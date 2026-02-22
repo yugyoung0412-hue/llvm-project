@@ -1542,6 +1542,18 @@ bool TargetTransformInfo::allowVectorElementIndexingUsingGEP() const {
   return TTIImpl->allowVectorElementIndexingUsingGEP();
 }
 
+bool TargetTransformInfo::hasTensorOps() const {
+  return TTIImpl->hasTensorOps();
+}
+
+SmallVector<TensorOpDesc> TargetTransformInfo::getSupportedTensorOps() const {
+  return TTIImpl->getSupportedTensorOps();
+}
+
+unsigned TargetTransformInfo::getTensorTileSize(Type *ElemTy) const {
+  return TTIImpl->getTensorTileSize(ElemTy);
+}
+
 TargetTransformInfoImplBase::~TargetTransformInfoImplBase() = default;
 
 TargetIRAnalysis::TargetIRAnalysis() : TTICallback(&getDefaultTTI) {}

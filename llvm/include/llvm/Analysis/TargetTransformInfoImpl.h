@@ -23,6 +23,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/PatternMatch.h"
+#include "llvm/Transforms/Vectorize/TensorISAInfo.h"
 #include <optional>
 #include <utility>
 
@@ -1202,6 +1203,10 @@ public:
   virtual void collectKernelLaunchBounds(
       const Function &F,
       SmallVectorImpl<std::pair<StringRef, int64_t>> &LB) const {}
+
+  virtual bool hasTensorOps() const { return false; }
+  virtual SmallVector<TensorOpDesc> getSupportedTensorOps() const { return {}; }
+  virtual unsigned getTensorTileSize(Type *) const { return 0; }
 
   virtual bool allowVectorElementIndexingUsingGEP() const { return true; }
 

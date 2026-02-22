@@ -35,6 +35,7 @@
 #include "llvm/Support/BranchProbability.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/InstructionCost.h"
+#include "llvm/Transforms/Vectorize/TensorISAInfo.h"
 #include <functional>
 #include <optional>
 #include <utility>
@@ -2067,6 +2068,15 @@ public:
   /// Returns true if GEP should not be used to index into vectors for this
   /// target.
   LLVM_ABI bool allowVectorElementIndexingUsingGEP() const;
+
+  /// Returns true if the target has hardware tensor/matrix operations.
+  LLVM_ABI bool hasTensorOps() const;
+
+  /// Returns descriptions of all hardware-supported tensor operations.
+  LLVM_ABI SmallVector<TensorOpDesc> getSupportedTensorOps() const;
+
+  /// Returns the native tile size (rows/cols) for tensor ops on this target.
+  LLVM_ABI unsigned getTensorTileSize(Type *ElemTy) const;
 
 private:
   std::unique_ptr<const TargetTransformInfoImplBase> TTIImpl;
