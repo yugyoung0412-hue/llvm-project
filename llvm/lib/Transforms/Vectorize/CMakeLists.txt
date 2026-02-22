@@ -5,6 +5,7 @@ add_llvm_component_library(LLVMVectorize
   LoopVectorize.cpp
   LoopTensorize.cpp
   LoopNestAnalyzer.cpp
+  TensorPatternClassifier.cpp
   SandboxVectorizer/DependencyGraph.cpp
   SandboxVectorizer/InstrMaps.cpp
   SandboxVectorizer/Interval.cpp

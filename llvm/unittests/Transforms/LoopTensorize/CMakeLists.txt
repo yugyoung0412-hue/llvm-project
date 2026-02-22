@@ -10,4 +10,5 @@ set(LLVM_LINK_COMPONENTS
 add_llvm_unittest(LoopTensorizeTests
   TensorISAInfoTest.cpp
   LoopNestAnalyzerTest.cpp
+  PatternClassifierTest.cpp
   )
