@@ -53,5 +53,16 @@ getLegalTransforms(const LoopNestInfo &Info,
 std::optional<SearchState> applyTransform(const SearchState &State,
                                            const Transform &T);
 
+// Forward declaration to avoid including TensorCostModel.h in this header.
+struct TensorCostModelParams;
+
+/// Run beam search over the transformation space, returning the best terminal
+/// SearchState found. BeamWidth controls the number of candidates kept at each
+/// depth. Lower Cost in the returned state is better (roofline cycles).
+SearchState runBeamSearch(const SearchState &Initial,
+                          ArrayRef<TensorOpDesc> SupportedOps,
+                          const TensorCostModelParams &Params,
+                          unsigned BeamWidth = 8);
+
 } // namespace llvm
 #endif

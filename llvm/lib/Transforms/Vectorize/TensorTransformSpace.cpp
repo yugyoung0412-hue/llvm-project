@@ -7,6 +7,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Vectorize/TensorTransformSpace.h"
+#include "llvm/Transforms/Vectorize/TensorCostModel.h"
+#include <algorithm>
 
 using namespace llvm;
 
@@ -76,4 +78,63 @@ llvm::applyTransform(const SearchState &State, const Transform &T) {
   }
 
   return Next;
+}
+
+SearchState llvm::runBeamSearch(const SearchState &Initial,
+                                 ArrayRef<TensorOpDesc> SupportedOps,
+                                 const TensorCostModelParams &Params,
+                                 unsigned BeamWidth) {
+  // Maximum search depth to prevent unbounded tiling.
+  const unsigned MaxSearchDepth = 4;
+
+  SmallVector<SearchState, 0> Beam = {Initial};
+  SearchState Best = Initial;
+  Best.Cost = std::numeric_limits<float>::infinity();
+
+  for (unsigned Depth = 0; Depth < MaxSearchDepth; ++Depth) {
+    SmallVector<SearchState, 0> Candidates;
+
+    for (auto &State : Beam) {
+      if (State.IsTerminal) {
+        float Score = scoreCost(State, Params);
+        State.Cost = Score;
+        if (Score < Best.Cost)
+          Best = State;
+        continue;
+      }
+
+      SmallVector<Transform> Transforms =
+          getLegalTransforms(State.Current, SupportedOps);
+      for (const auto &T : Transforms) {
+        if (auto Next = applyTransform(State, T)) {
+          Next->Cost = scoreCost(*Next, Params);
+          Candidates.push_back(*Next);
+        }
+      }
+    }
+
+    if (Candidates.empty())
+      break;
+
+    // Sort by cost ascending (lower is better) and keep top BeamWidth.
+    std::sort(Candidates.begin(), Candidates.end(),
+              [](const SearchState &A, const SearchState &B) {
+                return A.Cost < B.Cost;
+              });
+    if (Candidates.size() > BeamWidth)
+      Candidates.resize(BeamWidth);
+    Beam = std::move(Candidates);
+  }
+
+  // Score any remaining non-terminal states as terminal fallbacks.
+  for (auto &State : Beam) {
+    if (!State.IsTerminal) {
+      float Score = scoreCost(State, Params);
+      State.Cost = Score;
+      if (Score < Best.Cost)
+        Best = State;
+    }
+  }
+
+  return Best;
 }
