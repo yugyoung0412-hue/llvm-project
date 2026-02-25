@@ -12,4 +12,5 @@ add_llvm_unittest(LoopTensorizeTests
   LoopNestAnalyzerTest.cpp
   PatternClassifierTest.cpp
   TransformSpaceTest.cpp
+  CostModelTest.cpp
   )
