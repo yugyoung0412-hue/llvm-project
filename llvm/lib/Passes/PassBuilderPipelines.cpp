@@ -147,6 +147,7 @@
 #include "llvm/Transforms/Utils/NameAnonGlobals.h"
 #include "llvm/Transforms/Utils/RelLookupTableConverter.h"
 #include "llvm/Transforms/Utils/SimplifyCFGOptions.h"
+#include "llvm/Transforms/Vectorize/LoopTensorize.h"
 #include "llvm/Transforms/Vectorize/LoopVectorize.h"
 #include "llvm/Transforms/Vectorize/SLPVectorizer.h"
 #include "llvm/Transforms/Vectorize/VectorCombine.h"
@@ -320,6 +321,10 @@ static cl::opt<bool> EnableDevirtualizeSpeculatively(
     cl::desc("Enable speculative devirtualization optimization"),
     cl::init(false));
 
+static cl::opt<bool> EnableLoopTensorize(
+    "enable-loop-tensorize", cl::init(false), cl::Hidden,
+    cl::desc("Use LoopTensorize instead of LoopVectorize"));
+
 extern cl::opt<std::string> UseCtxProfile;
 extern cl::opt<bool> PGOInstrumentColdFunctionOnly;
 
@@ -342,6 +347,7 @@ PipelineTuningOptions::PipelineTuningOptions() {
   InlinerThreshold = -1;
   EagerlyInvalidateAnalyses = EnableEagerlyInvalidateAnalyses;
   DevirtualizeSpeculatively = EnableDevirtualizeSpeculatively;
+  LoopTensorization = EnableLoopTensorize;
 }
 
 namespace llvm {
@@ -1329,8 +1335,11 @@ void PassBuilder::addVectorPasses(OptimizationLevel Level,
                                   ThinOrFullLTOPhase LTOPhase) {
   const bool IsFullLTO = LTOPhase == ThinOrFullLTOPhase::FullLTOPostLink;
 
-  FPM.addPass(LoopVectorizePass(
-      LoopVectorizeOptions(!PTO.LoopInterleaving, !PTO.LoopVectorization)));
+  if (PTO.LoopTensorization)
+    FPM.addPass(LoopTensorizePass());
+  else
+    FPM.addPass(LoopVectorizePass(
+        LoopVectorizeOptions(!PTO.LoopInterleaving, !PTO.LoopVectorization)));
 
   // Drop dereferenceable assumes after vectorization, as they are no longer
   // needed and can inhibit further optimization.

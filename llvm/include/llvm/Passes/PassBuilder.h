@@ -103,6 +103,10 @@ public:
   // Tuning option to enable/disable speculative devirtualization.
   // Its default value is false.
   bool DevirtualizeSpeculatively;
+
+  /// Tuning option to enable loop tensorization instead of loop vectorization.
+  /// Default is false (use standard loop vectorization).
+  bool LoopTensorization = false;
 };
 
 /// This class provides access to building LLVM's passes.
