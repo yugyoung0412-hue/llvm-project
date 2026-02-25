@@ -19,6 +19,7 @@
 #include "X86TargetMachine.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/CodeGen/BasicTTIImpl.h"
+#include "llvm/Transforms/Vectorize/TensorISAInfo.h"
 #include <optional>
 
 namespace llvm {
@@ -326,6 +327,10 @@ public:
                              Type *ScalarValTy) const override;
 
   bool useFastCCForInternalCall(Function &F) const override;
+
+  bool hasTensorOps() const override;
+  SmallVector<TensorOpDesc> getSupportedTensorOps() const override;
+  unsigned getTensorTileSize(Type *ElemTy) const override;
 
 private:
   bool supportsGather() const;

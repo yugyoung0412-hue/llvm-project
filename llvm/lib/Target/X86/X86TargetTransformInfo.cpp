@@ -56,6 +56,7 @@
 #include "llvm/CodeGen/TargetLowering.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/IntrinsicsX86.h"
 #include <optional>
 
 using namespace llvm;
@@ -7290,4 +7291,28 @@ bool X86TTIImpl::useFastCCForInternalCall(Function &F) const {
   }
 
   return true;
+}
+
+bool X86TTIImpl::hasTensorOps() const {
+  return ST->hasAMXBF16() || ST->hasAMXINT8();
+}
+
+SmallVector<TensorOpDesc> X86TTIImpl::getSupportedTensorOps() const {
+  SmallVector<TensorOpDesc> Ops;
+  if (ST->hasAMXBF16()) {
+    TensorOpDesc D;
+    D.OpKind = TensorOpDesc::Kind::MatMul;
+    D.M = 16;
+    D.N = 16;
+    D.K = 32;
+    D.IntrinsicID = Intrinsic::x86_tdpbf16ps_internal;
+    Ops.push_back(D);
+  }
+  return Ops;
+}
+
+unsigned X86TTIImpl::getTensorTileSize(Type *ElemTy) const {
+  if (ST->hasAMXTILE())
+    return 16;
+  return 0;
 }
