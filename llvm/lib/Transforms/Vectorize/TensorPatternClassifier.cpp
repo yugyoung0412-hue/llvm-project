@@ -7,9 +7,73 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Vectorize/TensorPatternClassifier.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
 
 using namespace llvm;
+
+/// Recursively walk a nested SCEVAddRecExpr chain and collect all linear
+/// AddRec nodes grouped by their step operand.  The SCEV representation for
+/// a multi-loop affine subscript is a chain such as
+///   {{{base,+,s0}L0,+,s1}L1,+,s2}L2
+/// so we must descend into the start operand to find inner AddRecs.
+static void collectTermsByStep(
+    const SCEV *S,
+    DenseMap<const SCEV *, SmallVector<const SCEVAddRecExpr *, 4>> &Out) {
+  if (!S)
+    return;
+  if (const auto *AR = dyn_cast<SCEVAddRecExpr>(S)) {
+    if (AR->isAffine()) {
+      Out[AR->getOperand(1)].push_back(AR); // operand(1) is the step
+    }
+    // Recurse into the start operand to find inner AddRecs.
+    collectTermsByStep(AR->getStart(), Out);
+  }
+  // Also handle a flat SCEVAddExpr whose operands may be AddRecs.
+  if (const auto *Add = dyn_cast<SCEVAddExpr>(S)) {
+    for (const SCEV *Op : Add->operands())
+      collectTermsByStep(Op, Out);
+  }
+}
+
+/// Detect Conv2D sliding-window pattern:
+///   depth >= 4, perfect+affine, exactly 3 distinct base pointers,
+///   and at least one read's pointer SCEV has two SCEVAddRecExpr nodes
+///   sharing the same step value (e.g. oh and kh both step by W*elemSize).
+/// The accumulation pattern (output[oh,ow] += ...) produces 3 reads + 1 write
+/// because the output is both loaded and stored, so we allow Reads >= 2.
+static bool isConv2D(const LoopNestInfo &Info) {
+  if (Info.Depth < 4)
+    return false;
+
+  SmallPtrSet<Value *, 4> Bases;
+  unsigned Reads = 0, Writes = 0;
+  for (const auto &MA : Info.Accesses) {
+    Bases.insert(MA.BasePtr);
+    if (MA.Kind == AccessKind::Read)
+      ++Reads;
+    else if (MA.Kind == AccessKind::Write)
+      ++Writes;
+  }
+  // 3 distinct base arrays (input, kernel, output), at least 2 reads (input
+  // + output-read-for-accumulate), exactly 1 write.
+  if (Bases.size() != 3 || Reads < 2 || Writes != 1)
+    return false;
+
+  // For each read access, inspect the pointer SCEV for the sliding-window
+  // signature: two or more AddRec nodes sharing the same step value.
+  for (const auto &MA : Info.Accesses) {
+    if (MA.Kind != AccessKind::Read || MA.IndexExprs.empty())
+      continue;
+    DenseMap<const SCEV *, SmallVector<const SCEVAddRecExpr *, 4>> StepMap;
+    collectTermsByStep(MA.IndexExprs[0], StepMap);
+    for (const auto &[Step, ARs] : StepMap)
+      if (ARs.size() >= 2)
+        return true; // Two IVs share the same stride -> sliding window
+  }
+  return false;
+}
 
 // GEMM detection: depth >= 3, exactly 3 distinct base pointers,
 // exactly 2 reads and 1 write.
@@ -34,6 +98,13 @@ PatternHint llvm::classifyPattern(const LoopNestInfo &Info) {
 
   if (!Info.IsAffine || !Info.IsPerfectNest)
     return Hint; // Generic
+
+  // Check Conv2D first: stricter than GEMM (depth >= 4 + step equality).
+  // A 4-deep nest with 3 base pointers would otherwise also match isGEMM.
+  if (isConv2D(Info)) {
+    Hint.Kind = PatternKind::Conv2D;
+    return Hint;
+  }
 
   if (isGEMM(Info)) {
     Hint.Kind = PatternKind::GEMM;
