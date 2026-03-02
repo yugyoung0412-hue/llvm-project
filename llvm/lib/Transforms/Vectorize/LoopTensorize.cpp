@@ -48,6 +48,7 @@ PreservedAnalyses LoopTensorizePass::run(Function &F,
     PatternHint Hint = classifyPattern(*InfoOpt);
     LLVM_DEBUG(dbgs() << "PatternHint: "
       << (Hint.Kind == PatternKind::GEMM        ? "GEMM"
+        : Hint.Kind == PatternKind::Conv2D      ? "Conv2D"
         : Hint.Kind == PatternKind::Elementwise ? "Elementwise"
         :                                         "Generic")
       << "\n");

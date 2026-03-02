@@ -1,9 +1,10 @@
 ; RUN: opt -passes=loop-tensorize -debug-only=loop-tensorize -S < %s 2>&1 \
 ; RUN:   | FileCheck %s
 ; REQUIRES: asserts
-
-; A scalar GEMM: C[i][j] += A[i][k] * B[k][j]
+;
+; A standard 3-deep GEMM must NOT be classified as Conv2D.
 ; CHECK: PatternHint: GEMM
+; CHECK-NOT: PatternHint: Conv2D
 
 define void @gemm(ptr %A, ptr %B, ptr %C) {
 entry:
