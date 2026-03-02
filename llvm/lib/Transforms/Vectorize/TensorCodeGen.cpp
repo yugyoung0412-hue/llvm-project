@@ -65,7 +65,11 @@ bool llvm::applyPlan(const SearchState &Plan, const PatternHint &Hint,
   if (!HasTensorRecognize)
     return false;
 
-  // Only handle GEMM for now.
+  // Conv2D: recognized but codegen deferred to follow-up PR.
+  // Return false so the loop is left unchanged.
+  if (Hint.Kind == PatternKind::Conv2D)
+    return false;
+
   if (Hint.Kind != PatternKind::GEMM)
     return false;
 
