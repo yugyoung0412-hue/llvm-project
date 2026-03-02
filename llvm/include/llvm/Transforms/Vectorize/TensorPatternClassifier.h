@@ -24,6 +24,9 @@ struct PatternHint {
   PatternKind Kind = PatternKind::Generic;
   /// Index into TTI.getSupportedTensorOps() to try first; -1 = no hint.
   int PreferredOpIdx = -1;
+  /// True when col_matrix fits in L2 and im2col -> GEMM lowering is preferred.
+  /// Only meaningful when Kind == Conv2D.
+  bool UseIm2Col = false;
 };
 
 /// Classifies a LoopNestInfo into a PatternHint.

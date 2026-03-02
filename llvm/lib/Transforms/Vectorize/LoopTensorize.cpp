@@ -12,6 +12,7 @@
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Intrinsics.h"
@@ -52,6 +53,35 @@ PreservedAnalyses LoopTensorizePass::run(Function &F,
         : Hint.Kind == PatternKind::Elementwise ? "Elementwise"
         :                                         "Generic")
       << "\n");
+
+      // Conv2D lowering decision: estimate col_matrix size and choose
+      // im2col -> GEMM when it fits in L2 cache, direct tile otherwise.
+      if (Hint.Kind == PatternKind::Conv2D) {
+        uint64_t ColMatrixBytes = 1;
+        bool AllConstant = true;
+        for (const auto &IV : InfoOpt->IVs) {
+          if (const auto *SC = dyn_cast<SCEVConstant>(IV.TripCount))
+            ColMatrixBytes *= SC->getValue()->getZExtValue() + 1;
+          else { AllConstant = false; break; }
+        }
+        Type *TmpElemTy = InfoOpt->Accesses.empty()
+                              ? Type::getFloatTy(F.getContext())
+                              : InfoOpt->Accesses[0].ElemType;
+        if (!TmpElemTy) TmpElemTy = Type::getFloatTy(F.getContext());
+        uint64_t ElemBytes = TmpElemTy->getPrimitiveSizeInBits() / 8;
+        if (ElemBytes == 0) ElemBytes = 4;
+        ColMatrixBytes *= ElemBytes;
+
+        uint64_t L2Size = 262144; // 256 KiB fallback
+        if (auto MaybeL2 = TTI.getCacheSize(TargetTransformInfo::CacheLevel::L2D))
+          L2Size = *MaybeL2;
+
+        Hint.UseIm2Col = AllConstant && (ColMatrixBytes <= L2Size);
+
+        LLVM_DEBUG(dbgs() << "Conv2D: col_matrix_bytes=" << ColMatrixBytes
+                          << " L2=" << L2Size
+                          << " use_im2col=" << Hint.UseIm2Col << "\n");
+      }
 
     // Pick element type from the first memory access, default to float.
     Type *ElemTy = nullptr;
