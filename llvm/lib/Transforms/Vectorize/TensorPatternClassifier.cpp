@@ -10,6 +10,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Transforms/Vectorize/TPlan.h"
 
 using namespace llvm;
 
@@ -124,4 +125,66 @@ PatternHint llvm::classifyPattern(const LoopNestInfo &Info) {
   }
 
   return Hint; // Generic
+}
+
+PatternHint llvm::classifyPattern(TPlan &Plan) {
+  PatternHint Hint;
+
+  // 1. Count induction recipes → depth.
+  unsigned Depth = 0;
+  for (const auto &R : Plan.recipes())
+    if (isa<TPInductionRecipe>(R))
+      ++Depth;
+
+  // 2. Count mem recipes and collect distinct base pointers.
+  SmallPtrSet<Value *, 4> Bases;
+  unsigned Reads = 0, Writes = 0;
+  for (const auto &R : Plan.recipes()) {
+    if (const auto *MR = dyn_cast<TPMemRecipe>(&R)) {
+      if (MR->MA.BasePtr)
+        Bases.insert(MR->MA.BasePtr);
+      if (MR->IsWrite)
+        ++Writes;
+      else
+        ++Reads;
+    }
+  }
+
+  // 3. Conv2D: depth>=4, 3 distinct bases, reads>=2, writes==1,
+  //    and at least one read MA has the sliding-window SCEV signature.
+  PatternKind Kind = PatternKind::Generic;
+  if (Depth >= 4 && Bases.size() == 3 && Reads >= 2 && Writes == 1) {
+    for (const auto &R : Plan.recipes()) {
+      if (const auto *MR = dyn_cast<TPMemRecipe>(&R)) {
+        if (!MR->IsWrite && !MR->MA.IndexExprs.empty()) {
+          DenseMap<const SCEV *, SmallVector<const SCEVAddRecExpr *, 4>> StepMap;
+          collectTermsByStep(MR->MA.IndexExprs[0], StepMap);
+          for (const auto &[Step, ARs] : StepMap) {
+            if (ARs.size() >= 2) {
+              Kind = PatternKind::Conv2D;
+              break;
+            }
+          }
+        }
+        if (Kind == PatternKind::Conv2D)
+          break;
+      }
+    }
+  }
+
+  // 4. GEMM: depth>=3, 3 distinct bases, reads==2, writes==1.
+  if (Kind == PatternKind::Generic &&
+      Depth >= 3 && Bases.size() == 3 && Reads == 2 && Writes == 1)
+    Kind = PatternKind::GEMM;
+
+  // 5. Set Pattern on the TPComputeRecipe.
+  for (auto &R : Plan.recipes()) {
+    if (auto *CR = dyn_cast<TPComputeRecipe>(&R)) {
+      CR->Pattern = Kind;
+      break;
+    }
+  }
+
+  Hint.Kind = Kind;
+  return Hint;
 }

@@ -53,8 +53,9 @@ getLegalTransforms(const LoopNestInfo &Info,
 std::optional<SearchState> applyTransform(const SearchState &State,
                                            const Transform &T);
 
-// Forward declaration to avoid including TensorCostModel.h in this header.
+// Forward declarations to avoid circular includes.
 struct TensorCostModelParams;
+class TPlan;
 
 /// Run beam search over the transformation space, returning the best terminal
 /// SearchState found. BeamWidth controls the number of candidates kept at each
@@ -63,6 +64,11 @@ SearchState runBeamSearch(const SearchState &Initial,
                           ArrayRef<TensorOpDesc> SupportedOps,
                           const TensorCostModelParams &Params,
                           unsigned BeamWidth = 8);
+
+/// Run per-dimension beam search over TPlan parallel factors.
+/// Returns the lowest-cost TPlan found.
+TPlan searchTPlan(TPlan Initial, ArrayRef<TensorOpDesc> SupportedOps,
+                  const TensorCostModelParams &Params, unsigned BeamWidth = 8);
 
 } // namespace llvm
 #endif

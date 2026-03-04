@@ -24,6 +24,7 @@
 #include "llvm/Transforms/Vectorize/TensorISAInfo.h"
 #include "llvm/Transforms/Vectorize/TensorPatternClassifier.h"
 #include "llvm/Transforms/Vectorize/TensorTransformSpace.h"
+#include "llvm/Transforms/Vectorize/TPlan.h"
 
 #define DEBUG_TYPE "loop-tensorize"
 
@@ -46,6 +47,47 @@ PreservedAnalyses LoopTensorizePass::run(Function &F,
     if (!InfoOpt)
       continue;
 
+    // Pick element type from the first memory access, default to float.
+    Type *ElemTy = nullptr;
+    if (!InfoOpt->Accesses.empty())
+      ElemTy = InfoOpt->Accesses[0].ElemType;
+    if (!ElemTy)
+      ElemTy = Type::getFloatTy(F.getContext());
+
+    SmallVector<TensorOpDesc> SupportedOps = TTI.getSupportedTensorOps();
+    TensorCostModelParams Params = buildCostParams(TTI, ElemTy);
+
+    // --- TPlan path (new) ---
+    {
+      TPlan Plan = TPlan::buildInitial(*InfoOpt);
+      PatternHint TPlanHint = classifyPattern(Plan);
+      LLVM_DEBUG(dbgs() << "TPlan: classifyPattern: "
+        << (TPlanHint.Kind == PatternKind::GEMM        ? "GEMM"
+          : TPlanHint.Kind == PatternKind::Conv2D      ? "Conv2D"
+          : TPlanHint.Kind == PatternKind::Elementwise ? "Elementwise"
+          :                                              "Generic")
+        << "\n");
+
+      // Build EffectiveOps for TPlan search (same logic as legacy path).
+      SmallVector<TensorOpDesc> TPlanEffectiveOps(SupportedOps);
+      if (TPlanEffectiveOps.empty() &&
+          TPlanHint.Kind == PatternKind::GEMM) {
+        TensorOpDesc Synthetic;
+        Synthetic.OpKind = TensorOpDesc::Kind::MatMul;
+        Synthetic.IntrinsicID = Intrinsic::matrix_multiply;
+        TPlanEffectiveOps.push_back(Synthetic);
+        Params.PeakTensorFLOPS = Params.PeakVectorFLOPS * 2.0f;
+      }
+
+      TPlan BestTPlan =
+          searchTPlan(std::move(Plan), TPlanEffectiveOps, Params, Opts.BeamWidth);
+      if (applyTPlan(BestTPlan, F, LI, SE, DT)) {
+        Changed = true;
+        continue; // skip legacy path
+      }
+    }
+
+    // --- Legacy path (fallback) ---
     PatternHint Hint = classifyPattern(*InfoOpt);
     LLVM_DEBUG(dbgs() << "PatternHint: "
       << (Hint.Kind == PatternKind::GEMM        ? "GEMM"
@@ -82,16 +124,6 @@ PreservedAnalyses LoopTensorizePass::run(Function &F,
                           << " L2=" << L2Size
                           << " use_im2col=" << Hint.UseIm2Col << "\n");
       }
-
-    // Pick element type from the first memory access, default to float.
-    Type *ElemTy = nullptr;
-    if (!InfoOpt->Accesses.empty())
-      ElemTy = InfoOpt->Accesses[0].ElemType;
-    if (!ElemTy)
-      ElemTy = Type::getFloatTy(F.getContext());
-
-    SmallVector<TensorOpDesc> SupportedOps = TTI.getSupportedTensorOps();
-    TensorCostModelParams Params = buildCostParams(TTI, ElemTy);
 
     // If no hardware tensor ops are available but pattern is GEMM, synthesize
     // a generic MatMul descriptor using llvm.matrix.multiply.

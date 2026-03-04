@@ -3,7 +3,8 @@
 ; REQUIRES: asserts
 
 ; A scalar GEMM: C[i][j] += A[i][k] * B[k][j]
-; CHECK: PatternHint: GEMM
+; The TPlan path now handles GEMM before the legacy classifier runs.
+; CHECK: TPlan: classifyPattern: GEMM
 
 define void @gemm(ptr %A, ptr %B, ptr %C) {
 entry:

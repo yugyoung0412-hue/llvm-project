@@ -12,6 +12,8 @@
 
 namespace llvm {
 
+class TPlan;
+
 enum class PatternKind {
   GEMM,
   Conv2D,
@@ -31,6 +33,10 @@ struct PatternHint {
 
 /// Classifies a LoopNestInfo into a PatternHint.
 PatternHint classifyPattern(const LoopNestInfo &Info);
+
+/// Classifies a TPlan (via its recipes) into a PatternHint.
+/// Also sets TPComputeRecipe::Pattern in-place.
+PatternHint classifyPattern(TPlan &Plan);
 
 } // namespace llvm
 #endif

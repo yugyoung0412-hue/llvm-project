@@ -1,12 +1,11 @@
-; RUN: opt -passes=loop-tensorize -debug-only=loop-tensorize -S \
-; RUN:   -mtriple=x86_64-- -mattr=+amx-bf16 < %s 2>&1 | FileCheck %s
-; REQUIRES: x86-registered-target, asserts
+; RUN: opt -passes=loop-tensorize -S < %s | FileCheck %s
 ;
-; Verify that AMX-BF16 target reports a GEMM pattern for a scalar loop nest.
-; The TPlan path now handles GEMM before the legacy classifier runs.
-; CHECK: TPlan: classifyPattern: GEMM
+; 16x16x16 GEMM that should be transformed by the TPlan path using
+; applyTPlan() → emitMatrixMultiply → llvm.matrix.multiply.
+; CHECK: @llvm.matrix.multiply
+; CHECK-NOT: k.loop:
 
-define void @gemm(ptr %A, ptr %B, ptr %C) {
+define void @gemm_16x16x16(ptr %A, ptr %B, ptr %C) {
 entry:
   br label %i.loop
 

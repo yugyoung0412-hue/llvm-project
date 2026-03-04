@@ -15,6 +15,7 @@ class DominatorTree;
 class Function;
 class LoopInfo;
 class ScalarEvolution;
+class TPlan;
 struct LoopNestInfo;
 struct PatternHint;
 struct SearchState;
@@ -25,6 +26,11 @@ struct TensorOpDesc;
 bool applyPlan(const SearchState &Plan, const PatternHint &Hint,
                ArrayRef<TensorOpDesc> SupportedOps, Function &F,
                LoopInfo &LI, ScalarEvolution &SE, DominatorTree &DT);
+
+/// Apply a TPlan to the IR. Returns true if IR was modified.
+/// Currently supports GEMM pattern only; other patterns return false.
+bool applyTPlan(const TPlan &Plan, Function &F, LoopInfo &LI,
+                ScalarEvolution &SE, DominatorTree &DT);
 
 } // namespace llvm
 #endif

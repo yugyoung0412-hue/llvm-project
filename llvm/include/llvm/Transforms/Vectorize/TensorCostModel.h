@@ -13,6 +13,7 @@
 
 namespace llvm {
 class TargetTransformInfo;
+class TPlan;
 class Type;
 
 struct TensorCostModelParams {
@@ -30,6 +31,11 @@ TensorCostModelParams buildCostParams(const TargetTransformInfo &TTI,
 
 /// Score a SearchState using the roofline model. Lower is better (cycles).
 float scoreCost(const SearchState &State, const TensorCostModelParams &Params);
+
+/// Score a TPlan using the roofline model based on its parallel factors.
+/// Lower is better (estimated cycles).
+float costTPlan(const TPlan &Plan, ArrayRef<TensorOpDesc> SupportedOps,
+                const TensorCostModelParams &Params);
 
 } // namespace llvm
 #endif

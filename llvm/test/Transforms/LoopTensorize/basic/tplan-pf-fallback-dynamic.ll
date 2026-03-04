@@ -1,12 +1,13 @@
-; RUN: opt -passes=loop-tensorize -debug-only=loop-tensorize -S \
-; RUN:   -mtriple=x86_64-- -mattr=+amx-bf16 < %s 2>&1 | FileCheck %s
-; REQUIRES: x86-registered-target, asserts
+; RUN: opt -passes=loop-tensorize -S < %s | FileCheck %s
 ;
-; Verify that AMX-BF16 target reports a GEMM pattern for a scalar loop nest.
-; The TPlan path now handles GEMM before the legacy classifier runs.
-; CHECK: TPlan: classifyPattern: GEMM
+; GEMM with a dynamic trip count (%N as function argument).
+; The TPlan path cannot emit matrix.multiply without constant PFs ≥ 4 and
+; multiples of 4, so it falls through to the legacy path (which also cannot
+; emit without constant trip counts). The function must remain valid (no crash).
+;
+; CHECK: define void @gemm_dynamic
 
-define void @gemm(ptr %A, ptr %B, ptr %C) {
+define void @gemm_dynamic(ptr %A, ptr %B, ptr %C, i32 %N) {
 entry:
   br label %i.loop
 
@@ -31,17 +32,17 @@ k.loop:
   %mul   = fmul float %a.val, %b.val
   store float %mul, ptr %c.ptr
   %k.next = add i32 %k, 1
-  %k.cond = icmp slt i32 %k.next, 16
+  %k.cond = icmp slt i32 %k.next, %N
   br i1 %k.cond, label %k.loop, label %k.latch
 
 k.latch:
   %j.next = add i32 %j, 1
-  %j.cond = icmp slt i32 %j.next, 16
+  %j.cond = icmp slt i32 %j.next, %N
   br i1 %j.cond, label %j.loop, label %j.latch
 
 j.latch:
   %i.next = add i32 %i, 1
-  %i.cond = icmp slt i32 %i.next, 16
+  %i.cond = icmp slt i32 %i.next, %N
   br i1 %i.cond, label %i.loop, label %exit
 
 exit:

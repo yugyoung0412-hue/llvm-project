@@ -7,7 +7,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Vectorize/TensorTransformSpace.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Transforms/Vectorize/TensorCostModel.h"
+#include "llvm/Transforms/Vectorize/TensorPatternClassifier.h"
+#include "llvm/Transforms/Vectorize/TPlan.h"
 #include <algorithm>
 
 using namespace llvm;
@@ -137,4 +140,76 @@ SearchState llvm::runBeamSearch(const SearchState &Initial,
   }
 
   return Best;
+}
+
+TPlan llvm::searchTPlan(TPlan Initial, ArrayRef<TensorOpDesc> SupportedOps,
+                         const TensorCostModelParams &Params,
+                         unsigned BeamWidth) {
+  const LoopNestInfo &NI = Initial.getNestInfo();
+  unsigned Depth = static_cast<unsigned>(NI.IVs.size());
+
+  // Build PF candidates per dimension from trip counts.
+  SmallVector<SmallVector<uint32_t>> Candidates(Depth);
+  for (unsigned D = 0; D < Depth; ++D) {
+    if (const auto *C = dyn_cast_or_null<SCEVConstant>(NI.IVs[D].TripCount)) {
+      uint64_t TC = C->getValue()->getZExtValue() + 1; // backedge-taken + 1
+      uint32_t PF = 1;
+      while (PF <= TC && PF < 512) {
+        Candidates[D].push_back(PF);
+        PF *= 2;
+      }
+    } else {
+      Candidates[D] = {1, 4, 8, 16};
+    }
+    if (Candidates[D].empty())
+      Candidates[D].push_back(1);
+  }
+
+  // Per-dimension beam search.
+  SmallVector<TPlan, 0> Beam;
+  Beam.push_back(std::move(Initial));
+
+  for (unsigned D = 0; D < Depth; ++D) {
+    SmallVector<TPlan, 0> NextBeam;
+    for (auto &Plan : Beam) {
+      SmallVector<uint32_t> PFs(Plan.getAllPFs().begin(),
+                                Plan.getAllPFs().end());
+      for (uint32_t PF : Candidates[D]) {
+        SmallVector<uint32_t> NewPFs = PFs;
+        NewPFs[D] = PF;
+        TPlan NewPlan = Plan.withPFs(NewPFs);
+        NewPlan.setCost(costTPlan(NewPlan, SupportedOps, Params));
+        NextBeam.push_back(std::move(NewPlan));
+      }
+    }
+    std::sort(NextBeam.begin(), NextBeam.end(),
+              [](const TPlan &A, const TPlan &B) {
+                return A.getCost() < B.getCost();
+              });
+    if (NextBeam.size() > BeamWidth)
+      NextBeam.resize(BeamWidth);
+    Beam = std::move(NextBeam);
+  }
+
+  // Select best plan.
+  TPlan *Best = &Beam[0];
+  for (auto &P : Beam)
+    if (P.getCost() < Best->getCost())
+      Best = &P;
+
+  // Post-search Conv2D: set UseIm2Col if col_matrix fits in L2.
+  for (auto &R : Best->recipes()) {
+    if (auto *CR = dyn_cast<TPComputeRecipe>(&R)) {
+      if (CR->Pattern == PatternKind::Conv2D) {
+        float ColMatrixBytes = 1.0f;
+        for (uint32_t PF : Best->getAllPFs())
+          ColMatrixBytes *= static_cast<float>(PF);
+        ColMatrixBytes *= 4.0f; // assume float
+        CR->UseIm2Col = (ColMatrixBytes <= static_cast<float>(Params.L2Size));
+      }
+      break;
+    }
+  }
+
+  return std::move(*Best);
 }

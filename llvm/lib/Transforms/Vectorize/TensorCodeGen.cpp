@@ -21,6 +21,7 @@
 #include "llvm/Transforms/Vectorize/TensorISAInfo.h"
 #include "llvm/Transforms/Vectorize/TensorPatternClassifier.h"
 #include "llvm/Transforms/Vectorize/TensorTransformSpace.h"
+#include "llvm/Transforms/Vectorize/TPlan.h"
 
 using namespace llvm;
 
@@ -127,6 +128,89 @@ bool llvm::applyPlan(const SearchState &Plan, const PatternHint &Hint,
   Type *ElemTy = nullptr;
   if (!Plan.Current.Accesses.empty())
     ElemTy = Plan.Current.Accesses[0].ElemType;
+  if (!ElemTy)
+    ElemTy = Type::getFloatTy(F.getContext());
+
+  return emitMatrixMultiply(M, K, N, ElemTy, APtr, BPtr, CPtr, Preheader,
+                            ExitBlock, F);
+}
+
+bool llvm::applyTPlan(const TPlan &Plan, Function &F, LoopInfo &LI,
+                      ScalarEvolution &SE, DominatorTree &DT) {
+  // Find the compute recipe and check for GEMM pattern.
+  const TPComputeRecipe *CR = nullptr;
+  for (const auto &R : Plan.recipes()) {
+    if (const auto *C = dyn_cast<TPComputeRecipe>(&R)) {
+      CR = C;
+      break;
+    }
+  }
+  if (!CR || CR->Pattern != PatternKind::GEMM)
+    return false;
+
+  // Need at least 3 parallel factors for M, N, K.
+  if (Plan.getAllPFs().size() < 3)
+    return false;
+
+  unsigned M = Plan.getPF(0);
+  unsigned N = Plan.getPF(1);
+  unsigned K = Plan.getPF(2);
+
+  // All dimensions must be multiples of 4.
+  if (M % 4 != 0 || N % 4 != 0 || K % 4 != 0)
+    return false;
+
+  // PF must equal the actual trip count: we replace the entire loop, so a
+  // partial tile (PF < TC) would silently drop iterations.
+  const LoopNestInfo &NI0 = Plan.getNestInfo();
+  if (NI0.IVs.size() < 3)
+    return false;
+  for (unsigned D = 0; D < 3; ++D) {
+    const auto *TC = dyn_cast_or_null<SCEVConstant>(NI0.IVs[D].TripCount);
+    if (!TC)
+      return false;
+    uint64_t ActualTC = TC->getValue()->getZExtValue() + 1;
+    if (Plan.getPF(D) != static_cast<unsigned>(ActualTC))
+      return false;
+  }
+
+  // Extract base pointers from mem recipes.
+  Value *APtr = nullptr, *BPtr = nullptr, *CPtr = nullptr;
+  unsigned ReadCount = 0;
+  for (const auto &R : Plan.recipes()) {
+    if (const auto *MR = dyn_cast<TPMemRecipe>(&R)) {
+      if (!MR->IsWrite) {
+        if (ReadCount == 0)
+          APtr = MR->MA.BasePtr;
+        else if (ReadCount == 1)
+          BPtr = MR->MA.BasePtr;
+        ++ReadCount;
+      } else if (!CPtr) {
+        CPtr = MR->MA.BasePtr;
+      }
+    }
+  }
+  if (!APtr || !BPtr || !CPtr)
+    return false;
+
+  // Get preheader and exit from outermost loop.
+  const LoopNestInfo &NI = Plan.getNestInfo();
+  if (NI.Loops.empty())
+    return false;
+  Loop *OuterLoop = NI.Loops[0];
+  BasicBlock *Preheader = OuterLoop->getLoopPreheader();
+  BasicBlock *ExitBlock = OuterLoop->getUniqueExitBlock();
+  if (!Preheader || !ExitBlock)
+    return false;
+
+  // Bail if exit has PHI nodes.
+  if (isa<PHINode>(&ExitBlock->front()))
+    return false;
+
+  // Determine element type.
+  Type *ElemTy = nullptr;
+  if (!NI.Accesses.empty())
+    ElemTy = NI.Accesses[0].ElemType;
   if (!ElemTy)
     ElemTy = Type::getFloatTy(F.getContext());
 

@@ -9,6 +9,7 @@
 #include "llvm/Transforms/Vectorize/TensorCostModel.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Transforms/Vectorize/TPlan.h"
 #include <algorithm>
 #include <cmath>
 
@@ -77,4 +78,51 @@ float llvm::scoreCost(const SearchState &State,
   float BW = Params.MemBandwidth > 0.0f ? Params.MemBandwidth : 1.0f;
   float BoundedFLOPS = std::min(PeakFLOPS, BW * AI);
   return FLOPs / std::max(BoundedFLOPS, 1.0f);
+}
+
+float llvm::costTPlan(const TPlan &Plan, ArrayRef<TensorOpDesc> SupportedOps,
+                      const TensorCostModelParams &Params) {
+  // Compute tile FLOPs as product of parallel factors × 2.
+  float PFProduct = 1.0f;
+  for (uint32_t PF : Plan.getAllPFs())
+    PFProduct *= static_cast<float>(PF);
+  float FLOPs = PFProduct * 2.0f;
+
+  // Peak FLOPS: tensor if available, then vector, then scalar.
+  float PeakFLOPS = Params.PeakScalarFLOPS > 0.0f ? Params.PeakScalarFLOPS : 1.0f;
+  bool HasTensorOps = !SupportedOps.empty() && Params.PeakTensorFLOPS > 0.0f;
+  if (HasTensorOps)
+    PeakFLOPS = Params.PeakTensorFLOPS;
+  else if (Params.PeakVectorFLOPS > 0.0f)
+    PeakFLOPS = Params.PeakVectorFLOPS;
+
+  float ReuseMultiplier = HasTensorOps ? 8.0f : 1.0f;
+
+  // DRAM bytes per tile: 3 operands × 4 bytes / reuse.
+  // Not scaled by PFProduct: bigger tiles amortize the same data over more FLOPs,
+  // giving higher arithmetic intensity and better hardware utilization.
+  float DRAMBytes = 3.0f * 4.0f / ReuseMultiplier;
+
+  float BW = Params.MemBandwidth > 0.0f ? Params.MemBandwidth : 1.0f;
+  float AI = FLOPs / DRAMBytes; // grows with PFProduct
+  float BoundedFLOPS = std::min(PeakFLOPS, BW * AI);
+
+  // Cost = hardware inefficiency / tile_size.
+  // Lower is better: larger tiles amortize overhead and improve utilization.
+  // Dividing by PFProduct ensures the beam search prefers bigger tiles even
+  // when all plans are compute-bound (BoundedFLOPS == PeakFLOPS).
+  float Cost = (PeakFLOPS / std::max(BoundedFLOPS, 1.0f)) / PFProduct;
+
+  // Conv2D+UseIm2Col: add col_matrix transfer overhead.
+  for (const auto &R : Plan.recipes()) {
+    if (const auto *CR = dyn_cast<TPComputeRecipe>(&R)) {
+      if (CR->Pattern == PatternKind::Conv2D && CR->UseIm2Col) {
+        float ColMatrixBytes = PFProduct * 4.0f;
+        Cost += ColMatrixBytes / BW;
+      }
+      break;
+    }
+  }
+
+  return Cost;
 }

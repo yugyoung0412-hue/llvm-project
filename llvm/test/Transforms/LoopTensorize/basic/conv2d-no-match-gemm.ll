@@ -3,8 +3,9 @@
 ; REQUIRES: asserts
 ;
 ; A standard 3-deep GEMM must NOT be classified as Conv2D.
-; CHECK: PatternHint: GEMM
-; CHECK-NOT: PatternHint: Conv2D
+; The TPlan path now handles GEMM before the legacy classifier runs.
+; CHECK: TPlan: classifyPattern: GEMM
+; CHECK-NOT: TPlan: classifyPattern: Conv2D
 
 define void @gemm(ptr %A, ptr %B, ptr %C) {
 entry:

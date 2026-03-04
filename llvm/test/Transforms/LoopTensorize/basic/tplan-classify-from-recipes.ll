@@ -1,12 +1,13 @@
-; RUN: opt -passes=loop-tensorize -debug-only=loop-tensorize -S \
-; RUN:   -mtriple=x86_64-- -mattr=+amx-bf16 < %s 2>&1 | FileCheck %s
-; REQUIRES: x86-registered-target, asserts
+; RUN: opt -passes=loop-tensorize -debug-only=loop-tensorize -S < %s 2>&1 | FileCheck %s
+; REQUIRES: asserts
 ;
-; Verify that AMX-BF16 target reports a GEMM pattern for a scalar loop nest.
-; The TPlan path now handles GEMM before the legacy classifier runs.
+; Verifies that the TPlan classification debug output is emitted for a 3-loop
+; GEMM nest. The classifyPattern(TPlan&) overload must set Pattern=GEMM on the
+; compute recipe and print "TPlan: classifyPattern: GEMM".
+;
 ; CHECK: TPlan: classifyPattern: GEMM
 
-define void @gemm(ptr %A, ptr %B, ptr %C) {
+define void @gemm_for_tplan_classify(ptr %A, ptr %B, ptr %C) {
 entry:
   br label %i.loop
 
