@@ -53,8 +53,9 @@ void llvm::TPlanWidener_widen(TPlan &Plan) {
     unsigned PF = V->getParallelFactor();
 
     for (TPUser *U : V->users()) {
-      // We only propagate through recipe nodes.
-      auto *R = dynamic_cast<TPRecipeBase *>(U);
+      // All TPUser instances in this IR are TPRecipeBase nodes (there are no
+      // pure TPUser subclasses). Use static_cast to avoid RTTI dependency.
+      auto *R = static_cast<TPRecipeBase *>(U);
       if (!R)
         continue;
 

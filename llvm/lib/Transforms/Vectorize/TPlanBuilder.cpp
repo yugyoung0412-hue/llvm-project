@@ -79,13 +79,12 @@ private:
     for (const MemAccess &MA : Info.Accesses) {
       // Represent the base pointer as a null TPValue; the lowering pass
       // will materialize the actual GEP.
-      TPValue *PtrVal = nullptr;
+      (void)PtrTy;
       if (MA.Kind == AccessKind::Read || MA.Kind == AccessKind::ReadWrite) {
         auto *Load = new TPWidenLoadRecipe(ptrPlaceholder(), Align(1),
                                           MA.ElemType ? MA.ElemType
                                                       : Type::getFloatTy(Ctx));
         Header->appendRecipe(Load);
-        (void)PtrTy;
       }
       if (MA.Kind == AccessKind::Write || MA.Kind == AccessKind::ReadWrite) {
         auto *Store = new TPWidenStoreRecipe(ptrPlaceholder(), /*Val=*/nullptr,
