@@ -21,6 +21,7 @@
 #include "llvm/Transforms/Vectorize/TensorISAInfo.h"
 #include "llvm/Transforms/Vectorize/TensorPatternClassifier.h"
 #include "llvm/Transforms/Vectorize/TensorTransformSpace.h"
+#include "llvm/Transforms/Vectorize/TPlan.h"
 
 using namespace llvm;
 
@@ -55,6 +56,13 @@ static bool emitMatrixMultiply(unsigned M, unsigned K, unsigned N,
 bool llvm::applyPlan(const SearchState &Plan, const PatternHint &Hint,
                      ArrayRef<TensorOpDesc> SupportedOps, Function &F,
                      LoopInfo &LI, ScalarEvolution &SE, DominatorTree &DT) {
+  // TPlan fast path: if the SearchState carries a TPlan, use the IR lowering
+  // pipeline (widen + lower) instead of the legacy emitMatrixMultiply path.
+  if (Plan.Plan) {
+    TPlanWidener_widen(*Plan.Plan);
+    return TPlanLowering_lower(*Plan.Plan, F, LI, SE, DT);
+  }
+
   // Only proceed if TensorRecognize was applied.
   bool HasTensorRecognize = false;
   for (const auto &T : Plan.Applied)
