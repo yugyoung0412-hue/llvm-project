@@ -8,6 +8,9 @@
 
 #include "llvm/Transforms/Vectorize/TPRecipe.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Transforms/Vectorize/TPlan.h"
 
 using namespace llvm;

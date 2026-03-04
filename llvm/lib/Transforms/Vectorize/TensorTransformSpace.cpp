@@ -8,6 +8,7 @@
 
 #include "llvm/Transforms/Vectorize/TensorTransformSpace.h"
 #include "llvm/Transforms/Vectorize/TensorCostModel.h"
+#include "llvm/Transforms/Vectorize/TPlan.h"
 #include <algorithm>
 
 using namespace llvm;
@@ -69,6 +70,18 @@ llvm::applyTransform(const SearchState &State, const Transform &T) {
   case TransformKind::LoopTile:
     // Symbolic tiling: depth increases by 1 (outer strip + inner tile)
     Next.Current.Depth += 1;
+    // Stamp the tile size onto the corresponding TPHeaderPHIRecipe if a
+    // TPlan is attached to this SearchState.
+    if (Next.Plan) {
+      TPBasicBlock *Header = Next.Plan->getVectorBody()->getHeader();
+      for (TPRecipeBase &R : *Header) {
+        if (R.getKind() == RecipeKind::HeaderPHI) {
+          auto &PHI = static_cast<TPHeaderPHIRecipe &>(R);
+          if (PHI.getDimIndex() == T.Dim)
+            PHI.setTileSize(T.Size);
+        }
+      }
+    }
     break;
   case TransformKind::LoopPermute:
   case TransformKind::LoopUnroll:

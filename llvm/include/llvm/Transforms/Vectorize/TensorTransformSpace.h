@@ -17,6 +17,9 @@
 
 namespace llvm {
 
+// Forward-declare TPlan to avoid pulling in the full TPlan.h here.
+class TPlan;
+
 enum class TransformKind {
   TensorRecognize,
   LoopTile,
@@ -38,6 +41,7 @@ struct Transform {
 
 struct SearchState {
   LoopNestInfo           Current;
+  TPlan                  *Plan      = nullptr; // nullable; owned by caller
   SmallVector<Transform> Applied;
   float                  Cost       = std::numeric_limits<float>::infinity();
   bool                   IsTerminal = false;
