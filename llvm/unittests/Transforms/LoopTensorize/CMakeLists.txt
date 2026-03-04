@@ -14,4 +14,6 @@ add_llvm_unittest(LoopTensorizeTests
   TransformSpaceTest.cpp
   CostModelTest.cpp
   BeamSearchTest.cpp
+  TPRecipeTest.cpp
+  TPlanTest.cpp
   )
