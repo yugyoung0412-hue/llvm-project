@@ -23,6 +23,7 @@
 #include "llvm/Transforms/Vectorize/TensorISAInfo.h"
 #include "llvm/Transforms/Vectorize/TensorPatternClassifier.h"
 #include "llvm/Transforms/Vectorize/TensorTransformSpace.h"
+#include "llvm/Transforms/Vectorize/TPlan.h"
 
 #define DEBUG_TYPE "loop-tensorize"
 
@@ -45,7 +46,12 @@ PreservedAnalyses LoopTensorizePass::run(Function &F,
     if (!InfoOpt)
       continue;
 
-    PatternHint Hint = classifyPattern(*InfoOpt);
+    // Build a TPlan from the loop nest analysis; this becomes the primary IR.
+    auto Plan = TPlanBuilder_build(*InfoOpt, PatternHint{}, TensorOpDesc{}, {},
+                                   F.getContext());
+
+    // Classify based on the TPlan when available; fall back to legacy path.
+    PatternHint Hint = Plan ? classifyPattern(*Plan) : classifyPattern(*InfoOpt);
     LLVM_DEBUG(dbgs() << "PatternHint: "
       << (Hint.Kind == PatternKind::GEMM        ? "GEMM"
         : Hint.Kind == PatternKind::Elementwise ? "Elementwise"
@@ -75,6 +81,7 @@ PreservedAnalyses LoopTensorizePass::run(Function &F,
 
     SearchState Initial;
     Initial.Current = *InfoOpt;
+    Initial.Plan    = Plan.get(); // may be null; Plan keeps ownership
     Initial.Cost = std::numeric_limits<float>::infinity();
     Initial.IsTerminal = false;
 
