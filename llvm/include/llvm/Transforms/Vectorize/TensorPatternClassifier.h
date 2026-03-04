@@ -29,5 +29,12 @@ struct PatternHint {
 /// Classifies a LoopNestInfo into a PatternHint.
 PatternHint classifyPattern(const LoopNestInfo &Info);
 
+// Forward-declare TPlan to avoid circular include (TPlan.h includes this file).
+class TPlan;
+
+/// Classifies a TPlan's recipe structure into a PatternHint.
+/// This is the primary interface once a TPlan has been built.
+PatternHint classifyPattern(const TPlan &Plan);
+
 } // namespace llvm
 #endif

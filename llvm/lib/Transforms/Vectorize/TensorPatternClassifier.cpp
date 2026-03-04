@@ -8,6 +8,7 @@
 
 #include "llvm/Transforms/Vectorize/TensorPatternClassifier.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Transforms/Vectorize/TPlan.h"
 
 using namespace llvm;
 
@@ -53,4 +54,66 @@ PatternHint llvm::classifyPattern(const LoopNestInfo &Info) {
   }
 
   return Hint; // Generic
+}
+
+//===----------------------------------------------------------------------===//
+// classifyPattern(const TPlan &) — TPlan-based classification
+//===----------------------------------------------------------------------===//
+
+PatternHint llvm::classifyPattern(const TPlan &Plan) {
+  PatternHint Hint;
+
+  const TPBasicBlock *Header = Plan.getVectorBody()->getHeader();
+  if (!Header)
+    return Hint;
+
+  unsigned PHICount = 0;
+  unsigned LoadCount = 0;
+  unsigned StoreCount = 0;
+  bool HasMatMul = false;
+  bool HasConv = false;
+  bool HasReductionPHI = false;
+
+  for (const TPRecipeBase &R : *Header) {
+    switch (R.getKind()) {
+    case RecipeKind::HeaderPHI:
+    case RecipeKind::ScalarHeaderPHI:
+      ++PHICount;
+      break;
+    case RecipeKind::ReductionPHI:
+      ++PHICount;
+      HasReductionPHI = true;
+      break;
+    case RecipeKind::WidenLoad:
+    case RecipeKind::TensorLoad:
+      ++LoadCount;
+      break;
+    case RecipeKind::WidenStore:
+    case RecipeKind::TensorStore:
+      ++StoreCount;
+      break;
+    case RecipeKind::MatMul:
+      HasMatMul = true;
+      break;
+    case RecipeKind::Conv:
+      HasConv = true;
+      break;
+    default:
+      break;
+    }
+  }
+
+  if (HasMatMul || (PHICount >= 3 && LoadCount >= 2 && StoreCount >= 1)) {
+    Hint.Kind = PatternKind::GEMM;
+  } else if (HasConv || PHICount >= 5) {
+    Hint.Kind = PatternKind::Conv2D;
+  } else if (HasReductionPHI) {
+    Hint.Kind = PatternKind::Reduction;
+  } else if (PHICount == 1 && !HasReductionPHI) {
+    Hint.Kind = PatternKind::Elementwise;
+  } else {
+    Hint.Kind = PatternKind::Generic;
+  }
+
+  return Hint;
 }
