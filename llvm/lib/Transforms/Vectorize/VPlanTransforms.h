@@ -474,6 +474,20 @@ struct VPlanTransforms {
   /// are only valid for a subset of VFs in Range, Range.End is updated.
   static void createPartialReductions(VPlan &Plan, VPCostContext &CostCtx,
                                       VFRange &Range);
+
+  /// Widen the induction variable of \p TargetLoopRegion from scalar to vector
+  /// with vectorization factor \p VF.  Replaces the scalar IV phi (identified
+  /// by \p IVPHI) and all transitive integer-arithmetic users with widened
+  /// vector recipes, and appends the backedge increment to the widened phi.
+  /// This is an experimental MVP transform: only arithmetic widening is
+  /// performed; memory operations and inner-loop phi chains are left as
+  /// VPIRInstruction stubs (marked TODO for full implementation).
+  ///
+  /// Must be called AFTER recipe construction and BEFORE
+  /// convertToConcreteRecipes().
+  static void widenLoopIV(VPlan &Plan, VPRegionBlock *TargetLoopRegion,
+                          ElementCount VF, PHINode *IVPHI,
+                          const InductionDescriptor &IndDesc);
 };
 
 } // namespace llvm

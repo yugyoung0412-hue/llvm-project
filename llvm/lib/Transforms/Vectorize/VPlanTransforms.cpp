@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "VPlanTransforms.h"
+#include "LoopVectorizationPlanner.h"
 #include "VPRecipeBuilder.h"
 #include "VPlan.h"
 #include "VPlanAnalysis.h"
@@ -6148,4 +6149,113 @@ void VPlanTransforms::createPartialReductions(VPlan &Plan,
     for (const VPPartialReductionChain &Chain : Chains)
       transformToPartialReduction(Chain, CostCtx.Types, Plan, Phi, RK);
   }
+}
+
+void VPlanTransforms::widenLoopIV(VPlan &Plan, VPRegionBlock *TargetLoopRegion,
+                                   ElementCount VF, PHINode *IVPHI,
+                                   const InductionDescriptor &IndDesc) {
+  LLVM_DEBUG(dbgs() << "VPlanTransforms::widenLoopIV: widening IV "
+                    << IVPHI->getName() << " with VF=" << VF << "\n");
+
+  // ---- Step 0: Find the IV phi recipe in TargetLoopRegion's header ----
+  VPBasicBlock *HeaderVPBB = TargetLoopRegion->getEntryBasicBlock();
+  // VPlan native path may insert an empty preheader as entry block.
+  if (HeaderVPBB->empty())
+    HeaderVPBB = cast<VPBasicBlock>(HeaderVPBB->getSingleSuccessor());
+
+  VPIRInstruction *OldIVRecipe = nullptr;
+  for (VPRecipeBase &R : HeaderVPBB->phis()) {
+    auto *VPIRInst = dyn_cast<VPIRInstruction>(&R);
+    if (VPIRInst && &VPIRInst->getInstruction() == IVPHI) {
+      OldIVRecipe = VPIRInst;
+      break;
+    }
+  }
+  if (!OldIVRecipe) {
+    LLVM_DEBUG(dbgs() << "widenLoopIV: IV phi recipe not found, skipping\n");
+    return;
+  }
+
+  // ---- Step 1: Build VPWidenIntOrFpInductionRecipe to replace scalar phi ----
+  DebugLoc DL = IVPHI->getDebugLoc();
+  Type *IVTy = IVPHI->getType();
+
+  // Start value: use IndDesc's start value if available, else 0.
+  Value *StartIRV = IndDesc.getStartValue() ? IndDesc.getStartValue()
+                                             : ConstantInt::get(IVTy, 0);
+  VPIRValue *StartV = Plan.getOrAddLiveIn(StartIRV);
+  // Step value: IK_IntInduction with step 1.
+  VPValue *StepV = Plan.getConstantInt(IVTy, 1);
+
+  auto *WidenIVR = new VPWidenIntOrFpInductionRecipe(
+      IVPHI, StartV, StepV, &Plan.getVF(), IndDesc, VPIRFlags{}, DL);
+  WidenIVR->insertBefore(OldIVRecipe);
+
+  // Replace all VPlan uses of the old scalar IV value with the widened IV.
+  // VPIRInstruction defines a VPValue via its VPDef base. If the recipe has no
+  // defined values, the IV phi is referenced as a live-in by downstream recipes.
+  if (OldIVRecipe->getNumDefinedValues() > 0)
+    OldIVRecipe->getVPSingleValue()->replaceAllUsesWith(
+        WidenIVR->getVPSingleValue());
+  else {
+    VPIRValue *IVLiveIn = Plan.getOrAddLiveIn(IVPHI);
+    IVLiveIn->replaceAllUsesWith(WidenIVR->getVPSingleValue());
+  }
+  OldIVRecipe->eraseFromParent();
+
+  // ---- Step 2: Widen transitive arithmetic users (binary operators) ----
+  // Collect VPIRInstruction recipes that use the widened IV transitively
+  // (e.g. mul, sub, add deriving bounds from the IV). Walk in DFS order so
+  // definitions are encountered before their uses.
+  SmallDenseSet<VPValue *> WideValues;
+  WideValues.insert(WidenIVR->getVPSingleValue());
+
+  for (VPBlockBase *VPB :
+       vp_depth_first_shallow(TargetLoopRegion->getEntry())) {
+    auto *VPBB = dyn_cast<VPBasicBlock>(VPB);
+    if (!VPBB)
+      continue;
+    for (VPRecipeBase &R : make_early_inc_range(*VPBB)) {
+      auto *VPIRInst = dyn_cast<VPIRInstruction>(&R);
+      if (!VPIRInst)
+        continue;
+      auto *Inst = dyn_cast<BinaryOperator>(&VPIRInst->getInstruction());
+      if (!Inst)
+        continue;
+      SmallVector<VPValue *> Ops(VPIRInst->operands());
+      bool HasWideOp =
+          llvm::any_of(Ops, [&](VPValue *Op) { return WideValues.count(Op); });
+      if (!HasWideOp)
+        continue;
+      auto *WR = new VPWidenRecipe(*Inst, Ops, VPIRFlags(*Inst),
+                                   VPIRMetadata(*Inst), Inst->getDebugLoc());
+      WR->insertBefore(VPIRInst);
+      if (VPIRInst->getNumDefinedValues() > 0)
+        VPIRInst->getVPSingleValue()->replaceAllUsesWith(
+            WR->getVPSingleValue());
+      VPIRInst->eraseFromParent();
+      WideValues.insert(WR->getVPSingleValue());
+    }
+  }
+
+  // ---- Step 7: Adjust BranchOnCount trip count ----
+  // Since we now process VF elements per iteration, divide the trip count by
+  // VF. Locate the BranchOnCount instruction in the region's exiting block.
+  VPBasicBlock *LatchVPBB = cast<VPBasicBlock>(TargetLoopRegion->getExiting());
+  for (VPRecipeBase &R : *LatchVPBB) {
+    auto *VPI = dyn_cast<VPInstruction>(&R);
+    if (!VPI || VPI->getOpcode() != VPInstruction::BranchOnCount)
+      continue;
+    VPValue *TC = VPI->getOperand(1);
+    VPBuilder Builder(LatchVPBB, VPI->getIterator());
+    VPValue *NewTC =
+        Builder.createNaryOp(Instruction::UDiv, {TC, &Plan.getVF()}, DL);
+    VPI->setOperand(1, NewTC);
+    break;
+  }
+
+  // ---- Step 8: Cleanup ----
+  VPlanTransforms::removeDeadRecipes(Plan);
+
+  LLVM_DEBUG(dbgs() << "VPlanTransforms::widenLoopIV: done\n");
 }

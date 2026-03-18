@@ -46,6 +46,11 @@ AllowStridedPointerIVs("lv-strided-pointer-ivs", cl::init(false), cl::Hidden,
                        cl::desc("Enable recognition of non-constant strided "
                                 "pointer induction variables."));
 
+// Experimental: allow outer-loop vectorization even when inner loops are
+// non-uniform (e.g. boundary-dependent branches).  Defined in LoopVectorize.cpp
+// (along with the rest of the VPlan infrastructure flags).
+extern cl::opt<bool> EnableVPlanIVWidening;
+
 static cl::opt<bool>
     HintsAllowReordering("hints-allow-reordering", cl::init(true), cl::Hidden,
                          cl::desc("Allow enabling loop hints to reorder "
@@ -672,7 +677,11 @@ bool LoopVectorizationLegality::canVectorizeOuterLoop() {
 
   // Check whether inner loops are uniform. At this point, we only support
   // simple outer loops scenarios with uniform nested loops.
-  if (!isUniformLoopNest(TheLoop /*loop nest*/,
+  // When EnableVPlanIVWidening is set, the widenLoopIV VPlan transform takes
+  // responsibility for legalising non-uniform inner nests, so we skip this
+  // check.
+  if (!EnableVPlanIVWidening &&
+      !isUniformLoopNest(TheLoop /*loop nest*/,
                          TheLoop /*context outer loop*/)) {
     reportVectorizationFailure("Outer loop contains divergent loops",
         "loop control flow is not understood by vectorizer",

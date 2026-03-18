@@ -376,6 +376,14 @@ cl::list<std::string> llvm::VPlanPrintAfterPasses(
     cl::desc("Print VPlans after specified VPlan transformations (regexp)."));
 #endif
 
+// Experimental: allow outer-loop vectorization even when inner loops are
+// non-uniform (e.g. boundary-dependent branches).  When set,
+// VPlanTransforms::widenLoopIV() is invoked to legalise the VPlan.
+cl::opt<bool> EnableVPlanIVWidening(
+    "enable-vplan-iv-widening", cl::init(false), cl::Hidden,
+    cl::desc("Enable experimental VPlan IV-widening transform for outer loops "
+             "with non-uniform inner nests (bypasses isUniformLoopNest)."));
+
 // This flag enables the stress testing of the VPlan H-CFG construction in the
 // VPlan-native vectorization path. It must be used in conjuction with
 // -enable-vplan-native-path. -vplan-verify-hcfg can also be used to enable the
@@ -8792,6 +8800,17 @@ static bool processLoopInVPlanNativePath(
     return false;
 
   VPlan &BestPlan = LVP.getPlanFor(VF.Width);
+
+  // Experimental IV-widening pass: if the loop has non-uniform inner nests
+  // (e.g. boundary-dependent branches), widen the outer IV and its arithmetic
+  // users before execution.
+  if (EnableVPlanIVWidening) {
+    const auto &IVs = LVL->getInductionVars();
+    assert(!IVs.empty() && "Expected at least one outer-loop induction var");
+    auto It = IVs.begin();
+    VPlanTransforms::widenLoopIV(BestPlan, BestPlan.getVectorLoopRegion(),
+                                 VF.Width, It->first, It->second);
+  }
 
   {
     GeneratedRTChecks Checks(PSE, DT, LI, TTI, CM.CostKind);
