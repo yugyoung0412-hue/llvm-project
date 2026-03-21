@@ -261,7 +261,29 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
     // Get trip count from InductionDesc
     const SCEV *TC = Info.IVs[Idx].TripCount;
 
+    // Get the loop exit bound: latch branch condition ICmpInst RHS.
+    Value *LatchBound = nullptr;
+    if (BasicBlock *Latch = L->getLoopLatch()) {
+      if (auto *BI = dyn_cast<BranchInst>(Latch->getTerminator())) {
+        if (BI->isConditional()) {
+          if (auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition()))
+            LatchBound = Cmp->getOperand(1);
+        }
+      }
+    }
+    TPValue *BoundTP = LatchBound ? P.getOrCreateLiveIn(LatchBound) : nullptr;
+
     auto Region = std::make_unique<TPLoopRegion>(Idx, L, TC);
+
+    // Hoist InductionPhi declaration so it can be used for CanonIV creation.
+    PHINode *InductionPhi = Info.IVs[Idx].IndVar;
+
+    // Insert canonical IV phi as the first recipe (VPlan-style).
+    // Use a zero live-in as start matching the IV phi's type; step is patched below.
+    TPValue *ZeroTP = P.getOrCreateLiveIn(
+        ConstantInt::get(InductionPhi->getType(), 0));
+    auto *CanonIV = new TPCanonicalIVRecipe(ZeroTP, ZeroTP /*placeholder step*/);
+    Region->appendRecipe(CanonIV);
 
     // Loops that are "outer" (index < Idx) — their IVs are live-ins to us
     // Loops that are at or inside (index >= Idx) — defined within this region
@@ -274,7 +296,6 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
 
     // Process header PHIs
     BasicBlock *Header = L->getHeader();
-    PHINode *InductionPhi = Info.IVs[Idx].IndVar;
 
     for (PHINode &Phi : Header->phis()) {
       Value *PhiV = &Phi;
@@ -426,6 +447,23 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
           }
         }
       }
+    }
+
+    // Create canonical IV companion recipes.
+    if (CanonIV->getDefinedValue() && BoundTP) {
+      // Increment: canonical_iv + PF
+      auto *IncrRecipe = new TPCanonicalIVIncrRecipe(
+          CanonIV->getDefinedValue(), &P.PF);
+      Region->appendRecipe(IncrRecipe);
+
+      // Patch canonical IV step operand to point to the increment result.
+      CanonIV->setOperand(1, IncrRecipe->getDefinedValue());
+      IncrRecipe->getDefinedValue()->addUser(CanonIV);
+
+      // Exit cmp: incremented_iv icmp bound
+      auto *CmpRecipe = new TPCanonicalIVExitCmpRecipe(
+          IncrRecipe->getDefinedValue(), BoundTP);
+      Region->appendRecipe(CmpRecipe);
     }
 
     return Region;
