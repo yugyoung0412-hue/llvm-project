@@ -363,7 +363,10 @@ public:
 
   TPLoopRegion *getRootRegion() const { return RootRegion.get(); }
 
+  const TPSyntheticValue *getPF() const { return &PF; }
+
 private:
+  TPSyntheticValue PF{"PF"};
   std::string FuncName;
   unsigned Depth = 0;
   SmallVector<std::unique_ptr<TPLiveIn>> LiveIns;

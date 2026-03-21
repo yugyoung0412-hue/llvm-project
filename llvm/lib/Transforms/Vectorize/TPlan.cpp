@@ -408,7 +408,16 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
 void TPlan::print(raw_ostream &OS) const {
   OS << "TPlan '" << FuncName << "' (depth=" << Depth << ") {\n";
 
-  // Print live-ins
+  // Pre-assign PF as tp<%0> before any lazy recipe-slot assignment.
+  Tracker.reset();
+  Tracker.preAssignSynthetic(&PF);
+
+  // Print synthetic live-ins first (VPlan style).
+  OS << "Live-in ";
+  PF.printAsOperand(OS, Tracker);
+  OS << " = PF\n";
+
+  // Print IR-backed live-ins (unchanged, still ir<>).
   for (const auto &LI : LiveIns) {
     OS << "Live-in ";
     LI->printAsOperand(OS, Tracker);
