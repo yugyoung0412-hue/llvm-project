@@ -156,6 +156,42 @@ void TPWidenCastRecipe::print(raw_ostream &OS, unsigned Indent,
   OS << "\n";
 }
 
+void TPCanonicalIVRecipe::print(raw_ostream &OS, unsigned Indent,
+                                TPSlotTracker &Tracker) const {
+  printIndent(OS, Indent);
+  OS << "CANONICAL-INDUCTION ";
+  DefVal->printAsOperand(OS, Tracker);
+  OS << " = phi ";
+  Operands[0]->printAsOperand(OS, Tracker);
+  OS << ", ";
+  Operands[1]->printAsOperand(OS, Tracker);
+  OS << "\n";
+}
+
+void TPCanonicalIVIncrRecipe::print(raw_ostream &OS, unsigned Indent,
+                                    TPSlotTracker &Tracker) const {
+  printIndent(OS, Indent);
+  OS << "CANONICAL-INDUCTION-INC ";
+  DefVal->printAsOperand(OS, Tracker);
+  OS << " = add ";
+  Operands[0]->printAsOperand(OS, Tracker);
+  OS << ", ";
+  Operands[1]->printAsOperand(OS, Tracker);
+  OS << "\n";
+}
+
+void TPCanonicalIVExitCmpRecipe::print(raw_ostream &OS, unsigned Indent,
+                                       TPSlotTracker &Tracker) const {
+  printIndent(OS, Indent);
+  OS << "CANONICAL-INDUCTION-CMP ";
+  DefVal->printAsOperand(OS, Tracker);
+  OS << " = icmp ";
+  Operands[0]->printAsOperand(OS, Tracker);
+  OS << ", ";
+  Operands[1]->printAsOperand(OS, Tracker);
+  OS << "\n";
+}
+
 //===----------------------------------------------------------------------===//
 // TPLoopRegion::print
 //===----------------------------------------------------------------------===//
