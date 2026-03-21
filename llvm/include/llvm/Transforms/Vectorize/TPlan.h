@@ -134,6 +134,9 @@ public:
     WidenLoad,
     WidenStore,
     WidenCast,
+    CanonicalIV,
+    CanonicalIVIncr,
+    CanonicalIVExitCmp,
   };
 
   RecipeKind getKind() const { return Kind; }
@@ -320,6 +323,68 @@ public:
 
 private:
   Instruction *CastInst;
+};
+
+//===----------------------------------------------------------------------===//
+// TPCanonicalIVRecipe — CANONICAL-INDUCTION: synthetic loop counter phi
+//===----------------------------------------------------------------------===//
+class TPCanonicalIVRecipe : public TPRecipeBase {
+public:
+  /// StartVal: TPLiveIn for ir<0>. StepVal: placeholder; patched after
+  /// TPCanonicalIVIncrRecipe is created.
+  TPCanonicalIVRecipe(TPValue *StartVal, TPValue *StepVal)
+      : TPRecipeBase(RecipeKind::CanonicalIV) {
+    addOperand(StartVal);
+    addOperand(StepVal);
+  }
+
+  void print(raw_ostream &OS, unsigned Indent,
+             TPSlotTracker &Tracker) const override;
+
+  static bool classof(const TPRecipeBase *R) {
+    return R->getKind() == RecipeKind::CanonicalIV;
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// TPCanonicalIVIncrRecipe — CANONICAL-INDUCTION-INC: canonical IV + PF
+//===----------------------------------------------------------------------===//
+class TPCanonicalIVIncrRecipe : public TPRecipeBase {
+public:
+  /// IVVal: TPDefVal of TPCanonicalIVRecipe. PFVal: TPSyntheticValue for PF.
+  TPCanonicalIVIncrRecipe(TPValue *IVVal, TPValue *PFVal)
+      : TPRecipeBase(RecipeKind::CanonicalIVIncr) {
+    addOperand(IVVal);
+    addOperand(PFVal);
+  }
+
+  void print(raw_ostream &OS, unsigned Indent,
+             TPSlotTracker &Tracker) const override;
+
+  static bool classof(const TPRecipeBase *R) {
+    return R->getKind() == RecipeKind::CanonicalIVIncr;
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// TPCanonicalIVExitCmpRecipe — CANONICAL-INDUCTION-CMP: exit condition icmp
+//===----------------------------------------------------------------------===//
+class TPCanonicalIVExitCmpRecipe : public TPRecipeBase {
+public:
+  /// IncrVal: TPDefVal of TPCanonicalIVIncrRecipe. BoundVal: TPLiveIn for
+  /// the loop bound (RHS of the latch ICmpInst).
+  TPCanonicalIVExitCmpRecipe(TPValue *IncrVal, TPValue *BoundVal)
+      : TPRecipeBase(RecipeKind::CanonicalIVExitCmp) {
+    addOperand(IncrVal);
+    addOperand(BoundVal);
+  }
+
+  void print(raw_ostream &OS, unsigned Indent,
+             TPSlotTracker &Tracker) const override;
+
+  static bool classof(const TPRecipeBase *R) {
+    return R->getKind() == RecipeKind::CanonicalIVExitCmp;
+  }
 };
 
 //===----------------------------------------------------------------------===//
