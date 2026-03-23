@@ -21,6 +21,7 @@
 
 namespace llvm {
 
+class BasicBlock;
 class DominatorTree;
 class Function;
 class Instruction;
@@ -28,12 +29,17 @@ class Loop;
 class LoopInfo;
 class ScalarEvolution;
 class SCEV;
-class TPlan;
+class TPBasicBlock;
+class TPBlockBase;
+class TPBlockUtils;
+class TPIRBasicBlock;
 class TPLoopRegion;
 class TPRecipeBase;
+class TPRegionBlock;
 class TPSingleDefRecipe;
 class TPSlotTracker;
 class TPSyntheticValue;
+class TPlan;
 class Value;
 struct TPTransformState;
 
@@ -131,6 +137,99 @@ public:
 private:
   DenseMap<const TPValue *, unsigned> SlotMap;
   unsigned NextSlot = 0;
+};
+
+//===----------------------------------------------------------------------===//
+// TPBlockBase — base for all TPlan CFG blocks (mirrors VPBlockBase)
+//===----------------------------------------------------------------------===//
+class TPBlockBase {
+  friend class TPBlockUtils;
+
+public:
+  using TPBlockTy = enum { TPRegionBlockSC, TPBasicBlockSC, TPIRBasicBlockSC };
+  using TPBlocksTy = SmallVectorImpl<TPBlockBase *>;
+
+protected:
+  TPBlockBase(unsigned char SC, StringRef N) : SubclassID(SC), Name(N.str()) {}
+
+public:
+  virtual ~TPBlockBase() = default;
+
+  unsigned getTPBlockID() const { return SubclassID; }
+  const std::string &getName() const { return Name; }
+  void setName(StringRef N) { Name = N.str(); }
+
+  TPRegionBlock *getParent() { return Parent; }
+  const TPRegionBlock *getParent() const { return Parent; }
+  void setParent(TPRegionBlock *P) { Parent = P; }
+
+  /// Only valid on the plan's entry block.
+  TPlan *getPlan() const { return Plan; }
+  void setPlan(TPlan *P) { Plan = P; }
+
+  const TPBlocksTy &getSuccessors() const { return Successors; }
+  TPBlocksTy &getSuccessors() { return Successors; }
+  const TPBlocksTy &getPredecessors() const { return Predecessors; }
+  TPBlocksTy &getPredecessors() { return Predecessors; }
+
+  TPBlockBase *getSingleSuccessor() const {
+    return Successors.size() == 1 ? Successors[0] : nullptr;
+  }
+  TPBlockBase *getSinglePredecessor() const {
+    return Predecessors.size() == 1 ? Predecessors[0] : nullptr;
+  }
+  size_t getNumSuccessors() const { return Successors.size(); }
+  size_t getNumPredecessors() const { return Predecessors.size(); }
+
+  void setOneSuccessor(TPBlockBase *S) {
+    assert(Successors.empty() && "Successor already set");
+    assert(S->getParent() == getParent() && "Blocks must share parent");
+    appendSuccessor(S);
+  }
+  void setTwoSuccessors(TPBlockBase *S0, TPBlockBase *S1) {
+    assert(Successors.empty() && "Successors already set");
+    assert(S0->getParent() == getParent() && "Blocks must share parent");
+    assert(S1->getParent() == getParent() && "Blocks must share parent");
+    appendSuccessor(S0);
+    appendSuccessor(S1);
+  }
+  void setPredecessors(ArrayRef<TPBlockBase *> Preds) {
+    assert(Predecessors.empty() && "Predecessors already set");
+    for (auto *P : Preds) appendPredecessor(P);
+  }
+  void setSuccessors(ArrayRef<TPBlockBase *> Succs) {
+    assert(Successors.empty() && "Successors already set");
+    for (auto *S : Succs) appendSuccessor(S);
+  }
+  void clearPredecessors() { Predecessors.clear(); }
+  void clearSuccessors() { Successors.clear(); }
+
+  virtual void execute(TPTransformState &State) = 0;
+  virtual void print(raw_ostream &OS, const Twine &Indent,
+                     TPSlotTracker &Tracker) const = 0;
+
+private:
+  const unsigned char SubclassID;
+  std::string Name;
+  TPRegionBlock *Parent = nullptr;
+  TPlan *Plan = nullptr; ///< Only set on the plan's entry block.
+  SmallVector<TPBlockBase *, 1> Predecessors;
+  SmallVector<TPBlockBase *, 1> Successors;
+
+  void appendSuccessor(TPBlockBase *S) { Successors.push_back(S); }
+  void appendPredecessor(TPBlockBase *P) { Predecessors.push_back(P); }
+  void removeSuccessor(TPBlockBase *S) {
+    auto *It = llvm::find(Successors, S);
+    assert(It != Successors.end()); Successors.erase(It);
+  }
+  void removePredecessor(TPBlockBase *P) {
+    auto *It = llvm::find(Predecessors, P);
+    assert(It != Predecessors.end()); Predecessors.erase(It);
+  }
+  void replacePredecessor(TPBlockBase *Old, TPBlockBase *New) {
+    auto *It = llvm::find(Predecessors, Old);
+    assert(It != Predecessors.end()); *It = New;
+  }
 };
 
 //===----------------------------------------------------------------------===//
