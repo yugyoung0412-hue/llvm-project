@@ -203,11 +203,26 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
 
 bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
                                 ScalarEvolution &SE, DominatorTree &DT) {
-  // TODO: rewire in commit 2 — walk block CFG via constructionOrder().
-  (void)Plan;
-  (void)F;
-  (void)LI;
-  (void)SE;
-  (void)DT;
-  return false;
+  // 1. Propagate DimSets via BFS.
+  TPlanWidener_widen(Plan);
+
+  // 2. Classify every recipe by DimSet patterns.
+  RecipeClassMap CM;
+  TPRecipePatternMatcher_match(Plan, CM);
+
+  // 3. Lower: walk block CFG in construction order.
+  IRBuilder<> Builder(F.getContext());
+  if (!F.empty())
+    Builder.SetInsertPoint(&F.getEntryBlock().front());
+
+  TPTransformState State(Builder, Plan);
+  State.ClassMap = &CM;
+
+  if (Plan.getEntry()) {
+    // Collect and execute all blocks in top-level construction order.
+    // TPRegionBlock::execute() recurses into its interior.
+    for (TPBlockBase *B : constructionOrder(Plan.getEntry()))
+      B->execute(State);
+  }
+  return true;
 }

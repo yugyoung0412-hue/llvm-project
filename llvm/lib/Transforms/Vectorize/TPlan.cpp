@@ -294,16 +294,27 @@ void TPRegionBlock::print(raw_ostream &OS, const Twine &Indent,
 // TPBlockBase subclass execute() stubs (rewired in commit 2)
 //===----------------------------------------------------------------------===//
 
-void TPBasicBlock::execute(TPTransformState &) {
-  // TODO: rewire in commit 2
+void TPBasicBlock::execute(TPTransformState &State) {
+  // Each recipe handles its own IR emission using State.Builder.
+  for (TPRecipeBase &R : Recipes)
+    R.execute(State);
 }
 
-void TPIRBasicBlock::execute(TPTransformState &) {
-  // TODO: rewire in commit 2
+void TPIRBasicBlock::execute(TPTransformState &State) {
+  // Recipes are inserted before the first non-phi instruction of IRBB.
+  Instruction *InsertPt = &*IRBB->getFirstNonPHIIt();
+  State.Builder.SetInsertPoint(InsertPt);
+  for (TPRecipeBase &R : Recipes)
+    R.execute(State);
 }
 
-void TPRegionBlock::execute(TPTransformState &) {
-  // TODO: rewire in commit 2
+void TPRegionBlock::execute(TPTransformState &State) {
+  // Walk internal CFG in construction order (DFS pre-order from Entry).
+  // The latch block's recipes (IV incr + cmp) have no successors within the
+  // region, so execution order matches the def-use requirements.
+  if (Entry)
+    for (TPBlockBase *B : constructionOrder(Entry))
+      B->execute(State);
 }
 
 //===----------------------------------------------------------------------===//

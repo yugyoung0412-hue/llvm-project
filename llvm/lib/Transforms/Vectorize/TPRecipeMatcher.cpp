@@ -7,9 +7,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Vectorize/TPRecipeMatcher.h"
-#include "llvm/Transforms/Vectorize/TPlan.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Transforms/Vectorize/TPlan.h"
 
 using namespace llvm;
 
@@ -169,10 +171,44 @@ SmallVector<unsigned> llvm::getTPValueShape(const TPSingleDefRecipe &V,
   return Shape;
 }
 
+/// Collect all TPBasicBlock instances by recursively walking block successors
+/// and descending into TPRegionBlock interiors.
+static void collectBBs(TPBlockBase *Start,
+                        SmallVectorImpl<const TPBasicBlock *> &Out,
+                        SmallPtrSetImpl<TPBlockBase *> &Visited) {
+  if (!Start || !Visited.insert(Start).second)
+    return;
+  if (auto *BB = dyn_cast<TPBasicBlock>(Start))
+    Out.push_back(BB);
+  if (auto *R = dyn_cast<TPRegionBlock>(Start))
+    if (R->getEntry())
+      collectBBs(R->getEntry(), Out, Visited);
+  for (TPBlockBase *Succ : Start->getSuccessors())
+    collectBBs(Succ, Out, Visited);
+}
+
 void llvm::TPRecipePatternMatcher_match(const TPlan &Plan,
                                          RecipeClassMap &Out) {
-  // TODO: rewire in commit 2 — walk block CFG via constructionOrder().
-  (void)Plan;
+  SmallVector<const TPBasicBlock *, 32> AllBBs;
+  SmallPtrSet<TPBlockBase *, 32> Visited;
+  if (Plan.getEntry())
+    collectBBs(const_cast<TPBlockBase *>(Plan.getEntry()), AllBBs, Visited);
+
+  for (const TPBasicBlock *BB : AllBBs) {
+    for (const TPRecipeBase &R : *BB) {
+      RecipeClassification C;
+      if (isReductionUpdate(&R)) {
+        C = classifyReduction(R, Plan);
+      } else if (R.getKind() == TPRecipeBase::RecipeKind::Widen &&
+                 isa<BinaryOperator>(
+                     cast<TPWidenRecipe>(R).getInstruction()) &&
+                 R.operands().size() == 2) {
+        C.Kind = classifyBinaryOp(R);
+      }
+      // else: load, store, cast, PHI, canonical IV → default Scalar
+      Out[&R] = C;
+    }
+  }
 
   // Second pass: mark each FusedMulRecipe of a Contraction as Contraction too.
   // This ensures the fmul's execute() is a no-op (deferred to its consumer).
