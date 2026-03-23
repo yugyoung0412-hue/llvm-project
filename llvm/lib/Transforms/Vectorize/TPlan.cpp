@@ -7,6 +7,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Vectorize/TPlan.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/IR/BasicBlock.h"
@@ -91,6 +93,40 @@ void TPSingleDefRecipe::printAsOperand(raw_ostream &OS,
 static void printIndent(raw_ostream &OS, unsigned Indent) {
   for (unsigned I = 0; I < Indent; ++I)
     OS << "  ";
+}
+
+/// DFS pre-order traversal starting from \p Start, following successors in
+/// insertion order. Visited tracking prevents re-visiting latchBB.
+SmallVector<TPBlockBase *, 8>
+llvm::constructionOrder(TPBlockBase *Start) {
+  SmallVector<TPBlockBase *, 8> Order;
+  SmallPtrSet<TPBlockBase *, 8> Visited;
+  SmallVector<TPBlockBase *, 8> Stack;
+  Stack.push_back(Start);
+  while (!Stack.empty()) {
+    TPBlockBase *B = Stack.pop_back_val();
+    if (!Visited.insert(B).second)
+      continue;
+    Order.push_back(B);
+    // Push successors reversed so successor[0] is visited first (LIFO).
+    for (TPBlockBase *Succ : llvm::reverse(B->getSuccessors()))
+      if (!Visited.count(Succ))
+        Stack.push_back(Succ);
+  }
+  return Order;
+}
+
+static void printBlockSuccessors(raw_ostream &OS, const Twine &Indent,
+                                  const TPBlockBase *B) {
+  OS << Indent;
+  if (B->getSuccessors().empty()) {
+    OS << "No successors\n";
+    return;
+  }
+  OS << "Successor(s):";
+  for (const TPBlockBase *S : B->getSuccessors())
+    OS << " " << S->getName();
+  OS << "\n";
 }
 
 void TPWidenInductionRecipe::print(raw_ostream &OS, unsigned Indent,
@@ -214,27 +250,60 @@ void TPCanonicalIVExitCmpRecipe::print(raw_ostream &OS, unsigned Indent,
 }
 
 //===----------------------------------------------------------------------===//
-// TPLoopRegion::print
+// TPBlockBase subclass print() implementations
 //===----------------------------------------------------------------------===//
 
-void TPLoopRegion::print(raw_ostream &OS, unsigned Indent,
-                         TPSlotTracker &Tracker) const {
-  printIndent(OS, Indent);
-  OS << "<x1> loop[" << Level << "] (trip=";
-  if (TripCount)
-    TripCount->print(OS);
-  else
-    OS << "<unknown>";
-  OS << ") {\n";
-
+void TPBasicBlock::print(raw_ostream &OS, const Twine &Indent,
+                          TPSlotTracker &Tracker) const {
+  OS << Indent << getName() << ":\n";
+  // Recipes use unsigned Indent (existing API); compute depth from Twine length.
+  // Invariant: each nesting level is exactly 2 spaces, so depth = len/2.
+  unsigned RecipeDepth = Indent.str().size() / 2 + 1;
   for (const TPRecipeBase &R : Recipes)
-    R.print(OS, Indent + 1, Tracker);
+    R.print(OS, RecipeDepth, Tracker);
+  printBlockSuccessors(OS, Indent, this);
+  OS << "\n";
+}
 
-  if (Child)
-    Child->print(OS, Indent + 1, Tracker);
+void TPIRBasicBlock::print(raw_ostream &OS, const Twine &Indent,
+                            TPSlotTracker &Tracker) const {
+  OS << Indent << getName() << ":\n";
+  unsigned RecipeDepth = Indent.str().size() / 2 + 1;
+  for (const TPRecipeBase &R : Recipes)
+    R.print(OS, RecipeDepth, Tracker);
+  printBlockSuccessors(OS, Indent, this);
+  OS << "\n";
+}
 
-  printIndent(OS, Indent);
-  OS << "}\n";
+void TPRegionBlock::print(raw_ostream &OS, const Twine &Indent,
+                           TPSlotTracker &Tracker) const {
+  OS << Indent << "<x1> " << getName() << ": {\n";
+  if (Entry) {
+    // Materialise the indent string — Twine is a non-owning ref type and
+    // must not be stored as a named variable (dangling reference UB).
+    std::string InnerIndentStr = (Indent + "  ").str();
+    for (TPBlockBase *B : constructionOrder(Entry))
+      B->print(OS, InnerIndentStr, Tracker);
+  }
+  OS << Indent << "}\n";
+  printBlockSuccessors(OS, Indent, this);
+  OS << "\n";
+}
+
+//===----------------------------------------------------------------------===//
+// TPBlockBase subclass execute() stubs (rewired in commit 2)
+//===----------------------------------------------------------------------===//
+
+void TPBasicBlock::execute(TPTransformState &) {
+  // TODO: rewire in commit 2
+}
+
+void TPIRBasicBlock::execute(TPTransformState &) {
+  // TODO: rewire in commit 2
+}
+
+void TPRegionBlock::execute(TPTransformState &) {
+  // TODO: rewire in commit 2
 }
 
 //===----------------------------------------------------------------------===//
