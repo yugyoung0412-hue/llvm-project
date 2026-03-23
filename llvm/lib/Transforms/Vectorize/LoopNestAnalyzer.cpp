@@ -37,22 +37,68 @@ llvm::analyzeLoopNest(ArrayRef<Loop *> Nest, ScalarEvolution &SE,
   Info.Depth = Nest.size();
 
   for (Loop *L : Nest) {
-    if (!L->isLoopSimplifyForm())
-      return std::nullopt;
-
     InductionDesc IV;
-    IV.IndVar    = L->getInductionVariable(SE);
-    IV.TripCount = SE.getBackedgeTakenCount(L);
-    if (!IV.IndVar || isa<SCEVCouldNotCompute>(IV.TripCount))
+
+    if (L->isLoopSimplifyForm()) {
+      IV.IndVar    = L->getInductionVariable(SE);
+      IV.TripCount = SE.getBackedgeTakenCount(L);
+      if (isa<SCEVCouldNotCompute>(IV.TripCount))
+        IV.TripCount = nullptr;
+    }
+
+    // If getInductionVariable failed (e.g., loop not in simplify form),
+    // try to find a canonical IV manually: a PHI in the header that starts
+    // at 0 and increments by 1.
+    if (!IV.IndVar) {
+      BasicBlock *Header = L->getHeader();
+      BasicBlock *Latch  = L->getLoopLatch();
+      for (PHINode &Phi : Header->phis()) {
+        if (!Phi.getType()->isIntegerTy())
+          continue;
+        // Check for start value == 0 from outside the loop.
+        Value *StartVal = nullptr;
+        Value *LatchVal = nullptr;
+        for (unsigned I = 0, E = Phi.getNumIncomingValues(); I < E; ++I) {
+          BasicBlock *Pred = Phi.getIncomingBlock(I);
+          if (Latch && Pred == Latch)
+            LatchVal = Phi.getIncomingValue(I);
+          else if (!L->contains(Pred))
+            StartVal = Phi.getIncomingValue(I);
+        }
+        auto *StartConst = dyn_cast_or_null<ConstantInt>(StartVal);
+        if (!StartConst || !StartConst->isZero())
+          continue;
+        // Check for latch value == phi + 1.
+        auto *Inc = dyn_cast_or_null<BinaryOperator>(LatchVal);
+        if (!Inc || Inc->getOpcode() != Instruction::Add)
+          continue;
+        bool IsCanonical = false;
+        for (unsigned I = 0; I < 2; ++I) {
+          if (Inc->getOperand(I) == &Phi)
+            if (auto *C = dyn_cast<ConstantInt>(Inc->getOperand(1 - I)))
+              if (C->isOne())
+                IsCanonical = true;
+        }
+        if (IsCanonical) {
+          IV.IndVar = &Phi;
+          // Try to get trip count via SCEV even without simplify form.
+          IV.TripCount = SE.getBackedgeTakenCount(L);
+          if (isa<SCEVCouldNotCompute>(IV.TripCount))
+            IV.TripCount = nullptr;
+          break;
+        }
+      }
+    }
+
+    if (!IV.IndVar)
       return std::nullopt;
 
-    // Fix 1: Extract step from the SCEV AddRec expression rather than
-    // hardcoding 1.
+    // Extract step from the SCEV AddRec expression.
     const SCEV *IndVarSCEV = SE.getSCEV(IV.IndVar);
     if (auto *AddRec = dyn_cast<SCEVAddRecExpr>(IndVarSCEV))
       IV.Step = AddRec->getStepRecurrence(SE);
     else
-      return std::nullopt; // Not a recognized induction variable
+      IV.Step = nullptr; // Step unknown but don't reject
 
     Info.IVs.push_back(IV);
   }
@@ -106,5 +152,35 @@ llvm::analyzeLoopNest(ArrayRef<Loop *> Nest, ScalarEvolution &SE,
   }
 
   Info.Loops = SmallVector<Loop *>(Nest);
+
+  // Populate ReductionDims: dim d is a reduction dim if the loop at depth d
+  // does not appear as an AddRec in any store access's SCEV expression.
+  Info.ReductionDims.resize(Info.Depth, false);
+  for (unsigned D = 0; D < Info.Depth; ++D) {
+    bool AppearInStore = false;
+    for (const MemAccess &MA : Info.Accesses) {
+      if (MA.Kind == AccessKind::Read)
+        continue;
+      for (const SCEV *IdxExpr : MA.IndexExprs) {
+        struct ContainsAddRec {
+          Loop *L;
+          bool Found = false;
+          bool follow(const SCEV *S) {
+            if (const auto *AR = dyn_cast<SCEVAddRecExpr>(S))
+              if (AR->getLoop() == L) { Found = true; return false; }
+            return !Found;
+          }
+          bool isDone() const { return Found; }
+        } Checker{Nest[D]};
+        SCEVTraversal<ContainsAddRec> T(Checker);
+        T.visitAll(IdxExpr);
+        if (Checker.Found) { AppearInStore = true; break; }
+      }
+      if (AppearInStore) break;
+    }
+    if (!AppearInStore)
+      Info.ReductionDims.set(D);
+  }
+
   return Info;
 }
