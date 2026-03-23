@@ -33,7 +33,6 @@ class TPBasicBlock;
 class TPBlockBase;
 class TPBlockUtils;
 class TPIRBasicBlock;
-class TPLoopRegion;
 class TPRecipeBase;
 class TPRegionBlock;
 class TPSingleDefRecipe;
@@ -698,46 +697,24 @@ public:
 };
 
 //===----------------------------------------------------------------------===//
-// TPLoopRegion — one per nesting level, owns recipes + child region
-//===----------------------------------------------------------------------===//
-class TPLoopRegion {
-public:
-  TPLoopRegion(unsigned Level, Loop *L, const SCEV *TripCount)
-      : Level(Level), OwnerLoop(L), TripCount(TripCount) {}
-
-  void appendRecipe(TPRecipeBase *R) { Recipes.push_back(R); }
-  void setIV(TPSingleDefRecipe *V) { IV = V; }
-  TPSingleDefRecipe *getIV() const { return IV; }
-  void setChild(std::unique_ptr<TPLoopRegion> C) { Child = std::move(C); }
-  TPLoopRegion *getChild() const { return Child.get(); }
-  unsigned getLevel() const { return Level; }
-  Loop *getLoop() const { return OwnerLoop; }
-  const SCEV *getTripCount() const { return TripCount; }
-  iplist<TPRecipeBase> &getRecipes() { return Recipes; }
-  const iplist<TPRecipeBase> &getRecipes() const { return Recipes; }
-
-  void print(raw_ostream &OS, unsigned Indent, TPSlotTracker &Tracker) const;
-
-private:
-  unsigned Level;
-  Loop *OwnerLoop;
-  const SCEV *TripCount;
-  TPSingleDefRecipe *IV = nullptr;
-  iplist<TPRecipeBase> Recipes;
-  std::unique_ptr<TPLoopRegion> Child;
-};
-
-//===----------------------------------------------------------------------===//
-// TPlan — top-level container: root region, live-ins, slot tracker
+// TPlan — top-level container: entry block, live-ins, slot tracker
 //===----------------------------------------------------------------------===//
 class TPlan {
 public:
   /// Build an initial TPlan by walking the loop nest IR.
   static TPlan buildInitial(const LoopNestInfo &Info);
 
-  void print(raw_ostream &OS) const;
+  TPlan(const TPlan &) = delete;
+  TPlan &operator=(const TPlan &) = delete;
+  TPlan(TPlan &&) = default;
+  TPlan &operator=(TPlan &&) = default;
 
-  TPLoopRegion *getRootRegion() const { return RootRegion.get(); }
+  ~TPlan() {
+    for (auto *B : CreatedBlocks)
+      delete B;
+  }
+
+  void print(raw_ostream &OS) const;
 
   /// Returns the per-dimension parallel-factor synthetic value for dim \p D.
   TPSyntheticValue *getDimPF(unsigned D) const {
@@ -755,6 +732,28 @@ public:
   }
   void setDimPF(unsigned Dim, unsigned PF) { DimPFMap[Dim] = PF; }
 
+  /// Entry block (outermost preheader, a TPBasicBlock).
+  TPBlockBase *getEntry() const { return Entry; }
+  /// Set the plan's outermost entry block.
+  void setEntry(TPBlockBase *B) { Entry = B; }
+
+  /// Factory methods — allocate and track blocks.
+  TPBasicBlock *createTPBasicBlock(StringRef Name) {
+    auto *B = new TPBasicBlock(Name);
+    CreatedBlocks.push_back(B);
+    return B;
+  }
+  TPRegionBlock *createTPRegionBlock(StringRef Name) {
+    auto *B = new TPRegionBlock(Name);
+    CreatedBlocks.push_back(B);
+    return B;
+  }
+  TPIRBasicBlock *createTPIRBasicBlock(BasicBlock *IRBB) {
+    auto *B = new TPIRBasicBlock(IRBB);
+    CreatedBlocks.push_back(B);
+    return B;
+  }
+
 private:
   SmallVector<std::unique_ptr<TPSyntheticValue>> DimPFs; ///< PF[0]…PF[Depth-1]
   std::string FuncName;
@@ -762,7 +761,8 @@ private:
   SmallBitVector ReductionDims;              ///< Dims not in any store IndexExpr.
   DenseMap<unsigned, unsigned> DimPFMap;     ///< dim index → parallel factor.
   SmallVector<std::unique_ptr<TPLiveIn>> LiveIns;
-  std::unique_ptr<TPLoopRegion> RootRegion;
+  TPBlockBase *Entry = nullptr;                 ///< Outermost preheader block.
+  SmallVector<TPBlockBase *> CreatedBlocks;      ///< Owns all blocks.
   mutable TPSlotTracker Tracker;
 
   // Map from IR Value* to the TPValue* representing it (live-in or def).
