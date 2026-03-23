@@ -19,6 +19,7 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/Vectorize/LoopNestAnalyzer.h"
+#include "llvm/Transforms/Vectorize/TPlan.h"
 #include "llvm/Transforms/Vectorize/TensorCodeGen.h"
 #include "llvm/Transforms/Vectorize/TensorCostModel.h"
 #include "llvm/Transforms/Vectorize/TensorISAInfo.h"
@@ -45,6 +46,15 @@ PreservedAnalyses LoopTensorizePass::run(Function &F,
     auto InfoOpt = analyzeLoopNest(RawNest, SE, DI);
     if (!InfoOpt)
       continue;
+
+    // Build and print the initial TPlan (all PFs = 1).
+    TPlan Plan = TPlan::buildInitial(*InfoOpt);
+    LLVM_DEBUG(Plan.print(dbgs()));
+
+    // Set per-dim parallel factors (tile sizes) and lower to IR.
+    for (unsigned D = 0; D < InfoOpt->Depth; ++D)
+      Plan.setDimPF(D, 1); // placeholder; real heuristic to come
+    TPlanLowering_lower(Plan, F, LI, SE, DT);
 
     PatternHint Hint = classifyPattern(*InfoOpt);
     LLVM_DEBUG(dbgs() << "PatternHint: "

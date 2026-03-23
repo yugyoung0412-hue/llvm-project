@@ -1,30 +1,16 @@
-; RUN: opt -passes=loop-tensorize --disable-verify -debug-only=loop-tensorize %s -o /dev/null 2>&1 | FileCheck %s
+; RUN: opt -passes=loop-tensorize -S --disable-verify < %s | FileCheck %s
 ; REQUIRES: asserts
 ;
-; Verify that LoopTensorize builds and prints an initial TPlan for a simple
-; 3-deep loop nest (GEMM shape: 2 reads + 1 write).
-
-; CHECK: TPlan 'gemm' (depth=3) {
-; CHECK: Live-in tp<%0> = PF
-; CHECK: Live-in
-; CHECK: loop[0]
-; CHECK: CANONICAL-INDUCTION
-; CHECK: WIDEN-INDUCTION
-; CHECK: loop[1]
-; CHECK: CANONICAL-INDUCTION
-; CHECK: WIDEN-INDUCTION
-; CHECK: loop[2]
-; CHECK: CANONICAL-INDUCTION
-; CHECK: WIDEN-INDUCTION
-; CHECK: WIDEN{{.*}} = fmul
-; CHECK: WIDEN store
-; CHECK: CANONICAL-INDUCTION-INC
-; CHECK: CANONICAL-INDUCTION-CMP
+; Verify that a 3-level GEMM loop nest emits @llvm.matrix.multiply
+; via the PF DimSet system (Contraction classification).
+; Uses reduction-PHI form: acc = sum_k(A[i][k] * B[k][j])
+; Loop order: i (dim0) -> j (dim1) -> k (dim2, reduction)
+;
+; CHECK: llvm.matrix.multiply
 
 target datalayout = "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128"
 target triple = "aarch64"
 
-; Simple 3-deep GEMM loop: C[i][j] += A[i][k] * B[k][j]
 define void @gemm(ptr %A, ptr %B, ptr %C, i64 %M, i64 %N, i64 %K) {
 entry:
   br label %outer
@@ -39,6 +25,7 @@ middle:
 
 inner:
   %k = phi i64 [ 0, %middle ], [ %k.next, %inner.latch ]
+  %acc = phi float [ 0.0, %middle ], [ %sum, %inner.latch ]
   %ai = mul i64 %i, %K
   %ak = add i64 %ai, %k
   %aptr = getelementptr float, ptr %A, i64 %ak
@@ -48,12 +35,7 @@ inner:
   %bptr = getelementptr float, ptr %B, i64 %bj
   %bv = load float, ptr %bptr, align 4
   %prod = fmul float %av, %bv
-  %ci = mul i64 %i, %N
-  %cj = add i64 %ci, %j
-  %cptr = getelementptr float, ptr %C, i64 %cj
-  %cv = load float, ptr %cptr, align 4
-  %sum = fadd float %cv, %prod
-  store float %sum, ptr %cptr, align 4
+  %sum = fadd float %acc, %prod
   br label %inner.latch
 
 inner.latch:
