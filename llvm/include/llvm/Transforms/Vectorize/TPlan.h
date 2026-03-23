@@ -9,17 +9,24 @@
 #define LLVM_TRANSFORMS_VECTORIZE_TPLAN_H
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/ilist.h"
 #include "llvm/ADT/ilist_node.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Vectorize/LoopNestAnalyzer.h"
+#include "llvm/Transforms/Vectorize/TPlanTypes.h"
 #include <memory>
 
 namespace llvm {
 
+class DominatorTree;
+class Function;
 class Instruction;
 class Loop;
+class LoopInfo;
+class ScalarEvolution;
 class SCEV;
 class TPDefVal;
 class TPlan;
@@ -28,20 +35,29 @@ class TPRecipeBase;
 class TPSlotTracker;
 class TPSyntheticValue;
 class Value;
+struct TPTransformState;
 
 //===----------------------------------------------------------------------===//
 // TPValue — base SSA value node with use tracking
 //===----------------------------------------------------------------------===//
 class TPValue {
 public:
+  enum class ValueKind { LiveIn, Synthetic, Def };
+
+  explicit TPValue(ValueKind K) : Kind(K) {}
   virtual ~TPValue() = default;
   virtual void printAsOperand(raw_ostream &OS, TPSlotTracker &Tracker) const = 0;
+
+  ValueKind getValueKind() const { return Kind; }
 
   void addUser(class TPUser *U) { Users.push_back(U); }
   ArrayRef<class TPUser *> users() const { return Users; }
 
 protected:
   SmallVector<class TPUser *, 2> Users;
+
+private:
+  ValueKind Kind;
 };
 
 //===----------------------------------------------------------------------===//
@@ -68,9 +84,13 @@ protected:
 //===----------------------------------------------------------------------===//
 class TPLiveIn : public TPValue {
 public:
-  explicit TPLiveIn(Value *V) : IRVal(V) {}
+  explicit TPLiveIn(Value *V) : TPValue(ValueKind::LiveIn), IRVal(V) {}
   Value *getIRValue() const { return IRVal; }
   void printAsOperand(raw_ostream &OS, TPSlotTracker &Tracker) const override;
+
+  static bool classof(const TPValue *V) {
+    return V->getValueKind() == ValueKind::LiveIn;
+  }
 
 private:
   Value *IRVal;
@@ -81,9 +101,14 @@ private:
 //===----------------------------------------------------------------------===//
 class TPSyntheticValue : public TPValue {
 public:
-  explicit TPSyntheticValue(StringRef Name) : Name(Name) {}
+  explicit TPSyntheticValue(StringRef Name)
+      : TPValue(ValueKind::Synthetic), Name(Name) {}
   StringRef getName() const { return Name; }
   void printAsOperand(raw_ostream &OS, TPSlotTracker &Tracker) const override;
+
+  static bool classof(const TPValue *V) {
+    return V->getValueKind() == ValueKind::Synthetic;
+  }
 
 private:
   std::string Name;
@@ -113,9 +138,16 @@ private:
 //===----------------------------------------------------------------------===//
 class TPDefVal : public TPValue {
 public:
-  explicit TPDefVal(TPRecipeBase *R) : DefRecipe(R) {}
+  explicit TPDefVal(TPRecipeBase *R)
+      : TPValue(ValueKind::Def), DefRecipe(R) {}
   TPRecipeBase *getDefiningRecipe() const { return DefRecipe; }
   void printAsOperand(raw_ostream &OS, TPSlotTracker &Tracker) const override;
+
+  SmallBitVector DimSet; ///< Loop dim indices this value spans; set by TPlanWidener_widen().
+
+  static bool classof(const TPValue *V) {
+    return V->getValueKind() == ValueKind::Def;
+  }
 
 private:
   TPRecipeBase *DefRecipe;
@@ -146,7 +178,11 @@ public:
 
   virtual void print(raw_ostream &OS, unsigned Indent,
                      TPSlotTracker &Tracker) const = 0;
+  virtual void execute(TPTransformState &State) const = 0;
   virtual ~TPRecipeBase() = default;
+
+  /// All TPUser instances in a TPlan are TPRecipeBase instances.
+  static bool classof(const TPUser *) { return true; }
 
 protected:
   explicit TPRecipeBase(RecipeKind K, bool DefinesValue = true) : Kind(K) {
@@ -163,16 +199,19 @@ protected:
 //===----------------------------------------------------------------------===//
 class TPWidenInductionRecipe : public TPRecipeBase {
 public:
-  TPWidenInductionRecipe(PHINode *IV, TPValue *StartVal, TPValue *StepVal)
-      : TPRecipeBase(RecipeKind::WidenInduction), IVPhi(IV) {
+  TPWidenInductionRecipe(PHINode *IV, TPValue *StartVal, TPValue *StepVal,
+                          unsigned DimIdx = 0)
+      : TPRecipeBase(RecipeKind::WidenInduction), IVPhi(IV), DimIndex(DimIdx) {
     addOperand(StartVal);
     addOperand(StepVal);
   }
 
   PHINode *getIVPhi() const { return IVPhi; }
+  unsigned getDimIndex() const { return DimIndex; }
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::WidenInduction;
@@ -180,6 +219,7 @@ public:
 
 private:
   PHINode *IVPhi;
+  unsigned DimIndex = 0; ///< Index in LoopNestInfo::IVs (0 = outermost).
 };
 
 //===----------------------------------------------------------------------===//
@@ -197,6 +237,7 @@ public:
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::ReductionPHI;
@@ -221,6 +262,7 @@ public:
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::Widen;
@@ -245,6 +287,7 @@ public:
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::WidenGEP;
@@ -268,6 +311,7 @@ public:
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::WidenLoad;
@@ -293,6 +337,7 @@ public:
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::WidenStore;
@@ -316,6 +361,7 @@ public:
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::WidenCast;
@@ -340,6 +386,7 @@ public:
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::CanonicalIV;
@@ -360,6 +407,7 @@ public:
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::CanonicalIVIncr;
@@ -381,6 +429,7 @@ public:
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::CanonicalIVExitCmp;
@@ -404,6 +453,7 @@ public:
   Loop *getLoop() const { return OwnerLoop; }
   const SCEV *getTripCount() const { return TripCount; }
   iplist<TPRecipeBase> &getRecipes() { return Recipes; }
+  const iplist<TPRecipeBase> &getRecipes() const { return Recipes; }
 
   void print(raw_ostream &OS, unsigned Indent, TPSlotTracker &Tracker) const;
 
@@ -430,10 +480,22 @@ public:
 
   const TPSyntheticValue *getPF() const { return &PF; }
 
+  const SmallBitVector &getReductionDims() const { return ReductionDims; }
+
+  /// Returns the parallel factor for dimension \p Dim. Default: 1 (scalar).
+  /// Set by LoopTensorize via setDimPF() before lowering.
+  unsigned getPFForDim(unsigned Dim) const {
+    auto It = DimPFMap.find(Dim);
+    return It != DimPFMap.end() ? It->second : 1u;
+  }
+  void setDimPF(unsigned Dim, unsigned PF) { DimPFMap[Dim] = PF; }
+
 private:
   TPSyntheticValue PF{"PF"};
   std::string FuncName;
   unsigned Depth = 0;
+  SmallBitVector ReductionDims;              ///< Dims not in any store IndexExpr.
+  DenseMap<unsigned, unsigned> DimPFMap;     ///< dim index → parallel factor.
   SmallVector<std::unique_ptr<TPLiveIn>> LiveIns;
   std::unique_ptr<TPLoopRegion> RootRegion;
   mutable TPSlotTracker Tracker;
@@ -444,6 +506,44 @@ private:
   TPLiveIn *getOrCreateLiveIn(Value *V);
   TPValue *getTPValue(Value *V);
 };
+
+/// State passed to execute() during TPlan lowering.
+struct TPTransformState {
+  IRBuilder<> &Builder;
+  const TPlan &Plan;
+  const RecipeClassMap *ClassMap = nullptr;
+  DenseMap<const TPDefVal *, Value *> ValueMap;
+
+  TPTransformState(IRBuilder<> &B, const TPlan &P) : Builder(B), Plan(P) {}
+
+  Value *getValue(const TPDefVal *V) const { return ValueMap.lookup(V); }
+  void setValue(const TPDefVal *V, Value *IRV) { ValueMap[V] = IRV; }
+
+  TensorOpKind getKind(const TPRecipeBase *R) const {
+    if (!ClassMap) return TensorOpKind::Scalar;
+    auto It = ClassMap->find(R);
+    return It != ClassMap->end() ? It->second.Kind : TensorOpKind::Scalar;
+  }
+  int getContractDim(const TPRecipeBase *R) const {
+    if (!ClassMap) return -1;
+    auto It = ClassMap->find(R);
+    return It != ClassMap->end() ? It->second.ContractDim : -1;
+  }
+  TPRecipeBase *getFusedMulRecipe(const TPRecipeBase *R) const {
+    if (!ClassMap) return nullptr;
+    auto It = ClassMap->find(R);
+    return It != ClassMap->end() ? It->second.FusedMulRecipe : nullptr;
+  }
+};
+
+/// Propagates DimSets from induction variables through the def-use graph
+/// using BFS with union rule. Must be called before TPRecipePatternMatcher_match().
+void TPlanWidener_widen(TPlan &Plan);
+
+/// Lower all recipes in Plan to LLVM IR using the DimSet-driven dispatch.
+/// Calls TPlanWidener_widen() and TPRecipePatternMatcher_match() internally.
+bool TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
+                          ScalarEvolution &SE, DominatorTree &DT);
 
 } // namespace llvm
 #endif // LLVM_TRANSFORMS_VECTORIZE_TPLAN_H
