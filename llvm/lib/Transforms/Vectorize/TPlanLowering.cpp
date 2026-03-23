@@ -40,24 +40,24 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   if (!FusedMul || FusedMul->operands().size() < 2)
     return nullptr;
 
-  auto *LHSDefVal = dyn_cast<TPDefVal>(FusedMul->getOperand(0));
-  auto *RHSDefVal = dyn_cast<TPDefVal>(FusedMul->getOperand(1));
-  if (!LHSDefVal || !RHSDefVal)
+  auto *LHSDR = dyn_cast<TPSingleDefRecipe>(FusedMul->getOperand(0));
+  auto *RHSDR = dyn_cast<TPSingleDefRecipe>(FusedMul->getOperand(1));
+  if (!LHSDR || !RHSDR)
     return nullptr;
 
   // Dimension safety: require exactly 2D operands.
-  if (LHSDefVal->DimSet.count() != 2 || RHSDefVal->DimSet.count() != 2) {
+  if (LHSDR->DimSet.count() != 2 || RHSDR->DimSet.count() != 2) {
     LLVM_DEBUG(dbgs() << "TPlanLowering: Contraction requires 2D operands, "
                          "falling back to scalar clone\n");
     return nullptr;
   }
 
-  Value *LHS = State.getValue(LHSDefVal);
-  Value *RHS = State.getValue(RHSDefVal);
+  Value *LHS = State.getValue(LHSDR);
+  Value *RHS = State.getValue(RHSDR);
   if (!LHS || !RHS) return nullptr;
 
-  SmallVector<unsigned> LHSShape = getTPValueShape(*LHSDefVal, State.Plan);
-  SmallVector<unsigned> RHSShape = getTPValueShape(*RHSDefVal, State.Plan);
+  SmallVector<unsigned> LHSShape = getTPValueShape(*LHSDR, State.Plan);
+  SmallVector<unsigned> RHSShape = getTPValueShape(*RHSDR, State.Plan);
 
   int ContractDim = State.getContractDim(ReductionUpdate);
 
@@ -68,8 +68,8 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
       if (D == Dim) return Pos;
     return 0;
   };
-  unsigned LHSPos = findPos(LHSDefVal->DimSet, ContractDim);
-  unsigned RHSPos = findPos(RHSDefVal->DimSet, ContractDim);
+  unsigned LHSPos = findPos(LHSDR->DimSet, ContractDim);
+  unsigned RHSPos = findPos(RHSDR->DimSet, ContractDim);
   unsigned M = LHSShape[1 - LHSPos];
   unsigned K = LHSShape[LHSPos];
   unsigned N = RHSShape[1 - RHSPos];
@@ -117,34 +117,29 @@ void TPCanonicalIVExitCmpRecipe::execute(TPTransformState &) const {
 
 void TPWidenInductionRecipe::execute(TPTransformState &State) const {
   // IV values are loop PHIs already present in IR; register them in ValueMap.
-  if (DefVal)
-    State.setValue(DefVal.get(), IVPhi);
+  State.setValue(this, IVPhi);
 }
 
 void TPReductionPHIRecipe::execute(TPTransformState &State) const {
-  if (DefVal)
-    State.setValue(DefVal.get(), RedPhi);
+  State.setValue(this, RedPhi);
 }
 
 void TPWidenCastRecipe::execute(TPTransformState &State) const {
-  if (!DefVal) return;
-  auto *SrcDV = dyn_cast<TPDefVal>(getOperand(0));
-  Value *Src = SrcDV ? State.getValue(SrcDV) : nullptr;
+  auto *SrcDR = dyn_cast<TPSingleDefRecipe>(getOperand(0));
+  Value *Src = SrcDR ? State.getValue(SrcDR) : nullptr;
   if (!Src) return;
   Value *Result = State.Builder.Insert(CastInst->clone());
-  State.setValue(DefVal.get(), Result);
+  State.setValue(this, Result);
 }
 
 void TPWidenGEPRecipe::execute(TPTransformState &State) const {
-  if (!DefVal) return;
   Value *Result = State.Builder.Insert(GEPInst->clone());
-  State.setValue(DefVal.get(), Result);
+  State.setValue(this, Result);
 }
 
 void TPWidenLoadRecipe::execute(TPTransformState &State) const {
-  if (!DefVal) return;
   Value *Result = State.Builder.Insert(LoadInst->clone());
-  State.setValue(DefVal.get(), Result);
+  State.setValue(this, Result);
 }
 
 void TPWidenStoreRecipe::execute(TPTransformState &State) const {
@@ -159,10 +154,10 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
     // For the fused mul (fmul): deferred to its reduction consumer — no-op.
     // For the reduction update (fadd): emit @llvm.matrix.multiply.
     TPRecipeBase *FusedMul = State.getFusedMulRecipe(this);
-    if (FusedMul && DefVal) {
+    if (FusedMul) {
       Value *Result = emitContraction(FusedMul, this, State);
       if (Result)
-        State.setValue(DefVal.get(), Result);
+        State.setValue(this, Result);
     }
     // else: this is the fmul itself (FusedMulRecipe==nullptr here) — no-op.
     return;
@@ -170,37 +165,33 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
 
   case TensorOpKind::ElementWise:
   case TensorOpKind::Scalar: {
-    if (!DefVal) return;
     Value *Result = State.Builder.Insert(Inst->clone());
-    State.setValue(DefVal.get(), Result);
+    State.setValue(this, Result);
     return;
   }
 
   case TensorOpKind::BroadcastBinary: {
     // TODO: emit broadcast intrinsic. For now, clone scalar op.
-    if (!DefVal) return;
     LLVM_DEBUG(dbgs() << "TPlanLowering: BroadcastBinary not yet implemented, "
                          "falling back to scalar clone\n");
     Value *Result = State.Builder.Insert(Inst->clone());
-    State.setValue(DefVal.get(), Result);
+    State.setValue(this, Result);
     return;
   }
 
   case TensorOpKind::OuterProduct: {
     // TODO: emit outer product intrinsic. For now, clone scalar op.
-    if (!DefVal) return;
     LLVM_DEBUG(dbgs() << "TPlanLowering: OuterProduct not yet implemented, "
                          "falling back to scalar clone\n");
     Value *Result = State.Builder.Insert(Inst->clone());
-    State.setValue(DefVal.get(), Result);
+    State.setValue(this, Result);
     return;
   }
 
   case TensorOpKind::PlainReduction: {
     // Reduction update with no fuseable mul-like producer — clone as scalar.
-    if (!DefVal) return;
     Value *Result = State.Builder.Insert(Inst->clone());
-    State.setValue(DefVal.get(), Result);
+    State.setValue(this, Result);
     return;
   }
   }

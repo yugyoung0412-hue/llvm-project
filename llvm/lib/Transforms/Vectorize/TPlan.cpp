@@ -57,30 +57,29 @@ void TPLiveIn::printAsOperand(raw_ostream &OS, TPSlotTracker &) const {
 }
 
 //===----------------------------------------------------------------------===//
-// TPDefVal::printAsOperand
+// TPSingleDefRecipe::printAsOperand
 //===----------------------------------------------------------------------===//
 
-void TPDefVal::printAsOperand(raw_ostream &OS, TPSlotTracker &Tracker) const {
+void TPSingleDefRecipe::printAsOperand(raw_ostream &OS,
+                                        TPSlotTracker &Tracker) const {
   // For recipes that wrap IR instructions or PHIs, use the IR value name so
   // the TPlan printout is directly readable against the original IR.
-  if (DefRecipe) {
-    StringRef Name;
-    if (auto *R = dyn_cast<TPWidenRecipe>(DefRecipe))
-      Name = R->getInstruction()->getName();
-    else if (auto *R = dyn_cast<TPWidenInductionRecipe>(DefRecipe))
-      Name = R->getIVPhi()->getName();
-    else if (auto *R = dyn_cast<TPWidenLoadRecipe>(DefRecipe))
-      Name = R->getInstruction()->getName();
-    else if (auto *R = dyn_cast<TPWidenGEPRecipe>(DefRecipe))
-      Name = R->getInstruction()->getName();
-    else if (auto *R = dyn_cast<TPWidenCastRecipe>(DefRecipe))
-      Name = R->getInstruction()->getName();
-    else if (auto *R = dyn_cast<TPReductionPHIRecipe>(DefRecipe))
-      Name = R->getPhi()->getName();
-    if (!Name.empty()) {
-      OS << "ir<%" << Name << ">";
-      return;
-    }
+  StringRef Name;
+  if (auto *R = dyn_cast<TPWidenRecipe>(this))
+    Name = R->getInstruction()->getName();
+  else if (auto *R = dyn_cast<TPWidenInductionRecipe>(this))
+    Name = R->getIVPhi()->getName();
+  else if (auto *R = dyn_cast<TPWidenLoadRecipe>(this))
+    Name = R->getInstruction()->getName();
+  else if (auto *R = dyn_cast<TPWidenGEPRecipe>(this))
+    Name = R->getInstruction()->getName();
+  else if (auto *R = dyn_cast<TPWidenCastRecipe>(this))
+    Name = R->getInstruction()->getName();
+  else if (auto *R = dyn_cast<TPReductionPHIRecipe>(this))
+    Name = R->getPhi()->getName();
+  if (!Name.empty()) {
+    OS << "ir<%" << Name << ">";
+    return;
   }
   OS << "tp<%" << Tracker.getSlot(this) << ">";
 }
@@ -98,7 +97,7 @@ void TPWidenInductionRecipe::print(raw_ostream &OS, unsigned Indent,
                                    TPSlotTracker &Tracker) const {
   printIndent(OS, Indent);
   OS << "WIDEN-INDUCTION ";
-  DefVal->printAsOperand(OS, Tracker);
+  printAsOperand(OS, Tracker);
   OS << " = phi ";
   Operands[0]->printAsOperand(OS, Tracker);
   OS << ", ";
@@ -110,7 +109,7 @@ void TPReductionPHIRecipe::print(raw_ostream &OS, unsigned Indent,
                                  TPSlotTracker &Tracker) const {
   printIndent(OS, Indent);
   OS << "WIDEN-REDUCTION-PHI ";
-  DefVal->printAsOperand(OS, Tracker);
+  printAsOperand(OS, Tracker);
   OS << " = phi ";
   Operands[0]->printAsOperand(OS, Tracker);
   OS << ", ";
@@ -122,7 +121,7 @@ void TPWidenRecipe::print(raw_ostream &OS, unsigned Indent,
                           TPSlotTracker &Tracker) const {
   printIndent(OS, Indent);
   OS << "WIDEN ";
-  DefVal->printAsOperand(OS, Tracker);
+  printAsOperand(OS, Tracker);
   OS << " = " << Inst->getOpcodeName();
   for (unsigned I = 0, E = Operands.size(); I < E; ++I) {
     OS << " ";
@@ -137,7 +136,7 @@ void TPWidenGEPRecipe::print(raw_ostream &OS, unsigned Indent,
                               TPSlotTracker &Tracker) const {
   printIndent(OS, Indent);
   OS << "WIDEN-GEP ";
-  DefVal->printAsOperand(OS, Tracker);
+  printAsOperand(OS, Tracker);
   OS << " = getelementptr";
   for (unsigned I = 0, E = Operands.size(); I < E; ++I) {
     OS << " ";
@@ -152,7 +151,7 @@ void TPWidenLoadRecipe::print(raw_ostream &OS, unsigned Indent,
                                TPSlotTracker &Tracker) const {
   printIndent(OS, Indent);
   OS << "WIDEN ";
-  DefVal->printAsOperand(OS, Tracker);
+  printAsOperand(OS, Tracker);
   OS << " = load ";
   Operands[0]->printAsOperand(OS, Tracker);
   OS << "\n";
@@ -172,7 +171,7 @@ void TPWidenCastRecipe::print(raw_ostream &OS, unsigned Indent,
                                TPSlotTracker &Tracker) const {
   printIndent(OS, Indent);
   OS << "WIDEN-CAST ";
-  DefVal->printAsOperand(OS, Tracker);
+  printAsOperand(OS, Tracker);
   OS << " = " << CastInst->getOpcodeName() << " ";
   Operands[0]->printAsOperand(OS, Tracker);
   OS << "\n";
@@ -182,7 +181,7 @@ void TPCanonicalIVRecipe::print(raw_ostream &OS, unsigned Indent,
                                 TPSlotTracker &Tracker) const {
   printIndent(OS, Indent);
   OS << "CANONICAL-INDUCTION ";
-  DefVal->printAsOperand(OS, Tracker);
+  printAsOperand(OS, Tracker);
   OS << " = phi ";
   Operands[0]->printAsOperand(OS, Tracker);
   OS << ", ";
@@ -194,7 +193,7 @@ void TPCanonicalIVIncrRecipe::print(raw_ostream &OS, unsigned Indent,
                                     TPSlotTracker &Tracker) const {
   printIndent(OS, Indent);
   OS << "CANONICAL-INDUCTION-INC ";
-  DefVal->printAsOperand(OS, Tracker);
+  printAsOperand(OS, Tracker);
   OS << " = add ";
   Operands[0]->printAsOperand(OS, Tracker);
   OS << ", ";
@@ -206,7 +205,7 @@ void TPCanonicalIVExitCmpRecipe::print(raw_ostream &OS, unsigned Indent,
                                        TPSlotTracker &Tracker) const {
   printIndent(OS, Indent);
   OS << "CANONICAL-INDUCTION-CMP ";
-  DefVal->printAsOperand(OS, Tracker);
+  printAsOperand(OS, Tracker);
   OS << " = icmp ";
   Operands[0]->printAsOperand(OS, Tracker);
   OS << ", ";
@@ -352,8 +351,8 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
             &Phi, StartTP,
             StartTP /* placeholder; patched after body */, Idx);
         Region->appendRecipe(R);
-        P.ValueMap[PhiV] = R->getDefinedValue();
-        Region->setIV(R->getDefinedValue());
+        P.ValueMap[PhiV] = R;
+        Region->setIV(R);
       } else {
         // Reduction PHI: start from outside, loop value from inside
         Value *InitVal = nullptr;
@@ -371,7 +370,7 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
 
         auto *R = new TPReductionPHIRecipe(&Phi, InitTP, LoopTP);
         Region->appendRecipe(R);
-        P.ValueMap[PhiV] = R->getDefinedValue();
+        P.ValueMap[PhiV] = R;
       }
     }
 
@@ -393,12 +392,12 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
             Ops.push_back(P.getTPValue(Op));
           auto *R = new TPWidenGEPRecipe(&Inst, Ops);
           Region->appendRecipe(R);
-          P.ValueMap[InstV] = R->getDefinedValue();
+          P.ValueMap[InstV] = R;
         } else if (auto *LI = dyn_cast<LoadInst>(&Inst)) {
           TPValue *PtrOp = P.getTPValue(LI->getPointerOperand());
           auto *R = new TPWidenLoadRecipe(&Inst, PtrOp);
           Region->appendRecipe(R);
-          P.ValueMap[InstV] = R->getDefinedValue();
+          P.ValueMap[InstV] = R;
         } else if (auto *SI = dyn_cast<StoreInst>(&Inst)) {
           TPValue *PtrOp = P.getTPValue(SI->getPointerOperand());
           TPValue *ValOp = P.getTPValue(SI->getValueOperand());
@@ -409,14 +408,14 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
           TPValue *SrcOp = P.getTPValue(Inst.getOperand(0));
           auto *R = new TPWidenCastRecipe(&Inst, SrcOp);
           Region->appendRecipe(R);
-          P.ValueMap[InstV] = R->getDefinedValue();
+          P.ValueMap[InstV] = R;
         } else {
           SmallVector<TPValue *, 4> Ops;
           for (Value *Op : Inst.operands())
             Ops.push_back(P.getTPValue(Op));
           auto *R = new TPWidenRecipe(&Inst, Ops);
           Region->appendRecipe(R);
-          P.ValueMap[InstV] = R->getDefinedValue();
+          P.ValueMap[InstV] = R;
         }
       }
     };
@@ -477,19 +476,19 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
     }
 
     // Create canonical IV companion recipes.
-    if (CanonIV->getDefinedValue() && BoundTP) {
+    if (BoundTP) {
       // Increment: canonical_iv + PF[Idx]
-      auto *IncrRecipe = new TPCanonicalIVIncrRecipe(
-          CanonIV->getDefinedValue(), P.DimPFs[Idx].get());
+      // CanonIV IS a TPValue (TPSingleDefRecipe), so pass it directly.
+      auto *IncrRecipe = new TPCanonicalIVIncrRecipe(CanonIV, P.DimPFs[Idx].get());
       Region->appendRecipe(IncrRecipe);
 
       // Patch canonical IV step operand to point to the increment result.
-      CanonIV->setOperand(1, IncrRecipe->getDefinedValue());
-      IncrRecipe->getDefinedValue()->addUser(CanonIV);
+      // IncrRecipe IS a TPValue (TPSingleDefRecipe).
+      CanonIV->setOperand(1, IncrRecipe);
+      IncrRecipe->addUser(CanonIV);
 
       // Exit cmp: incremented_iv icmp bound
-      auto *CmpRecipe = new TPCanonicalIVExitCmpRecipe(
-          IncrRecipe->getDefinedValue(), BoundTP);
+      auto *CmpRecipe = new TPCanonicalIVExitCmpRecipe(IncrRecipe, BoundTP);
       Region->appendRecipe(CmpRecipe);
     }
 

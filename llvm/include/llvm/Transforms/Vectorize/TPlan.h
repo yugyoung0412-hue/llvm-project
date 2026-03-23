@@ -28,10 +28,10 @@ class Loop;
 class LoopInfo;
 class ScalarEvolution;
 class SCEV;
-class TPDefVal;
 class TPlan;
 class TPLoopRegion;
 class TPRecipeBase;
+class TPSingleDefRecipe;
 class TPSlotTracker;
 class TPSyntheticValue;
 class Value;
@@ -134,26 +134,6 @@ private:
 };
 
 //===----------------------------------------------------------------------===//
-// TPDefVal — value defined by a recipe, printed as tp<%N>
-//===----------------------------------------------------------------------===//
-class TPDefVal : public TPValue {
-public:
-  explicit TPDefVal(TPRecipeBase *R)
-      : TPValue(ValueKind::Def), DefRecipe(R) {}
-  TPRecipeBase *getDefiningRecipe() const { return DefRecipe; }
-  void printAsOperand(raw_ostream &OS, TPSlotTracker &Tracker) const override;
-
-  SmallBitVector DimSet; ///< Loop dim indices this value spans; set by TPlanWidener_widen().
-
-  static bool classof(const TPValue *V) {
-    return V->getValueKind() == ValueKind::Def;
-  }
-
-private:
-  TPRecipeBase *DefRecipe;
-};
-
-//===----------------------------------------------------------------------===//
 // TPRecipeBase — base for all TPlan recipe nodes
 //===----------------------------------------------------------------------===//
 class TPRecipeBase : public ilist_node<TPRecipeBase>, public TPUser {
@@ -174,7 +154,8 @@ public:
   RecipeKind getKind() const { return Kind; }
 
   /// Returns the value defined by this recipe, or nullptr for stores.
-  TPDefVal *getDefinedValue() const { return DefVal.get(); }
+  TPSingleDefRecipe *getDefinedValue();
+  const TPSingleDefRecipe *getDefinedValue() const;
 
   virtual void print(raw_ostream &OS, unsigned Indent,
                      TPSlotTracker &Tracker) const = 0;
@@ -185,23 +166,52 @@ public:
   static bool classof(const TPUser *) { return true; }
 
 protected:
-  explicit TPRecipeBase(RecipeKind K, bool DefinesValue = true) : Kind(K) {
-    if (DefinesValue)
-      DefVal = std::make_unique<TPDefVal>(this);
-  }
+  explicit TPRecipeBase(RecipeKind K) : Kind(K) {}
 
   RecipeKind Kind;
-  std::unique_ptr<TPDefVal> DefVal; // null for void recipes (store)
 };
+
+//===----------------------------------------------------------------------===//
+// TPSingleDefRecipe — recipe that IS the value it defines (dual inheritance)
+//===----------------------------------------------------------------------===//
+class TPSingleDefRecipe : public TPRecipeBase, public TPValue {
+public:
+  /// Loop dim indices this value spans; set by TPlanWidener_widen().
+  SmallBitVector DimSet;
+
+  void printAsOperand(raw_ostream &OS, TPSlotTracker &Tracker) const override;
+
+  static bool classof(const TPRecipeBase *R) {
+    return R->getKind() != RecipeKind::WidenStore;
+  }
+  static bool classof(const TPValue *V) {
+    return V->getValueKind() == ValueKind::Def;
+  }
+
+protected:
+  explicit TPSingleDefRecipe(RecipeKind K)
+      : TPRecipeBase(K), TPValue(ValueKind::Def) {}
+};
+
+//===----------------------------------------------------------------------===//
+// TPRecipeBase::getDefinedValue — inline after TPSingleDefRecipe is defined
+//===----------------------------------------------------------------------===//
+inline TPSingleDefRecipe *TPRecipeBase::getDefinedValue() {
+  return dyn_cast<TPSingleDefRecipe>(this);
+}
+inline const TPSingleDefRecipe *TPRecipeBase::getDefinedValue() const {
+  return dyn_cast<TPSingleDefRecipe>(this);
+}
 
 //===----------------------------------------------------------------------===//
 // TPWidenInductionRecipe — WIDEN-INDUCTION: loop IV PHIs
 //===----------------------------------------------------------------------===//
-class TPWidenInductionRecipe : public TPRecipeBase {
+class TPWidenInductionRecipe : public TPSingleDefRecipe {
 public:
   TPWidenInductionRecipe(PHINode *IV, TPValue *StartVal, TPValue *StepVal,
                           unsigned DimIdx = 0)
-      : TPRecipeBase(RecipeKind::WidenInduction), IVPhi(IV), DimIndex(DimIdx) {
+      : TPSingleDefRecipe(RecipeKind::WidenInduction), IVPhi(IV),
+        DimIndex(DimIdx) {
     addOperand(StartVal);
     addOperand(StepVal);
   }
@@ -225,10 +235,10 @@ private:
 //===----------------------------------------------------------------------===//
 // TPReductionPHIRecipe — WIDEN-REDUCTION-PHI: accumulator PHIs
 //===----------------------------------------------------------------------===//
-class TPReductionPHIRecipe : public TPRecipeBase {
+class TPReductionPHIRecipe : public TPSingleDefRecipe {
 public:
   TPReductionPHIRecipe(PHINode *Phi, TPValue *InitVal, TPValue *LoopVal)
-      : TPRecipeBase(RecipeKind::ReductionPHI), RedPhi(Phi) {
+      : TPSingleDefRecipe(RecipeKind::ReductionPHI), RedPhi(Phi) {
     addOperand(InitVal);
     addOperand(LoopVal);
   }
@@ -250,10 +260,10 @@ private:
 //===----------------------------------------------------------------------===//
 // TPWidenRecipe — WIDEN: arithmetic/icmp/generic instructions
 //===----------------------------------------------------------------------===//
-class TPWidenRecipe : public TPRecipeBase {
+class TPWidenRecipe : public TPSingleDefRecipe {
 public:
   TPWidenRecipe(Instruction *I, SmallVectorImpl<TPValue *> &Ops)
-      : TPRecipeBase(RecipeKind::Widen), Inst(I) {
+      : TPSingleDefRecipe(RecipeKind::Widen), Inst(I) {
     for (TPValue *Op : Ops)
       addOperand(Op);
   }
@@ -275,10 +285,10 @@ private:
 //===----------------------------------------------------------------------===//
 // TPWidenGEPRecipe — WIDEN-GEP: getelementptr
 //===----------------------------------------------------------------------===//
-class TPWidenGEPRecipe : public TPRecipeBase {
+class TPWidenGEPRecipe : public TPSingleDefRecipe {
 public:
   TPWidenGEPRecipe(Instruction *GEP, SmallVectorImpl<TPValue *> &Ops)
-      : TPRecipeBase(RecipeKind::WidenGEP), GEPInst(GEP) {
+      : TPSingleDefRecipe(RecipeKind::WidenGEP), GEPInst(GEP) {
     for (TPValue *Op : Ops)
       addOperand(Op);
   }
@@ -300,10 +310,10 @@ private:
 //===----------------------------------------------------------------------===//
 // TPWidenLoadRecipe — WIDEN: load instruction
 //===----------------------------------------------------------------------===//
-class TPWidenLoadRecipe : public TPRecipeBase {
+class TPWidenLoadRecipe : public TPSingleDefRecipe {
 public:
   TPWidenLoadRecipe(Instruction *Load, TPValue *PtrOp)
-      : TPRecipeBase(RecipeKind::WidenLoad), LoadInst(Load) {
+      : TPSingleDefRecipe(RecipeKind::WidenLoad), LoadInst(Load) {
     addOperand(PtrOp);
   }
 
@@ -327,8 +337,7 @@ private:
 class TPWidenStoreRecipe : public TPRecipeBase {
 public:
   TPWidenStoreRecipe(Instruction *Store, TPValue *PtrOp, TPValue *ValOp)
-      : TPRecipeBase(RecipeKind::WidenStore, /*DefinesValue=*/false),
-        StoreInst(Store) {
+      : TPRecipeBase(RecipeKind::WidenStore), StoreInst(Store) {
     addOperand(PtrOp);
     addOperand(ValOp);
   }
@@ -350,10 +359,10 @@ private:
 //===----------------------------------------------------------------------===//
 // TPWidenCastRecipe — WIDEN-CAST: bitcast, sext, zext
 //===----------------------------------------------------------------------===//
-class TPWidenCastRecipe : public TPRecipeBase {
+class TPWidenCastRecipe : public TPSingleDefRecipe {
 public:
   TPWidenCastRecipe(Instruction *Cast, TPValue *SrcOp)
-      : TPRecipeBase(RecipeKind::WidenCast), CastInst(Cast) {
+      : TPSingleDefRecipe(RecipeKind::WidenCast), CastInst(Cast) {
     addOperand(SrcOp);
   }
 
@@ -374,12 +383,12 @@ private:
 //===----------------------------------------------------------------------===//
 // TPCanonicalIVRecipe — CANONICAL-INDUCTION: synthetic loop counter phi
 //===----------------------------------------------------------------------===//
-class TPCanonicalIVRecipe : public TPRecipeBase {
+class TPCanonicalIVRecipe : public TPSingleDefRecipe {
 public:
   /// StartVal: TPLiveIn for ir<0>. StepVal: placeholder; patched after
   /// TPCanonicalIVIncrRecipe is created.
   TPCanonicalIVRecipe(TPValue *StartVal, TPValue *StepVal)
-      : TPRecipeBase(RecipeKind::CanonicalIV) {
+      : TPSingleDefRecipe(RecipeKind::CanonicalIV) {
     addOperand(StartVal);
     addOperand(StepVal);
   }
@@ -396,11 +405,11 @@ public:
 //===----------------------------------------------------------------------===//
 // TPCanonicalIVIncrRecipe — CANONICAL-INDUCTION-INC: canonical IV + PF
 //===----------------------------------------------------------------------===//
-class TPCanonicalIVIncrRecipe : public TPRecipeBase {
+class TPCanonicalIVIncrRecipe : public TPSingleDefRecipe {
 public:
-  /// IVVal: TPDefVal of TPCanonicalIVRecipe. PFVal: TPSyntheticValue for PF.
+  /// IVVal: TPCanonicalIVRecipe (is TPValue). PFVal: TPSyntheticValue for PF.
   TPCanonicalIVIncrRecipe(TPValue *IVVal, TPValue *PFVal)
-      : TPRecipeBase(RecipeKind::CanonicalIVIncr) {
+      : TPSingleDefRecipe(RecipeKind::CanonicalIVIncr) {
     addOperand(IVVal);
     addOperand(PFVal);
   }
@@ -417,12 +426,12 @@ public:
 //===----------------------------------------------------------------------===//
 // TPCanonicalIVExitCmpRecipe — CANONICAL-INDUCTION-CMP: exit condition icmp
 //===----------------------------------------------------------------------===//
-class TPCanonicalIVExitCmpRecipe : public TPRecipeBase {
+class TPCanonicalIVExitCmpRecipe : public TPSingleDefRecipe {
 public:
-  /// IncrVal: TPDefVal of TPCanonicalIVIncrRecipe. BoundVal: TPLiveIn for
+  /// IncrVal: TPCanonicalIVIncrRecipe (is TPValue). BoundVal: TPLiveIn for
   /// the loop bound (RHS of the latch ICmpInst).
   TPCanonicalIVExitCmpRecipe(TPValue *IncrVal, TPValue *BoundVal)
-      : TPRecipeBase(RecipeKind::CanonicalIVExitCmp) {
+      : TPSingleDefRecipe(RecipeKind::CanonicalIVExitCmp) {
     addOperand(IncrVal);
     addOperand(BoundVal);
   }
@@ -445,8 +454,8 @@ public:
       : Level(Level), OwnerLoop(L), TripCount(TripCount) {}
 
   void appendRecipe(TPRecipeBase *R) { Recipes.push_back(R); }
-  void setIV(TPDefVal *V) { IV = V; }
-  TPDefVal *getIV() const { return IV; }
+  void setIV(TPSingleDefRecipe *V) { IV = V; }
+  TPSingleDefRecipe *getIV() const { return IV; }
   void setChild(std::unique_ptr<TPLoopRegion> C) { Child = std::move(C); }
   TPLoopRegion *getChild() const { return Child.get(); }
   unsigned getLevel() const { return Level; }
@@ -461,7 +470,7 @@ private:
   unsigned Level;
   Loop *OwnerLoop;
   const SCEV *TripCount;
-  TPDefVal *IV = nullptr;
+  TPSingleDefRecipe *IV = nullptr;
   iplist<TPRecipeBase> Recipes;
   std::unique_ptr<TPLoopRegion> Child;
 };
@@ -516,12 +525,12 @@ struct TPTransformState {
   IRBuilder<> &Builder;
   const TPlan &Plan;
   const RecipeClassMap *ClassMap = nullptr;
-  DenseMap<const TPDefVal *, Value *> ValueMap;
+  DenseMap<const TPSingleDefRecipe *, Value *> ValueMap;
 
   TPTransformState(IRBuilder<> &B, const TPlan &P) : Builder(B), Plan(P) {}
 
-  Value *getValue(const TPDefVal *V) const { return ValueMap.lookup(V); }
-  void setValue(const TPDefVal *V, Value *IRV) { ValueMap[V] = IRV; }
+  Value *getValue(const TPSingleDefRecipe *V) const { return ValueMap.lookup(V); }
+  void setValue(const TPSingleDefRecipe *V, Value *IRV) { ValueMap[V] = IRV; }
 
   TensorOpKind getKind(const TPRecipeBase *R) const {
     if (!ClassMap) return TensorOpKind::Scalar;

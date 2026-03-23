@@ -11,9 +11,9 @@
 ///
 /// Phase 1 (Seed): each TPWidenInductionRecipe's defined value gets
 ///          DimSet = {recipe.getDimIndex()}.
-/// Phase 2 (BFS): for every TPDefVal V with non-empty DimSet, for every
-///          TPUser U that is a TPRecipeBase defining a TPDefVal DV:
-///          DV.DimSet |= V.DimSet
+/// Phase 2 (BFS): for every TPSingleDefRecipe V with non-empty DimSet, for
+///          every TPUser U that is a TPRecipeBase defining a TPSingleDefRecipe
+///          DV: DV.DimSet |= V.DimSet
 ///
 /// Reduction accumulator PHIs (TPReductionPHIRecipe) are intentionally
 /// seeded with empty DimSet — they carry scalar accumulated values.
@@ -40,18 +40,16 @@ static void walkRecipes(TPLoopRegion *Region, Fn &&F) {
 }
 
 void llvm::TPlanWidener_widen(TPlan &Plan) {
-  SmallVector<TPDefVal *, 32> Worklist;
+  SmallVector<TPSingleDefRecipe *, 32> Worklist;
 
   // Phase 1: Seed from TPWidenInductionRecipe.
   walkRecipes(Plan.getRootRegion(), [&](TPRecipeBase &R) {
     if (auto *WI = dyn_cast<TPWidenInductionRecipe>(&R)) {
-      TPDefVal *DV = WI->getDefinedValue();
-      if (!DV)
-        return;
+      // WI IS a TPSingleDefRecipe
       unsigned Dim = WI->getDimIndex();
-      DV->DimSet.resize(std::max(DV->DimSet.size(), (size_t)(Dim + 1)));
-      DV->DimSet.set(Dim);
-      Worklist.push_back(DV);
+      WI->DimSet.resize(std::max(WI->DimSet.size(), (size_t)(Dim + 1)));
+      WI->DimSet.set(Dim);
+      Worklist.push_back(WI);
     }
   });
 
@@ -60,14 +58,14 @@ void llvm::TPlanWidener_widen(TPlan &Plan) {
   // is guaranteed because DimSet is monotonically non-decreasing and bounded
   // by the loop nest depth (at most Depth bits per DV).
   while (!Worklist.empty()) {
-    TPDefVal *V = Worklist.pop_back_val();
+    TPSingleDefRecipe *V = Worklist.pop_back_val();
 
     for (TPUser *U : V->users()) {
       auto *Recipe = dyn_cast<TPRecipeBase>(U);
       if (!Recipe)
         continue;
 
-      TPDefVal *DV = Recipe->getDefinedValue(); // null for stores/branches
+      TPSingleDefRecipe *DV = Recipe->getDefinedValue(); // null for stores
       if (!DV)
         continue;
 

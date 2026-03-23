@@ -22,8 +22,8 @@ using namespace llvm;
 /// Returns the DimSet of \p V, or an empty bitset for live-ins/synthetics.
 static const SmallBitVector &getDimSet(const TPValue *V) {
   static const SmallBitVector Empty;
-  if (const auto *DV = dyn_cast<TPDefVal>(V))
-    return DV->DimSet;
+  if (const auto *SDR = dyn_cast<TPSingleDefRecipe>(V))
+    return SDR->DimSet;
   return Empty;
 }
 
@@ -33,26 +33,23 @@ static const SmallBitVector &getDimSet(const TPValue *V) {
 /// Null-safe: returns nullptr when given nullptr.
 static TPRecipeBase *skipIntermediateRecipes(TPValue *V) {
   while (V) {
-    auto *DV = dyn_cast<TPDefVal>(V);
-    if (!DV)
+    auto *SDR = dyn_cast<TPSingleDefRecipe>(V);
+    if (!SDR)
       return nullptr;
-    TPRecipeBase *R = DV->getDefiningRecipe();
-    if (!R)
-      return nullptr;
-    if (R->getKind() == TPRecipeBase::RecipeKind::WidenCast) {
-      V = R->getOperand(0); // skip cast, follow source
+    // SDR IS the recipe — no getDefiningRecipe() needed
+    if (SDR->getKind() == TPRecipeBase::RecipeKind::WidenCast) {
+      V = SDR->getOperand(0); // skip cast, follow source
       continue;
     }
-    if (R->getKind() == TPRecipeBase::RecipeKind::Widen &&
-        R->operands().size() == 1) {
+    if (SDR->getKind() == TPRecipeBase::RecipeKind::Widen &&
+        SDR->operands().size() == 1) {
       // Single-operand Widen = unary op; skip it.
-      auto *WR = cast<TPWidenRecipe>(R);
-      if (isa<UnaryOperator>(WR->getInstruction())) {
-        V = R->getOperand(0);
+      if (isa<UnaryOperator>(cast<TPWidenRecipe>(SDR)->getInstruction())) {
+        V = SDR->getOperand(0);
         continue;
       }
     }
-    return R; // Not an intermediate — stop here.
+    return SDR; // Not an intermediate — stop here.
   }
   return nullptr;
 }
@@ -75,8 +72,9 @@ static bool isReductionUpdate(const TPRecipeBase *R) {
   if (!isa<BinaryOperator>(WR->getInstruction()))
     return false;
   for (TPValue *Op : R->operands()) {
-    auto *DV = dyn_cast<TPDefVal>(Op);
-    if (DV && dyn_cast<TPReductionPHIRecipe>(DV->getDefiningRecipe()))
+    if (!isa<TPSingleDefRecipe>(Op))
+      continue;
+    if (isa<TPReductionPHIRecipe>(cast<TPSingleDefRecipe>(Op)))
       return true;
   }
   return false;
@@ -86,8 +84,8 @@ static bool isReductionUpdate(const TPRecipeBase *R) {
 /// Precondition: isReductionUpdate(R) == true.
 static TPValue *getReductionInput(const TPRecipeBase *R) {
   for (TPValue *Op : R->operands()) {
-    auto *DV = dyn_cast<TPDefVal>(Op);
-    if (!DV || !dyn_cast<TPReductionPHIRecipe>(DV->getDefiningRecipe()))
+    if (!isa<TPSingleDefRecipe>(Op) ||
+        !isa<TPReductionPHIRecipe>(cast<TPSingleDefRecipe>(Op)))
       return Op;
   }
   return nullptr;
@@ -184,7 +182,7 @@ static void matchRegion(const TPLoopRegion *Region, const TPlan &Plan,
 // Public API
 //===----------------------------------------------------------------------===//
 
-SmallVector<unsigned> llvm::getTPValueShape(const TPDefVal &V,
+SmallVector<unsigned> llvm::getTPValueShape(const TPSingleDefRecipe &V,
                                              const TPlan &Plan) {
   SmallVector<unsigned> Shape;
   for (int D = V.DimSet.find_first(); D >= 0; D = V.DimSet.find_next(D))

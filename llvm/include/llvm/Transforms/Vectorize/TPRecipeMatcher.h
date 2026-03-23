@@ -16,12 +16,12 @@
 
 namespace llvm {
 class TPlan;
-class TPDefVal;
+class TPSingleDefRecipe;
 
 /// Returns the tensor shape of \p V: { Plan.getPFForDim(d) for d in V.DimSet }.
 /// Returns {} for scalar (empty DimSet) values.
 /// Requires TPlanWidener_widen() to have been called first.
-SmallVector<unsigned> getTPValueShape(const TPDefVal &V, const TPlan &Plan);
+SmallVector<unsigned> getTPValueShape(const TPSingleDefRecipe &V, const TPlan &Plan);
 
 /// Classify every recipe in \p Plan into a TensorOpKind.
 /// Requires TPlanWidener_widen() to have been called first.
