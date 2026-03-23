@@ -233,6 +233,159 @@ private:
 };
 
 //===----------------------------------------------------------------------===//
+// TPBasicBlock — named block owning a recipe list (mirrors VPBasicBlock)
+//===----------------------------------------------------------------------===//
+class TPBasicBlock : public TPBlockBase {
+public:
+  using RecipeListTy = iplist<TPRecipeBase>;
+
+  explicit TPBasicBlock(StringRef Name = "")
+      : TPBlockBase(TPBasicBlockSC, Name) {}
+
+  static bool classof(const TPBlockBase *B) {
+    return B->getTPBlockID() == TPBasicBlockSC ||
+           B->getTPBlockID() == TPIRBasicBlockSC;
+  }
+
+  using iterator = RecipeListTy::iterator;
+  using const_iterator = RecipeListTy::const_iterator;
+  iterator begin() { return Recipes.begin(); }
+  iterator end() { return Recipes.end(); }
+  const_iterator begin() const { return Recipes.begin(); }
+  const_iterator end() const { return Recipes.end(); }
+  bool empty() const { return Recipes.empty(); }
+  RecipeListTy &getRecipeList() { return Recipes; }
+
+  void appendRecipe(TPRecipeBase *R) { Recipes.push_back(R); }
+
+  /// Returns a pointer to the recipe list for ilist_node parent access.
+  static RecipeListTy TPBasicBlock::*getSublistAccess(TPRecipeBase *) {
+    return &TPBasicBlock::Recipes;
+  }
+
+  void execute(TPTransformState &State) override;
+  void print(raw_ostream &OS, const Twine &Indent,
+             TPSlotTracker &Tracker) const override;
+
+protected:
+  explicit TPBasicBlock(unsigned char SC, StringRef Name)
+      : TPBlockBase(SC, Name) {}
+
+  RecipeListTy Recipes;
+};
+
+//===----------------------------------------------------------------------===//
+// TPIRBasicBlock — wraps an IR BasicBlock (mirrors VPIRBasicBlock)
+//===----------------------------------------------------------------------===//
+class TPIRBasicBlock : public TPBasicBlock {
+public:
+  explicit TPIRBasicBlock(BasicBlock *BB)
+      : TPBasicBlock(TPIRBasicBlockSC,
+                     (Twine("ir-bb<") + BB->getName() + ">").str()),
+        IRBB(BB) {}
+
+  BasicBlock *getIRBasicBlock() const { return IRBB; }
+
+  static bool classof(const TPBlockBase *B) {
+    return B->getTPBlockID() == TPIRBasicBlockSC;
+  }
+
+  void execute(TPTransformState &State) override;
+  void print(raw_ostream &OS, const Twine &Indent,
+             TPSlotTracker &Tracker) const override;
+
+private:
+  BasicBlock *IRBB;
+};
+
+//===----------------------------------------------------------------------===//
+// TPRegionBlock — SESE loop region with Entry + Exiting (mirrors VPRegionBlock)
+//===----------------------------------------------------------------------===//
+class TPRegionBlock : public TPBlockBase {
+public:
+  explicit TPRegionBlock(StringRef Name = "", bool IsReplicator = false)
+      : TPBlockBase(TPRegionBlockSC, Name), IsReplicator(IsReplicator) {}
+
+  static bool classof(const TPBlockBase *B) {
+    return B->getTPBlockID() == TPRegionBlockSC;
+  }
+
+  TPBlockBase *getEntry() { return Entry; }
+  const TPBlockBase *getEntry() const { return Entry; }
+  TPBlockBase *getExiting() { return Exiting; }
+  const TPBlockBase *getExiting() const { return Exiting; }
+
+  void setEntry(TPBlockBase *B) {
+    assert(B->getPredecessors().empty() && "Entry must have no predecessors");
+    Entry = B;
+    B->setParent(this);
+  }
+  void setExiting(TPBlockBase *B) {
+    assert(B->getSuccessors().empty() && "Exiting must have no successors");
+    Exiting = B;
+    B->setParent(this);
+  }
+
+  bool isReplicator() const { return IsReplicator; }
+
+  void execute(TPTransformState &State) override;
+  void print(raw_ostream &OS, const Twine &Indent,
+             TPSlotTracker &Tracker) const override;
+
+private:
+  TPBlockBase *Entry = nullptr;
+  TPBlockBase *Exiting = nullptr;
+  bool IsReplicator = false;
+};
+
+//===----------------------------------------------------------------------===//
+// TPBlockUtils — block wiring utilities (mirrors VPBlockUtils)
+//===----------------------------------------------------------------------===//
+class TPBlockUtils {
+public:
+  /// Bidirectional connect: adds To to From's successors and From to To's
+  /// predecessors. Both blocks must have the same parent.
+  static void connectBlocks(TPBlockBase *From, TPBlockBase *To) {
+    assert(From->getParent() == To->getParent() &&
+           "connectBlocks: blocks must share parent (nullptr == nullptr for "
+           "top-level blocks)");
+    From->appendSuccessor(To);
+    To->appendPredecessor(From);
+  }
+
+  /// Bidirectional disconnect.
+  static void disconnectBlocks(TPBlockBase *From, TPBlockBase *To) {
+    From->removeSuccessor(To);
+    To->removePredecessor(From);
+  }
+
+  /// Insert New after After: New inherits After's successors, After -> New.
+  static void insertBlockAfter(TPBlockBase *New, TPBlockBase *After) {
+    assert(New->getSuccessors().empty() && New->getPredecessors().empty());
+    New->setParent(After->getParent());
+    transferSuccessors(After, New);
+    connectBlocks(After, New);
+  }
+
+  /// Transfer all successors from Old to New (updates predecessor lists too).
+  static void transferSuccessors(TPBlockBase *Old, TPBlockBase *New) {
+    SmallVector<TPBlockBase *, 4> Succs;
+    Succs.append(Old->getSuccessors().begin(), Old->getSuccessors().end());
+    Old->clearSuccessors();
+    for (auto *S : Succs) {
+      auto *It = llvm::find(S->getPredecessors(), Old);
+      assert(It != S->getPredecessors().end());
+      *It = New;
+      New->appendSuccessor(S);
+    }
+  }
+};
+
+/// DFS pre-order traversal from \p Start, following successors in insertion
+/// order. Used by print() and block-driven lowering.
+SmallVector<TPBlockBase *, 8> constructionOrder(TPBlockBase *Start);
+
+//===----------------------------------------------------------------------===//
 // TPRecipeBase — base for all TPlan recipe nodes
 //===----------------------------------------------------------------------===//
 class TPRecipeBase : public ilist_node<TPRecipeBase>, public TPUser {
