@@ -1,0 +1,169 @@
+PF DimSet System — Approach 2 vs Approach 3 Analysis
+=====================================================
+Date: 2026-03-23
+Context: TPlan PF propagation redesign for LoopTensorize (TPlan branch)
+
+
+BACKGROUND
+----------
+The existing TPlanWidener propagates a single scalar ParallelFactor (PF) per
+TPValue using BFS with max(). This loses information about WHICH loop dimensions
+a value spans. The new design replaces/supplements this with a DimSet (set of
+loop dimension indices) per TPValue so that the shape of each value can be
+derived as:
+
+  shape = [PFMap[d] for d in DimSet]
+
+Example (GEMM, for i / for k / for j, PFs = 256/512/1024):
+  %b (load, depends on i,k) → DimSet={0,1} → shape [256, 512]
+  %c (load, depends on k,j) → DimSet={1,2} → shape [512, 1024]
+  %mul = fmul %b, %c        → DimSet={0,1,2} (union) → logical shape [256,512,1024]
+  %sum = reduction(fadd)    → DimSet={0,2}   → shape [256, 1024]  (k contracted)
+
+
+PROPAGATION SEMANTICS
+---------------------
+Chosen rule: UNION-ALWAYS (Option B in earlier analysis)
+  DV.DimSet |= V.DimSet   for every user DV of V
+
+Contraction (k dimension disappearing) is NOT handled at widening time.
+It is handled at execute() time by the reduction recipe peeking at its
+producer (B1-alpha style). This keeps widening as pure shape analysis.
+
+Why union-always:
+  - Widening = structural/shape analysis only
+  - Instruction selection (what hardware op to emit) belongs in lowering
+  - Detecting "this is a matmul" is a lowering decision, not a shape decision
+
+
+FUSION STYLE: B1-ALPHA
+----------------------
+When TPReductionRecipe::execute() runs:
+  - It peeks at its producer recipe (e.g., fmul)
+  - If producer is mul-like AND shared dims include a reduction dim → emit matmul
+  - fmul recipe's execute() is a no-op in this case (deferred to consumer)
+
+Order safety: load recipes always precede arithmetic recipes in program order
+(enforced by def-use constraints). So State.getValue(%b) and State.getValue(%c)
+are guaranteed populated before the reduction recipe runs. B1-alpha is safe.
+
+
+APPROACH 2 — DimSet replaces scalar PF, detection in execute()
+--------------------------------------------------------------
+Pipeline:
+  TPlanWidener  → DimSet BFS (union)
+  TPlanLowering → execute() detects patterns AND emits IR
+
+Pseudo-code (execute):
+  TPReductionRecipe::execute():
+    auto *P = getProducer(fmul);
+    if (P && shared dim is reduction dim):
+      emit matmul(State.getValue(%b), State.getValue(%c), ...)
+    else:
+      emit scalar fadd
+
+  TPScalarOpRecipe::execute() for fdiv:
+    if (same dims)      → emit element-wise fdiv
+    if (subset dims)    → emit broadcast fdiv
+    if (disjoint dims)  → emit outer product
+    ...  // grows with every new op pattern
+
+Pros:
+  - Minimal new infrastructure
+  - Simple pipeline (no new pass)
+
+Cons:
+  - execute() becomes an instruction selector — grows unboundedly
+  - Pattern detection is scattered across multiple recipe execute() methods
+  - Hard to test detection logic independently from lowering
+  - Every new tensor op type requires editing execute() in multiple classes
+
+
+APPROACH 3 — DimSet + dedicated TPRecipePatternMatcher pass  [CHOSEN]
+----------------------------------------------------------------------
+Pipeline:
+  TPlanWidener         → DimSet BFS (union), pure shape analysis
+  TPRecipePatternMatcher → classify every recipe → RecipeClassMap
+  TPlanLowering        → execute() dispatches on RecipeClassMap, no detection
+
+TensorOpKind enum:
+  Contraction      — fmul+reduction, shared reduction dim → matmul/tensor contract
+  ElementWise      — binary op, operand DimSets are equal
+  BroadcastBinary  — binary op, one DimSet is subset of other
+  OuterProduct     — binary op, operand DimSets are disjoint
+  PlainReduction   — reduction with no fuseable mul-like producer
+  Scalar           — no dims (PF=1)
+
+Pseudo-code (matcher):
+  TensorOpKind classifyByDimSets(TPRecipeBase &R):
+    if isReduction(R):
+      P = getProducer(R)
+      if P && isMulLike(P):
+        shared = P.op0.DimSet & P.op1.DimSet
+        if shared & Plan.getReductionDims(): return Contraction
+      return PlainReduction
+
+    if isBinaryOp(R):
+      D0 = R.op0.DimSet,  D1 = R.op1.DimSet
+      if D0 == D1:              return ElementWise
+      if D0.isSubset(D1) or
+         D1.isSubset(D0):       return BroadcastBinary
+      if (D0 & D1).none():      return OuterProduct
+
+    return Scalar
+
+Pseudo-code (execute — dumb dispatcher):
+  TPScalarOpRecipe::execute(State, CM):
+    switch CM[this]:
+      ElementWise:     emit vector op (fdiv, fmul, fadd, fsub, ...)
+      BroadcastBinary: emit broadcast op
+      OuterProduct:    emit outer product intrinsic
+      Scalar:          emit scalar op
+
+  TPReductionRecipe::execute(State, CM):
+    switch CM[this]:
+      Contraction:     peek at fmul producer → emit matmul
+      PlainReduction:  emit reduce intrinsic
+
+Element-wise division example:
+  %a.dims={i,j}, %b.dims={i,j}
+  fdiv → D0==D1 → ElementWise → emit vector fdiv [256,1024]
+
+  %a.dims={i,j}, %b.dims={j}   (broadcast case)
+  fdiv → D1 subset D0 → BroadcastBinary → emit broadcast fdiv along dim i
+
+Pros:
+  - Single place for all pattern detection (TPRecipePatternMatcher)
+  - execute() is a pure dispatcher — fixed complexity regardless of op count
+  - Test matcher independently from lowering
+  - Add new op pattern by adding one rule to classifyByDimSets()
+  - General: handles fmul, fdiv, fsub, fmax, outer products uniformly
+
+Cons:
+  - New pass + RecipeClassMap adds pipeline infrastructure
+  - RecipeClassMap must be threaded through to lowering
+
+
+WHY APPROACH 3 WINS FOR GENERALITY
+-----------------------------------
+Approach 2 handles fmul+reduction naturally but every additional op type
+(fdiv, fsub, outer product, batched matmul, conv2d pattern) requires editing
+execute() in multiple recipe classes with no central coordination.
+
+Approach 3's TPRecipePatternMatcher is a single extension point. New patterns
+are additive — existing execute() dispatch tables never change. This matches
+how the existing TensorPatternClassifier (at loop-nest level) works: classify
+first, emit later.
+
+
+FINAL PIPELINE
+--------------
+  TPlanBuilder          LoopNestInfo → scalar TPlan
+  TPlanWidener          DimSet BFS (union), seeds from TPHeaderPHIRecipe
+  TPRecipePatternMatcher classify all recipes → RecipeClassMap
+  TPlanLowering         execute() dispatches on RecipeClassMap
+
+Invariants:
+  TPlanWidener          owns shape analysis only
+  TPRecipePatternMatcher owns all pattern detection
+  execute()             is a pure dispatcher, no analysis
