@@ -157,27 +157,6 @@ static TensorOpKind classifyBinaryOp(const TPRecipeBase &R) {
   return TensorOpKind::Scalar;
 }
 
-/// Walk all recipes in \p Region and its children.
-static void matchRegion(const TPLoopRegion *Region, const TPlan &Plan,
-                         RecipeClassMap &Out) {
-  if (!Region)
-    return;
-  for (const TPRecipeBase &R : Region->getRecipes()) {
-    RecipeClassification C;
-    if (isReductionUpdate(&R)) {
-      C = classifyReduction(R, Plan);
-    } else if (R.getKind() == TPRecipeBase::RecipeKind::Widen &&
-               isa<BinaryOperator>(
-                   cast<TPWidenRecipe>(R).getInstruction()) &&
-               R.operands().size() == 2) {
-      C.Kind = classifyBinaryOp(R);
-    }
-    // else: load, store, cast, PHI, canonical IV → default Scalar
-    Out[&R] = C;
-  }
-  matchRegion(Region->getChild(), Plan, Out);
-}
-
 //===----------------------------------------------------------------------===//
 // Public API
 //===----------------------------------------------------------------------===//
@@ -192,7 +171,8 @@ SmallVector<unsigned> llvm::getTPValueShape(const TPSingleDefRecipe &V,
 
 void llvm::TPRecipePatternMatcher_match(const TPlan &Plan,
                                          RecipeClassMap &Out) {
-  matchRegion(Plan.getRootRegion(), Plan, Out);
+  // TODO: rewire in commit 2 — walk block CFG via constructionOrder().
+  (void)Plan;
 
   // Second pass: mark each FusedMulRecipe of a Contraction as Contraction too.
   // This ensures the fmul's execute() is a no-op (deferred to its consumer).

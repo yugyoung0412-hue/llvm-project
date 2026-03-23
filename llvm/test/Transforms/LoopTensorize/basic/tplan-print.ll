@@ -9,19 +9,40 @@
 ; CHECK: Live-in {{.*}} = PF[1]
 ; CHECK: Live-in {{.*}} = PF[2]
 ; CHECK: Live-in
-; CHECK: loop[0]
-; CHECK: CANONICAL-INDUCTION
-; CHECK: WIDEN-INDUCTION
-; CHECK: loop[1]
-; CHECK: CANONICAL-INDUCTION
-; CHECK: WIDEN-INDUCTION
-; CHECK: loop[2]
-; CHECK: CANONICAL-INDUCTION
-; CHECK: WIDEN-INDUCTION
-; CHECK: WIDEN{{.*}} = fmul
-; CHECK: WIDEN store
-; CHECK: CANONICAL-INDUCTION-INC
-; CHECK: CANONICAL-INDUCTION-CMP
+; CHECK: tensor.ph2:
+; CHECK: Successor(s): tensor loop2
+; CHECK: <x1> tensor loop2: {
+; CHECK:   ir-bb<outer>:
+; CHECK:     CANONICAL-INDUCTION
+; CHECK:     WIDEN-INDUCTION
+; CHECK:   Successor(s): tensor.latch2 tensor.ph1
+; CHECK:   tensor.latch2:
+; CHECK:     CANONICAL-INDUCTION-INC
+; CHECK:     CANONICAL-INDUCTION-CMP
+; CHECK:   No successors
+; CHECK:   tensor.ph1:
+; CHECK:   <x1> tensor loop1: {
+; CHECK:     ir-bb<middle>:
+; CHECK:       CANONICAL-INDUCTION
+; CHECK:       WIDEN-INDUCTION
+; CHECK:     tensor.latch1:
+; CHECK:       CANONICAL-INDUCTION-INC
+; CHECK:       CANONICAL-INDUCTION-CMP
+; CHECK:     tensor.ph0:
+; CHECK:     <x1> tensor loop0: {
+; CHECK:       ir-bb<inner>:
+; CHECK:         CANONICAL-INDUCTION
+; CHECK:         WIDEN-INDUCTION
+; CHECK:         WIDEN{{.*}} = fmul
+; CHECK:         WIDEN store
+; CHECK:       Successor(s): tensor.latch0 tensor.body.0
+; CHECK:       tensor.latch0:
+; CHECK:         CANONICAL-INDUCTION-INC
+; CHECK:         CANONICAL-INDUCTION-CMP
+; CHECK:       tensor.body.0:
+; CHECK:     }
+; CHECK:   }
+; CHECK: }
 
 target datalayout = "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128"
 target triple = "aarch64"

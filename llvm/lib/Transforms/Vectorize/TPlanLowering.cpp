@@ -198,38 +198,16 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
 }
 
 //===----------------------------------------------------------------------===//
-// Region walker
-//===----------------------------------------------------------------------===//
-
-static void lowerRegion(const TPLoopRegion *Region, TPTransformState &State) {
-  if (!Region)
-    return;
-  for (const TPRecipeBase &R : Region->getRecipes())
-    R.execute(State);
-  lowerRegion(Region->getChild(), State);
-}
-
-//===----------------------------------------------------------------------===//
 // Public entry point
 //===----------------------------------------------------------------------===//
 
 bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
                                 ScalarEvolution &SE, DominatorTree &DT) {
-  // 1. Propagate DimSets via BFS.
-  TPlanWidener_widen(Plan);
-
-  // 2. Classify every recipe by DimSet patterns.
-  RecipeClassMap CM;
-  TPRecipePatternMatcher_match(Plan, CM);
-
-  // 3. Lower: emit IR at the function entry block.
-  IRBuilder<> Builder(F.getContext());
-  if (!F.empty())
-    Builder.SetInsertPoint(&F.getEntryBlock().front());
-
-  TPTransformState State(Builder, Plan);
-  State.ClassMap = &CM;
-
-  lowerRegion(Plan.getRootRegion(), State);
-  return true;
+  // TODO: rewire in commit 2 — walk block CFG via constructionOrder().
+  (void)Plan;
+  (void)F;
+  (void)LI;
+  (void)SE;
+  (void)DT;
+  return false;
 }

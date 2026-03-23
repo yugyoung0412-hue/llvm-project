@@ -96,7 +96,7 @@ static void printIndent(raw_ostream &OS, unsigned Indent) {
 }
 
 /// DFS pre-order traversal starting from \p Start, following successors in
-/// insertion order. Visited tracking prevents re-visiting latchBB.
+/// insertion order. Visited tracking prevents re-visiting LatchBB.
 SmallVector<TPBlockBase *, 8>
 llvm::constructionOrder(TPBlockBase *Start) {
   SmallVector<TPBlockBase *, 8> Order;
@@ -348,13 +348,62 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
   // We'll build regions recursively. Track which loops are "above" current.
   ArrayRef<Loop *> AllLoops = Info.Loops;
 
-  // Recursive lambda to build a region for loop at index Idx
-  std::function<std::unique_ptr<TPLoopRegion>(unsigned)> BuildRegion =
-      [&](unsigned Idx) -> std::unique_ptr<TPLoopRegion> {
+  // Helper lambda to emit instructions from a basic block into a target block.
+  auto EmitBlock = [&](BasicBlock *BB, TPBasicBlock *Target) {
+    for (Instruction &Inst : *BB) {
+      if (isa<BranchInst>(&Inst) || isa<SwitchInst>(&Inst))
+        continue;
+      if (isa<PHINode>(&Inst))
+        continue;
+
+      Value *InstV = &Inst;
+
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(&Inst)) {
+        SmallVector<TPValue *, 4> Ops;
+        for (Value *Op : GEP->operands())
+          Ops.push_back(P.getTPValue(Op));
+        auto *R = new TPWidenGEPRecipe(&Inst, Ops);
+        Target->appendRecipe(R);
+        P.ValueMap[InstV] = R;
+      } else if (auto *LI = dyn_cast<LoadInst>(&Inst)) {
+        TPValue *PtrOp = P.getTPValue(LI->getPointerOperand());
+        auto *R = new TPWidenLoadRecipe(&Inst, PtrOp);
+        Target->appendRecipe(R);
+        P.ValueMap[InstV] = R;
+      } else if (auto *SI = dyn_cast<StoreInst>(&Inst)) {
+        TPValue *PtrOp = P.getTPValue(SI->getPointerOperand());
+        TPValue *ValOp = P.getTPValue(SI->getValueOperand());
+        auto *R = new TPWidenStoreRecipe(&Inst, PtrOp, ValOp);
+        Target->appendRecipe(R);
+      } else if (isa<BitCastInst>(&Inst) || isa<SExtInst>(&Inst) ||
+                 isa<ZExtInst>(&Inst)) {
+        TPValue *SrcOp = P.getTPValue(Inst.getOperand(0));
+        auto *R = new TPWidenCastRecipe(&Inst, SrcOp);
+        Target->appendRecipe(R);
+        P.ValueMap[InstV] = R;
+      } else {
+        SmallVector<TPValue *, 4> Ops;
+        for (Value *Op : Inst.operands())
+          Ops.push_back(P.getTPValue(Op));
+        auto *R = new TPWidenRecipe(&Inst, Ops);
+        Target->appendRecipe(R);
+        P.ValueMap[InstV] = R;
+      }
+    }
+  };
+
+  // Recursive lambda to build a TPRegionBlock for loop at index Idx.
+  std::function<TPRegionBlock *(unsigned)> BuildRegion =
+      [&](unsigned Idx) -> TPRegionBlock * {
     Loop *L = AllLoops[Idx];
 
     // Get trip count from InductionDesc
     const SCEV *TC = Info.IVs[Idx].TripCount;
+    (void)TC; // Trip count stored for future use
+
+    // Compute per-level naming suffix.
+    unsigned Level = P.Depth - 1 - Idx;
+    std::string LevelStr = std::to_string(Level);
 
     // Get the loop exit bound: latch branch condition ICmpInst RHS.
     Value *LatchBound = nullptr;
@@ -368,28 +417,21 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
     }
     TPValue *BoundTP = LatchBound ? P.getOrCreateLiveIn(LatchBound) : nullptr;
 
-    auto Region = std::make_unique<TPLoopRegion>(Idx, L, TC);
-
     // Hoist InductionPhi declaration so it can be used for CanonIV creation.
     PHINode *InductionPhi = Info.IVs[Idx].IndVar;
+
+    // Create the header and latch blocks for this loop level.
+    auto *HeaderBB = P.createTPIRBasicBlock(L->getHeader());
+    auto *LatchBB = P.createTPBasicBlock("tensor.latch" + LevelStr);
 
     // Insert canonical IV phi as the first recipe (VPlan-style).
     // Use a zero live-in as start matching the IV phi's type; step is patched below.
     TPValue *ZeroTP = P.getOrCreateLiveIn(
         ConstantInt::get(InductionPhi->getType(), 0));
     auto *CanonIV = new TPCanonicalIVRecipe(ZeroTP, ZeroTP /*placeholder step*/);
-    Region->appendRecipe(CanonIV);
+    HeaderBB->appendRecipe(CanonIV);
 
-    // Loops that are "outer" (index < Idx) — their IVs are live-ins to us
-    // Loops that are at or inside (index >= Idx) — defined within this region
-
-    // Set of basic blocks belonging to loops strictly inside this one
-    SmallPtrSet<BasicBlock *, 16> InnerBlocks;
-    for (unsigned J = Idx + 1; J < AllLoops.size(); ++J)
-      for (BasicBlock *BB : AllLoops[J]->blocks())
-        InnerBlocks.insert(BB);
-
-    // Process header PHIs
+    // Process header PHIs into HeaderBB.
     BasicBlock *Header = L->getHeader();
 
     for (PHINode &Phi : Header->phis()) {
@@ -419,9 +461,9 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
         auto *R = new TPWidenInductionRecipe(
             &Phi, StartTP,
             StartTP /* placeholder; patched after body */, Idx);
-        Region->appendRecipe(R);
+        HeaderBB->appendRecipe(R);
         P.ValueMap[PhiV] = R;
-        Region->setIV(R);
+        // Note: Region->setIV(R) removed — IV tracking is via P.ValueMap
       } else {
         // Reduction PHI: start from outside, loop value from inside
         Value *InitVal = nullptr;
@@ -438,89 +480,128 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
         TPValue *LoopTP = LoopVal ? P.getTPValue(LoopVal) : InitTP;
 
         auto *R = new TPReductionPHIRecipe(&Phi, InitTP, LoopTP);
-        Region->appendRecipe(R);
-        P.ValueMap[PhiV] = R;
+        HeaderBB->appendRecipe(R);
+        P.ValueMap[&Phi] = R;
       }
     }
 
-    // Process blocks: include header (non-PHI instructions) and other body blocks,
-    // but exclude blocks belonging to inner loops.
-    // Helper lambda to emit instructions from a basic block.
-    auto EmitBlock = [&](BasicBlock *BB) {
-      for (Instruction &Inst : *BB) {
-        if (isa<BranchInst>(&Inst) || isa<SwitchInst>(&Inst))
-          continue;
-        if (isa<PHINode>(&Inst))
-          continue;
+    // Emit non-PHI instructions from header into HeaderBB.
+    EmitBlock(Header, HeaderBB);
 
-        Value *InstV = &Inst;
+    // Emit latch non-PHI instructions to LatchBB.
+    if (BasicBlock *Latch = L->getLoopLatch())
+      EmitBlock(Latch, LatchBB);
 
-        if (auto *GEP = dyn_cast<GetElementPtrInst>(&Inst)) {
-          SmallVector<TPValue *, 4> Ops;
-          for (Value *Op : GEP->operands())
-            Ops.push_back(P.getTPValue(Op));
-          auto *R = new TPWidenGEPRecipe(&Inst, Ops);
-          Region->appendRecipe(R);
-          P.ValueMap[InstV] = R;
-        } else if (auto *LI = dyn_cast<LoadInst>(&Inst)) {
-          TPValue *PtrOp = P.getTPValue(LI->getPointerOperand());
-          auto *R = new TPWidenLoadRecipe(&Inst, PtrOp);
-          Region->appendRecipe(R);
-          P.ValueMap[InstV] = R;
-        } else if (auto *SI = dyn_cast<StoreInst>(&Inst)) {
-          TPValue *PtrOp = P.getTPValue(SI->getPointerOperand());
-          TPValue *ValOp = P.getTPValue(SI->getValueOperand());
-          auto *R = new TPWidenStoreRecipe(&Inst, PtrOp, ValOp);
-          Region->appendRecipe(R);
-        } else if (isa<BitCastInst>(&Inst) || isa<SExtInst>(&Inst) ||
-                   isa<ZExtInst>(&Inst)) {
-          TPValue *SrcOp = P.getTPValue(Inst.getOperand(0));
-          auto *R = new TPWidenCastRecipe(&Inst, SrcOp);
-          Region->appendRecipe(R);
-          P.ValueMap[InstV] = R;
-        } else {
-          SmallVector<TPValue *, 4> Ops;
-          for (Value *Op : Inst.operands())
-            Ops.push_back(P.getTPValue(Op));
-          auto *R = new TPWidenRecipe(&Inst, Ops);
-          Region->appendRecipe(R);
-          P.ValueMap[InstV] = R;
-        }
-      }
-    };
-
-    // Emit non-PHI instructions from header first
-    EmitBlock(Header);
-
-    // Process body blocks (excluding inner loop blocks and header)
-    for (BasicBlock *BB : L->blocks()) {
-      if (BB == Header)
-        continue;
-      if (InnerBlocks.count(BB))
-        continue;
-      // Also skip if this BB belongs to a sub-loop
-      bool IsInSubLoop = false;
-      for (unsigned J = Idx + 1; J < AllLoops.size(); ++J) {
-        if (AllLoops[J]->contains(BB)) {
-          IsInSubLoop = true;
-          break;
-        }
-      }
-      if (IsInSubLoop)
-        continue;
-
-      EmitBlock(BB);
-    }
-
-    // Recurse into child region (next loop level)
     if (Idx + 1 < AllLoops.size()) {
-      // Process inner loop's header and body into child region
-      auto Child = BuildRegion(Idx + 1);
-      Region->setChild(std::move(Child));
+      // Non-innermost: create inner preheader + recurse.
+      unsigned ChildLevel = Level - 1;
+      std::string ChildStr = std::to_string(ChildLevel);
+      auto *InnerPH = P.createTPBasicBlock("tensor.ph" + ChildStr);
+      auto *Child = BuildRegion(Idx + 1);
+      auto *MiddleBB = P.createTPBasicBlock("middle.block" + ChildStr);
+      BasicBlock *ExitBB = AllLoops[Idx + 1]->getExitBlock();
+      auto *CleanupBB = ExitBB ? P.createTPIRBasicBlock(ExitBB) : nullptr;
+      auto *ScalarPH = P.createTPBasicBlock("scalar.ph" + ChildStr);
+
+      // Emit body blocks (not header, not latch, not in inner loops) to InnerPH.
+      Loop *InnerLoop = AllLoops[Idx + 1];
+      for (BasicBlock *BB : L->blocks()) {
+        if (BB == L->getHeader() || BB == L->getLoopLatch()) continue;
+        if (InnerLoop->contains(BB)) continue;
+        EmitBlock(BB, InnerPH);
+      }
+
+      // Wire intra-region CFG.
+      // Note: setParent() calls happen after wiring so connectBlocks asserts
+      // parent == parent (nullptr == nullptr at this point) pass correctly.
+      TPBlockUtils::connectBlocks(HeaderBB, LatchBB);
+      TPBlockUtils::connectBlocks(HeaderBB, InnerPH);
+      TPBlockUtils::connectBlocks(InnerPH, Child);
+      TPBlockUtils::connectBlocks(Child, MiddleBB);
+      if (CleanupBB) {
+        TPBlockUtils::connectBlocks(MiddleBB, CleanupBB);
+        TPBlockUtils::connectBlocks(MiddleBB, ScalarPH);
+        TPBlockUtils::connectBlocks(CleanupBB, ScalarPH);
+      } else {
+        TPBlockUtils::connectBlocks(MiddleBB, ScalarPH);
+      }
+      TPBlockUtils::connectBlocks(ScalarPH, LatchBB);
+
+      // Carve out region: setEntry/setExiting set parent on header/latch.
+      auto *Region = P.createTPRegionBlock("tensor loop" + LevelStr);
+      Region->setEntry(HeaderBB);   // sets HeaderBB->Parent = Region
+      Region->setExiting(LatchBB);  // sets LatchBB->Parent = Region
+      InnerPH->setParent(Region);
+      Child->setParent(Region);
+      MiddleBB->setParent(Region);
+      if (CleanupBB) CleanupBB->setParent(Region);
+      ScalarPH->setParent(Region);
+
+      // Append canonical IV companion recipes to LatchBB.
+      if (BoundTP) {
+        auto *IncrRecipe = new TPCanonicalIVIncrRecipe(CanonIV, P.DimPFs[Idx].get());
+        LatchBB->appendRecipe(IncrRecipe);
+        CanonIV->setOperand(1, IncrRecipe);
+        IncrRecipe->addUser(CanonIV);
+        auto *CmpRecipe = new TPCanonicalIVExitCmpRecipe(IncrRecipe, BoundTP);
+        LatchBB->appendRecipe(CmpRecipe);
+      }
+
+      // Patch widen-induction step operand now that body is fully built.
+      BasicBlock *Latch = L->getLoopLatch();
+      if (Latch && InductionPhi) {
+        Value *StepVal = nullptr;
+        for (unsigned I = 0, E = InductionPhi->getNumIncomingValues(); I < E; ++I)
+          if (InductionPhi->getIncomingBlock(I) == Latch)
+            StepVal = InductionPhi->getIncomingValue(I);
+
+        if (StepVal) {
+          for (TPRecipeBase &R : *HeaderBB) {
+            if (auto *WI = dyn_cast<TPWidenInductionRecipe>(&R)) {
+              if (WI->getIVPhi() == InductionPhi) {
+                TPValue *StepTP = P.getTPValue(StepVal);
+                WI->setOperand(1, StepTP);
+                StepTP->addUser(WI);
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      return Region;
     }
 
-    // Patch induction recipe: fix up the step operand now that body is built.
-    // Find the increment instruction for this loop's IV.
+    // Innermost: create body block.
+    auto *BodyBB = P.createTPBasicBlock("tensor.body.0");
+
+    // Emit body blocks (not header, not latch) to BodyBB.
+    for (BasicBlock *BB : L->blocks()) {
+      if (BB == L->getHeader() || BB == L->getLoopLatch()) continue;
+      EmitBlock(BB, BodyBB);
+    }
+
+    // Wire intra-region CFG.
+    TPBlockUtils::connectBlocks(HeaderBB, LatchBB);
+    TPBlockUtils::connectBlocks(HeaderBB, BodyBB);
+
+    // Carve out region.
+    auto *Region = P.createTPRegionBlock("tensor loop" + LevelStr);
+    Region->setEntry(HeaderBB);
+    Region->setExiting(LatchBB);
+    BodyBB->setParent(Region);
+
+    // Append canonical IV companion recipes to LatchBB.
+    if (BoundTP) {
+      auto *IncrRecipe = new TPCanonicalIVIncrRecipe(CanonIV, P.DimPFs[Idx].get());
+      LatchBB->appendRecipe(IncrRecipe);
+      CanonIV->setOperand(1, IncrRecipe);
+      IncrRecipe->addUser(CanonIV);
+      auto *CmpRecipe = new TPCanonicalIVExitCmpRecipe(IncrRecipe, BoundTP);
+      LatchBB->appendRecipe(CmpRecipe);
+    }
+
+    // Patch widen-induction step operand now that body is fully built.
     BasicBlock *Latch = L->getLoopLatch();
     if (Latch && InductionPhi) {
       Value *StepVal = nullptr;
@@ -529,11 +610,9 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
           StepVal = InductionPhi->getIncomingValue(I);
 
       if (StepVal) {
-        // Find the TPWidenInductionRecipe for this phi
-        for (TPRecipeBase &R : Region->getRecipes()) {
+        for (TPRecipeBase &R : *HeaderBB) {
           if (auto *WI = dyn_cast<TPWidenInductionRecipe>(&R)) {
             if (WI->getIVPhi() == InductionPhi) {
-              // Patch operand[1] (step)
               TPValue *StepTP = P.getTPValue(StepVal);
               WI->setOperand(1, StepTP);
               StepTP->addUser(WI);
@@ -544,28 +623,34 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
       }
     }
 
-    // Create canonical IV companion recipes.
-    if (BoundTP) {
-      // Increment: canonical_iv + PF[Idx]
-      // CanonIV IS a TPValue (TPSingleDefRecipe), so pass it directly.
-      auto *IncrRecipe = new TPCanonicalIVIncrRecipe(CanonIV, P.DimPFs[Idx].get());
-      Region->appendRecipe(IncrRecipe);
-
-      // Patch canonical IV step operand to point to the increment result.
-      // IncrRecipe IS a TPValue (TPSingleDefRecipe).
-      CanonIV->setOperand(1, IncrRecipe);
-      IncrRecipe->addUser(CanonIV);
-
-      // Exit cmp: incremented_iv icmp bound
-      auto *CmpRecipe = new TPCanonicalIVExitCmpRecipe(IncrRecipe, BoundTP);
-      Region->appendRecipe(CmpRecipe);
-    }
-
     return Region;
   };
 
-  if (!AllLoops.empty())
-    P.RootRegion = BuildRegion(0);
+  if (!AllLoops.empty()) {
+    unsigned OuterLevel = P.Depth - 1;
+    std::string OuterStr = std::to_string(OuterLevel);
+
+    auto *OuterPH  = P.createTPBasicBlock("tensor.ph" + OuterStr);
+    auto *Outer    = BuildRegion(0);
+    auto *MiddleBB = P.createTPBasicBlock("middle.block" + OuterStr);
+    BasicBlock *ExitBB = AllLoops[0]->getExitBlock();
+    auto *CleanupBB = ExitBB ? P.createTPIRBasicBlock(ExitBB) : nullptr;
+    auto *ScalarPH  = P.createTPBasicBlock("scalar.ph" + OuterStr);
+
+    // Top-level blocks all have parent = nullptr (top-level plan).
+    TPBlockUtils::connectBlocks(OuterPH, Outer);
+    TPBlockUtils::connectBlocks(Outer, MiddleBB);
+    if (CleanupBB) {
+      TPBlockUtils::connectBlocks(MiddleBB, CleanupBB);
+      TPBlockUtils::connectBlocks(MiddleBB, ScalarPH);
+      TPBlockUtils::connectBlocks(CleanupBB, ScalarPH);
+    } else {
+      TPBlockUtils::connectBlocks(MiddleBB, ScalarPH);
+    }
+    // ScalarPH: no successors at top level.
+
+    P.setEntry(OuterPH);
+  }
 
   P.ReductionDims = Info.ReductionDims;
   return P;
@@ -599,8 +684,11 @@ void TPlan::print(raw_ostream &OS) const {
   }
   OS << "\n";
 
-  if (RootRegion)
-    RootRegion->print(OS, 0, Tracker);
+  // Walk the block CFG in DFS pre-order from the entry block.
+  if (Entry) {
+    for (TPBlockBase *B : constructionOrder(Entry))
+      B->print(OS, "", Tracker);
+  }
 
   OS << "}\n";
 }

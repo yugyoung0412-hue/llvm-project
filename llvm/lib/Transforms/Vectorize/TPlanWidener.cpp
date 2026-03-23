@@ -24,62 +24,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Vectorize/TPlan.h"
-#include "llvm/ADT/SmallVector.h"
 
 using namespace llvm;
 
-/// Walk all recipes in \p Region and its children recursively.
-/// Calls \p Fn(TPRecipeBase &).
-template <typename Fn>
-static void walkRecipes(TPLoopRegion *Region, Fn &&F) {
-  if (!Region)
-    return;
-  for (TPRecipeBase &R : Region->getRecipes())
-    F(R);
-  walkRecipes(Region->getChild(), F);
-}
-
 void llvm::TPlanWidener_widen(TPlan &Plan) {
-  SmallVector<TPSingleDefRecipe *, 32> Worklist;
-
-  // Phase 1: Seed from TPWidenInductionRecipe.
-  walkRecipes(Plan.getRootRegion(), [&](TPRecipeBase &R) {
-    if (auto *WI = dyn_cast<TPWidenInductionRecipe>(&R)) {
-      // WI IS a TPSingleDefRecipe
-      unsigned Dim = WI->getDimIndex();
-      WI->DimSet.resize(std::max(WI->DimSet.size(), (size_t)(Dim + 1)));
-      WI->DimSet.set(Dim);
-      Worklist.push_back(WI);
-    }
-  });
-
-  // Phase 2: BFS union propagation to fixpoint.
-  // A DV may be re-enqueued whenever its DimSet gains new bits.  Termination
-  // is guaranteed because DimSet is monotonically non-decreasing and bounded
-  // by the loop nest depth (at most Depth bits per DV).
-  while (!Worklist.empty()) {
-    TPSingleDefRecipe *V = Worklist.pop_back_val();
-
-    for (TPUser *U : V->users()) {
-      auto *Recipe = dyn_cast<TPRecipeBase>(U);
-      if (!Recipe)
-        continue;
-
-      TPSingleDefRecipe *DV = Recipe->getDefinedValue(); // null for stores
-      if (!DV)
-        continue;
-
-      // Resize to accommodate all bit indices.
-      unsigned NeedSize = V->DimSet.size();
-      if (DV->DimSet.size() < NeedSize)
-        DV->DimSet.resize(NeedSize);
-
-      // Union: re-enqueue whenever new bits are added so downstream users
-      // see the complete DimSet (fixpoint propagation).
-      SmallBitVector Before = DV->DimSet;
-      DV->DimSet |= V->DimSet;
-      if (DV->DimSet != Before)
-        Worklist.push_back(DV);
-    }
-  }
+  // TODO: rewire in commit 2 — walk block CFG via constructionOrder().
+  (void)Plan;
 }

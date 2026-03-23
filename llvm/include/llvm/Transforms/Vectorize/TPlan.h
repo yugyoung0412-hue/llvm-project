@@ -704,6 +704,7 @@ public:
   /// Build an initial TPlan by walking the loop nest IR.
   static TPlan buildInitial(const LoopNestInfo &Info);
 
+  TPlan() = default;
   TPlan(const TPlan &) = delete;
   TPlan &operator=(const TPlan &) = delete;
   TPlan(TPlan &&) = default;
