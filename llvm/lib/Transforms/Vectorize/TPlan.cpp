@@ -14,6 +14,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Support/raw_ostream.h"
+#include <string>  // for std::to_string
 
 using namespace llvm;
 
@@ -60,6 +61,27 @@ void TPLiveIn::printAsOperand(raw_ostream &OS, TPSlotTracker &) const {
 //===----------------------------------------------------------------------===//
 
 void TPDefVal::printAsOperand(raw_ostream &OS, TPSlotTracker &Tracker) const {
+  // For recipes that wrap IR instructions or PHIs, use the IR value name so
+  // the TPlan printout is directly readable against the original IR.
+  if (DefRecipe) {
+    StringRef Name;
+    if (auto *R = dyn_cast<TPWidenRecipe>(DefRecipe))
+      Name = R->getInstruction()->getName();
+    else if (auto *R = dyn_cast<TPWidenInductionRecipe>(DefRecipe))
+      Name = R->getIVPhi()->getName();
+    else if (auto *R = dyn_cast<TPWidenLoadRecipe>(DefRecipe))
+      Name = R->getInstruction()->getName();
+    else if (auto *R = dyn_cast<TPWidenGEPRecipe>(DefRecipe))
+      Name = R->getInstruction()->getName();
+    else if (auto *R = dyn_cast<TPWidenCastRecipe>(DefRecipe))
+      Name = R->getInstruction()->getName();
+    else if (auto *R = dyn_cast<TPReductionPHIRecipe>(DefRecipe))
+      Name = R->getPhi()->getName();
+    if (!Name.empty()) {
+      OS << "ir<%" << Name << ">";
+      return;
+    }
+  }
   OS << "tp<%" << Tracker.getSlot(this) << ">";
 }
 
@@ -249,6 +271,11 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
       P.FuncName = std::string(F->getName());
   }
   P.Depth = Info.Depth;
+
+  // Create one synthetic PF value per loop dimension.
+  for (unsigned D = 0; D < P.Depth; ++D)
+    P.DimPFs.push_back(
+        std::make_unique<TPSyntheticValue>("PF[" + std::to_string(D) + "]"));
 
   // We'll build regions recursively. Track which loops are "above" current.
   ArrayRef<Loop *> AllLoops = Info.Loops;
@@ -451,9 +478,9 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
 
     // Create canonical IV companion recipes.
     if (CanonIV->getDefinedValue() && BoundTP) {
-      // Increment: canonical_iv + PF
+      // Increment: canonical_iv + PF[Idx]
       auto *IncrRecipe = new TPCanonicalIVIncrRecipe(
-          CanonIV->getDefinedValue(), &P.PF);
+          CanonIV->getDefinedValue(), P.DimPFs[Idx].get());
       Region->appendRecipe(IncrRecipe);
 
       // Patch canonical IV step operand to point to the increment result.
@@ -483,14 +510,18 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
 void TPlan::print(raw_ostream &OS) const {
   OS << "TPlan '" << FuncName << "' (depth=" << Depth << ") {\n";
 
-  // Pre-assign PF as tp<%0> before any lazy recipe-slot assignment.
+  // Pre-assign PF[d] slots in order (tp<%0>…tp<%D-1>) before any lazy
+  // recipe-slot assignment, so they always have the lowest slot numbers.
   Tracker.reset();
-  Tracker.preAssignSynthetic(&PF);
+  for (const auto &DP : DimPFs)
+    Tracker.preAssignSynthetic(DP.get());
 
-  // Print synthetic live-ins first (VPlan style).
-  OS << "Live-in ";
-  PF.printAsOperand(OS, Tracker);
-  OS << " = PF\n";
+  // Print per-dim synthetic live-ins (PF[0], PF[1], …).
+  for (const auto &DP : DimPFs) {
+    OS << "Live-in ";
+    DP->printAsOperand(OS, Tracker);
+    OS << " = " << DP->getName() << "\n";
+  }
 
   // Print IR-backed live-ins (unchanged, still ir<>).
   for (const auto &LI : LiveIns) {

@@ -478,7 +478,11 @@ public:
 
   TPLoopRegion *getRootRegion() const { return RootRegion.get(); }
 
-  const TPSyntheticValue *getPF() const { return &PF; }
+  /// Returns the per-dimension parallel-factor synthetic value for dim \p D.
+  TPSyntheticValue *getDimPF(unsigned D) const {
+    assert(D < DimPFs.size() && "Dim out of range");
+    return DimPFs[D].get();
+  }
 
   const SmallBitVector &getReductionDims() const { return ReductionDims; }
 
@@ -491,7 +495,7 @@ public:
   void setDimPF(unsigned Dim, unsigned PF) { DimPFMap[Dim] = PF; }
 
 private:
-  TPSyntheticValue PF{"PF"};
+  SmallVector<std::unique_ptr<TPSyntheticValue>> DimPFs; ///< PF[0]…PF[Depth-1]
   std::string FuncName;
   unsigned Depth = 0;
   SmallBitVector ReductionDims;              ///< Dims not in any store IndexExpr.

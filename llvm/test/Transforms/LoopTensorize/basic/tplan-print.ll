@@ -5,7 +5,9 @@
 ; 3-deep loop nest (GEMM shape: 2 reads + 1 write).
 
 ; CHECK: TPlan 'gemm' (depth=3) {
-; CHECK: Live-in tp<%0> = PF
+; CHECK: Live-in {{.*}} = PF[0]
+; CHECK: Live-in {{.*}} = PF[1]
+; CHECK: Live-in {{.*}} = PF[2]
 ; CHECK: Live-in
 ; CHECK: loop[0]
 ; CHECK: CANONICAL-INDUCTION
