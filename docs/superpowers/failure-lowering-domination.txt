@@ -1,0 +1,81 @@
+Failure Report: LoopTensorize Lowering — Domination Violations
+==============================================================
+Date: 2026-03-24
+Branch: LoopTensorizebyClaude
+Commit: fe3226b00483
+
+FAILING TESTS (5)
+-----------------
+  llvm/test/Transforms/LoopTensorize/basic/no-tensorize-negative.ll
+  llvm/test/Transforms/LoopTensorize/basic/conv2d-no-match-non-affine.ll
+  llvm/test/Transforms/LoopTensorize/basic/conv2d-recognition.ll
+  llvm/test/Transforms/LoopTensorize/basic/conv2d-im2col-decision.ll
+  llvm/test/Transforms/LoopTensorize/remainder/non-divisible-tripcount.ll
+
+SYMPTOM
+-------
+All five tests abort with:
+
+  Instruction does not dominate all uses!
+    %ptr.addr = getelementptr ptr, ptr %Ptrs, i32 %i
+    ...
+  LLVM ERROR: Broken module found, compilation aborted!
+
+The IR verifier detects that cloned instructions are inserted at a point
+that does not dominate their uses (or that uses of loop-local values appear
+outside the loop). opt then aborts (exit code -6, SIGABRT).
+
+ROOT CAUSE
+----------
+In TPlanLowering_lower() (TPlanLowering.cpp), the IRBuilder is positioned
+at the function entry block:
+
+  Builder.SetInsertPoint(&F.getEntryBlock().front());
+
+Then TPRegionBlock::execute() and TPBasicBlock::execute() walk the block
+graph in construction order.  Only TPIRBasicBlock::execute() repositions
+the builder (to the first non-PHI of its associated IR basic block).  All
+other TPBasicBlock::execute() calls (tensor.latch, tensor.ph, tensor.body,
+middle.block, scalar.ph) emit their cloned instructions wherever the builder
+currently is.
+
+Because loop-body values (%i, %k, GEP results, load results, etc.) are
+defined inside loop blocks, cloning them at the entry block (or at whatever
+arbitrary builder position is current) violates SSA dominance: a use
+appears before its definition in CFG post-order.
+
+AFFECTED RECIPE EXECUTE() IMPLS
+--------------------------------
+  TPWidenGEPRecipe::execute()   -> Builder.Insert(GEPInst->clone())
+  TPWidenLoadRecipe::execute()  -> Builder.Insert(LoadInst->clone())
+  TPWidenStoreRecipe::execute() -> Builder.Insert(StoreInst->clone())
+  TPWidenRecipe::execute()      -> Builder.Insert(Inst->clone())
+  TPWidenCastRecipe::execute()  -> Builder.Insert(CastInst->clone())
+
+All of these blindly clone the original instruction and insert at the
+current builder position without remapping operands or repositioning the
+builder to the instruction's original dominating block.
+
+PRE-EXISTING STATUS
+-------------------
+These tests were also failing at the Commit 1 stub (000e690c32b9) in
+a different way: the stub returned false (no-op), so for tests that expected
+the pass to NOT produce matrix.multiply, the IR verifier would still run on
+the unmodified IR.  For conv2d-recognition and conv2d-im2col-decision (which
+use -debug-only and check debug output), the stub caused FileCheck to receive
+no output and crash (-6 from FileCheck itself).
+
+After Commit 2, the lowering runs for all recognized loops, exposing the
+domination issue uniformly across all five tests.
+
+TESTS NOT AFFECTED
+------------------
+  pf-dimset-gemm.ll        -- uses --disable-verify; verifier skipped
+  matrix-multiply-emit.ll  -- uses --disable-verify; verifier skipped
+  amx-bf16-gemm.ll         -- uses --disable-verify; verifier skipped
+  pf-dimset-eltwise.ll     -- uses --disable-verify
+  pf-dimset-plain-reduction.ll -- uses --disable-verify
+  gemm-recognition.ll      -- debug-only output only; no IR output checked
+  conv2d-no-match-gemm.ll  -- debug-only output only
+  no-op.ll                 -- loop not recognized; pass is no-op
+  tplan-print.ll           -- debug-only; no IR output

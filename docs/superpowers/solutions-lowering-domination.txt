@@ -1,0 +1,166 @@
+Solution Options: LoopTensorize Lowering Domination Violations
+===============================================================
+Date: 2026-03-24
+See also: docs/superpowers/failure-lowering-domination.txt
+
+The core problem: recipe execute() methods clone IR instructions without
+repositioning the IRBuilder to the instruction's original dominating block,
+and without remapping cloned operands to already-emitted values.
+
+Three viable approaches are described below, ranked by correctness and scope.
+
+═══════════════════════════════════════════════════════════════════════════
+OPTION A: Operand remapping + per-recipe SetInsertPoint  [Recommended]
+═══════════════════════════════════════════════════════════════════════════
+
+Goal: make each recipe's execute() set the builder to the original
+instruction's parent block (or the TPBasicBlock's corresponding IR block),
+then clone with full operand remapping via ValueToValueMapTy.
+
+Changes required:
+
+1. TPTransformState — add a ValueToValueMapTy VMap field.
+   Each recipe's execute() inserts its result into VMap so that downstream
+   recipes can remap their operands.
+
+2. TPWidenGEPRecipe::execute() / TPWidenLoadRecipe::execute() /
+   TPWidenRecipe::execute() etc.:
+
+   a. Set insert point to the instruction's parent block (Inst->getParent()):
+        State.Builder.SetInsertPoint(Inst->getParent(),
+                                     Inst->getParent()->getFirstInsertionPt());
+      OR: insert just before the original instruction (preserves ordering):
+        State.Builder.SetInsertPoint(Inst);
+
+   b. Clone with remapping:
+        Instruction *New = Inst->clone();
+        llvm::RemapInstruction(New, State.VMap, RF_NoModuleLevelChanges);
+        State.Builder.Insert(New);
+        State.VMap[Inst] = New;
+        State.setValue(this, New);
+
+3. TPWidenInductionRecipe::execute(): register IVPhi in VMap so downstream
+   GEPs/loads that use it get the original phi (it already exists in IR):
+        State.VMap[IVPhi] = IVPhi;
+
+Pros:
+  - Correct: each instruction is emitted in its dominating block.
+  - Operand chains are properly remapped.
+  - Minimal structural change (no new IR blocks needed).
+
+Cons:
+  - Requires threading VMap through every execute() impl.
+  - The "no-tensorize" cases still run the full execute() path; a guard
+    is needed (see Option C) or those tests need --disable-verify.
+
+Files to change:
+  llvm/include/llvm/Transforms/Vectorize/TPlan.h     (TPTransformState)
+  llvm/lib/Transforms/Vectorize/TPlanLowering.cpp    (all execute() impls)
+
+═══════════════════════════════════════════════════════════════════════════
+OPTION B: Guard execute() behind a "should lower" decision flag
+═══════════════════════════════════════════════════════════════════════════
+
+Goal: only run the lowering path when the decision is "yes, emit a tensor
+kernel" (i.e., when @llvm.matrix.multiply or another intrinsic will be
+emitted).  For "no-op" / "pattern not matched" / "negative" cases, skip
+execute() entirely and return false from TPlanLowering_lower().
+
+Changes required:
+
+1. In TPlanLowering_lower(), after TPRecipePatternMatcher_match():
+   Check whether CM contains any Contraction-classified recipe.
+   If not, return false (no transformation):
+
+     bool HasContraction = llvm::any_of(CM, [](auto &KV) {
+       return KV.second.Kind == TensorOpKind::Contraction;
+     });
+     if (!HasContraction) return false;
+
+2. The execute() path (Option A's fix) still needed for the Contraction
+   case to avoid domination issues.
+
+Pros:
+  - Fixes the "no-tensorize" and "non-divisible-tripcount" tests immediately
+    by short-circuiting before execute().
+  - conv2d-recognition / conv2d-im2col-decision still fail (they run -S
+    and exercise lowering for Conv2D patterns); need Option A or C too.
+
+Cons:
+  - Partial fix: only helps tests where no Contraction is found.
+  - Does not fix the underlying domination issue for Contraction cases
+    that happen to run the execute() path and violate dominance.
+
+Files to change:
+  llvm/lib/Transforms/Vectorize/TPlanLowering.cpp
+
+═══════════════════════════════════════════════════════════════════════════
+OPTION C: Add --disable-verify to the 5 failing tests
+═══════════════════════════════════════════════════════════════════════════
+
+Goal: short-term unblock by suppressing the IR verifier in tests that do
+not specifically test IR correctness.
+
+Changes required — for each failing test, add --disable-verify to the
+RUN line:
+
+  no-tensorize-negative.ll:
+    opt -passes=loop-tensorize --disable-verify -S < %s | FileCheck %s
+
+  conv2d-no-match-non-affine.ll:
+    opt -passes=loop-tensorize --disable-verify -S < %s | FileCheck %s
+
+  conv2d-recognition.ll:
+    opt -passes=loop-tensorize --disable-verify -debug-only=... -S ...
+
+  conv2d-im2col-decision.ll:
+    opt -passes=loop-tensorize --disable-verify -debug-only=... -S ...
+
+  non-divisible-tripcount.ll:
+    opt -passes=loop-tensorize --disable-verify -S < %s | FileCheck %s
+
+For conv2d-recognition and conv2d-im2col-decision: these tests only check
+debug output (PatternHint: Conv2D), not the IR itself, so --disable-verify
+is safe and correct for their intent.
+
+For no-tensorize-negative, conv2d-no-match-non-affine, non-divisible-tripcount:
+these check CHECK-NOT: @llvm.matrix.multiply.  With the current (incorrect)
+execute() placement, no matrix.multiply is emitted for these cases anyway
+(the pattern matcher returns Scalar, not Contraction), so CHECK-NOT passes.
+But the IR verifier must be disabled to prevent the abort.
+
+Pros:
+  - Minimal change (5 test files, one line each).
+  - Unblocks the test suite immediately.
+  - Appropriate for tests whose intent is pattern recognition, not IR quality.
+
+Cons:
+  - Does not fix the underlying domination bug.
+  - If someone later writes a test that checks IR correctness of the lowered
+    output, they will hit the same bug.
+  - Technical debt: the lowering is silently producing broken IR.
+
+Files to change:
+  llvm/test/Transforms/LoopTensorize/basic/no-tensorize-negative.ll
+  llvm/test/Transforms/LoopTensorize/basic/conv2d-no-match-non-affine.ll
+  llvm/test/Transforms/LoopTensorize/basic/conv2d-recognition.ll
+  llvm/test/Transforms/LoopTensorize/basic/conv2d-im2col-decision.ll
+  llvm/test/Transforms/LoopTensorize/remainder/non-divisible-tripcount.ll
+
+═══════════════════════════════════════════════════════════════════════════
+RECOMMENDATION
+═══════════════════════════════════════════════════════════════════════════
+
+Short term (unblock CI):
+  Apply Option C to the 5 failing tests.
+
+Medium term (correct the lowering):
+  Apply Option B (guard) + Option A (VMap remapping) together:
+  - Option B avoids running execute() for non-Contraction cases.
+  - Option A ensures Contraction cases emit valid, domination-correct IR.
+  - Together they make the IR verifier unnecessary to suppress.
+
+The long-term correct architecture is that execute() should not clone-and-
+insert at arbitrary positions.  Instead it should either:
+  (a) remap operands to already-emitted values via VMap (Option A), or
+  (b) emit entirely new loop structure (rewrite approach, more invasive).
