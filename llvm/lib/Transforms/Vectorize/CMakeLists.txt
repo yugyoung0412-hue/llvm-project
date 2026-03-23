@@ -9,6 +9,10 @@ add_llvm_component_library(LLVMVectorize
   TensorTransformSpace.cpp
   TensorCodeGen.cpp
   TensorCostModel.cpp
+  TPlan.cpp
+  TPlanWidener.cpp
+  TPRecipeMatcher.cpp
+  TPlanLowering.cpp
   SandboxVectorizer/DependencyGraph.cpp
   SandboxVectorizer/InstrMaps.cpp
   SandboxVectorizer/Interval.cpp
