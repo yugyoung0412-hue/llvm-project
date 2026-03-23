@@ -163,13 +163,15 @@ protected:
 //===----------------------------------------------------------------------===//
 class TPWidenInductionRecipe : public TPRecipeBase {
 public:
-  TPWidenInductionRecipe(PHINode *IV, TPValue *StartVal, TPValue *StepVal)
-      : TPRecipeBase(RecipeKind::WidenInduction), IVPhi(IV) {
+  TPWidenInductionRecipe(PHINode *IV, TPValue *StartVal, TPValue *StepVal,
+                          unsigned DimIdx)
+      : TPRecipeBase(RecipeKind::WidenInduction), IVPhi(IV), DimIndex(DimIdx) {
     addOperand(StartVal);
     addOperand(StepVal);
   }
 
   PHINode *getIVPhi() const { return IVPhi; }
+  unsigned getDimIndex() const { return DimIndex; }
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
@@ -180,6 +182,7 @@ public:
 
 private:
   PHINode *IVPhi;
+  unsigned DimIndex = 0;  // index in LoopNestInfo::IVs (0 = outermost)
 };
 
 //===----------------------------------------------------------------------===//

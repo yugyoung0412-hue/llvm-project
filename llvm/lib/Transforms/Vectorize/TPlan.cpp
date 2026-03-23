@@ -323,7 +323,7 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
 
         auto *R = new TPWidenInductionRecipe(
             &Phi, StartTP,
-            StartTP /* placeholder; patched after body */);
+            StartTP /* placeholder; patched after body */, Idx);
         Region->appendRecipe(R);
         P.ValueMap[PhiV] = R->getDefinedValue();
         Region->setIV(R->getDefinedValue());
