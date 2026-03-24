@@ -24,7 +24,7 @@ using namespace llvm;
 // TPSlotTracker
 //===----------------------------------------------------------------------===//
 
-void TPSlotTracker::preAssignSynthetic(const TPSyntheticValue *V) {
+void TPSlotTracker::preAssignSynthetic(const TPSymbolicValue *V) {
   SlotMap.try_emplace(V, NextSlot++);
 }
 
@@ -35,16 +35,17 @@ unsigned TPSlotTracker::getSlot(const TPValue *V) {
   return It->second;
 }
 
-void TPSyntheticValue::printAsOperand(raw_ostream &OS,
+void TPSymbolicValue::printAsOperand(raw_ostream &OS,
                                       TPSlotTracker &Tracker) const {
   OS << "tp<%" << Tracker.getSlot(this) << ">";
 }
 
 //===----------------------------------------------------------------------===//
-// TPLiveIn::printAsOperand
+// TPIRValue::printAsOperand
 //===----------------------------------------------------------------------===//
 
-void TPLiveIn::printAsOperand(raw_ostream &OS, TPSlotTracker &) const {
+void TPIRValue::printAsOperand(raw_ostream &OS, TPSlotTracker &) const {
+  Value *IRVal = getUnderlyingValue();
   OS << "ir<";
   if (auto *CI = dyn_cast<ConstantInt>(IRVal)) {
     OS << CI->getSExtValue();
@@ -56,6 +57,71 @@ void TPLiveIn::printAsOperand(raw_ostream &OS, TPSlotTracker &) const {
     IRVal->printAsOperand(OS, /*PrintType=*/false);
   }
   OS << ">";
+}
+
+//===----------------------------------------------------------------------===//
+// TPConstantInt methods
+//===----------------------------------------------------------------------===//
+
+bool TPConstantInt::isOne()  const { return cast<ConstantInt>(getUnderlyingValue())->isOne(); }
+bool TPConstantInt::isZero() const { return cast<ConstantInt>(getUnderlyingValue())->isZero(); }
+const APInt &TPConstantInt::getAPInt() const {
+  return cast<ConstantInt>(getUnderlyingValue())->getValue();
+}
+unsigned TPConstantInt::getBitWidth() const { return getAPInt().getBitWidth(); }
+uint64_t TPConstantInt::getZExtValue() const { return getAPInt().getZExtValue(); }
+
+//===----------------------------------------------------------------------===//
+// TPValue utility methods
+//===----------------------------------------------------------------------===//
+
+void TPValue::replaceAllUsesWith(TPValue *New) {
+  SmallVector<TPUser *, 4> Snapshot(Users.begin(), Users.end());
+  for (TPUser *U : Snapshot)
+    for (unsigned I = 0, E = U->getNumOperands(); I != E; ++I)
+      if (U->getOperand(I) == this)
+        U->setOperand(I, New);
+}
+
+void TPValue::replaceUsesWithIf(TPValue *New,
+                                 function_ref<bool(TPUser &, unsigned)> Fn) {
+  SmallVector<TPUser *, 4> Snapshot(Users.begin(), Users.end());
+  for (TPUser *U : Snapshot)
+    for (unsigned I = 0, E = U->getNumOperands(); I != E; ++I)
+      if (U->getOperand(I) == this && Fn(*U, I))
+        U->setOperand(I, New);
+}
+
+// Base implementation returns nullptr; TPRecipeValue overrides in TPlan.h.
+TPRecipeBase *TPValue::getDefiningRecipe() { return nullptr; }
+const TPRecipeBase *TPValue::getDefiningRecipe() const { return nullptr; }
+
+//===----------------------------------------------------------------------===//
+// TPRecipeBase insertion/movement helpers
+//===----------------------------------------------------------------------===//
+
+void TPRecipeBase::insertBefore(TPRecipeBase *InsertPos) {
+  assert(InsertPos->Parent && "InsertPos has no parent block");
+  Parent = InsertPos->Parent;
+  Parent->getRecipeList().insert(InsertPos->getIterator(), this);
+}
+
+void TPRecipeBase::insertAfter(TPRecipeBase *InsertPos) {
+  assert(InsertPos->Parent && "InsertPos has no parent block");
+  Parent = InsertPos->Parent;
+  auto It = std::next(InsertPos->getIterator());
+  Parent->getRecipeList().insert(It, this);
+}
+
+void TPRecipeBase::removeFromParent() {
+  assert(Parent && "Recipe not in any block");
+  Parent->getRecipeList().remove(getIterator());
+  Parent = nullptr;
+}
+
+iplist<TPRecipeBase>::iterator TPRecipeBase::eraseFromParent() {
+  assert(Parent && "Recipe not in any block");
+  return Parent->getRecipeList().erase(getIterator());
 }
 
 //===----------------------------------------------------------------------===//
@@ -253,14 +319,35 @@ void TPCanonicalIVExitCmpRecipe::print(raw_ostream &OS, unsigned Indent,
 // TPBlockBase subclass print() implementations
 //===----------------------------------------------------------------------===//
 
+/// Append DimSet annotation for a TPSingleDefRecipe (only when non-empty).
+/// Shown at Stage 2+ after TPlanWidener_widen() has populated DimSet fields.
+static void printDimSetAnnotation(raw_ostream &OS, const TPRecipeBase &R,
+                                   unsigned Indent) {
+  const auto *SDR = dyn_cast<TPSingleDefRecipe>(&R);
+  if (!SDR || SDR->DimSet.none())
+    return;
+  printIndent(OS, Indent);
+  OS << "; DimSet={";
+  bool First = true;
+  for (int D = SDR->DimSet.find_first(); D >= 0; D = SDR->DimSet.find_next(D)) {
+    if (!First)
+      OS << ",";
+    OS << D;
+    First = false;
+  }
+  OS << "}\n";
+}
+
 void TPBasicBlock::print(raw_ostream &OS, const Twine &Indent,
                           TPSlotTracker &Tracker) const {
   OS << Indent << getName() << ":\n";
   // Recipes use unsigned Indent (existing API); compute depth from Twine length.
   // Invariant: each nesting level is exactly 2 spaces, so depth = len/2.
   unsigned RecipeDepth = Indent.str().size() / 2 + 1;
-  for (const TPRecipeBase &R : Recipes)
+  for (const TPRecipeBase &R : Recipes) {
     R.print(OS, RecipeDepth, Tracker);
+    printDimSetAnnotation(OS, R, RecipeDepth + 1);
+  }
   printBlockSuccessors(OS, Indent, this);
   OS << "\n";
 }
@@ -269,8 +356,10 @@ void TPIRBasicBlock::print(raw_ostream &OS, const Twine &Indent,
                             TPSlotTracker &Tracker) const {
   OS << Indent << getName() << ":\n";
   unsigned RecipeDepth = Indent.str().size() / 2 + 1;
-  for (const TPRecipeBase &R : Recipes)
+  for (const TPRecipeBase &R : Recipes) {
     R.print(OS, RecipeDepth, Tracker);
+    printDimSetAnnotation(OS, R, RecipeDepth + 1);
+  }
   printBlockSuccessors(OS, Indent, this);
   OS << "\n";
 }
@@ -321,11 +410,11 @@ void TPRegionBlock::execute(TPTransformState &State) {
 // TPlan::getOrCreateLiveIn / getTPValue
 //===----------------------------------------------------------------------===//
 
-TPLiveIn *TPlan::getOrCreateLiveIn(Value *V) {
+TPIRValue *TPlan::getOrCreateLiveIn(Value *V) {
   auto It = ValueMap.find(V);
   if (It != ValueMap.end())
-    return static_cast<TPLiveIn *>(It->second);
-  auto *LI = new TPLiveIn(V);
+    return static_cast<TPIRValue *>(It->second);
+  auto *LI = new TPIRValue(V);
   LiveIns.emplace_back(LI);
   ValueMap[V] = LI;
   return LI;
@@ -354,7 +443,7 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
   // Create one synthetic PF value per loop dimension.
   for (unsigned D = 0; D < P.Depth; ++D)
     P.DimPFs.push_back(
-        std::make_unique<TPSyntheticValue>("PF[" + std::to_string(D) + "]"));
+        std::make_unique<TPSymbolicValue>("PF[" + std::to_string(D) + "]"));
 
   // We'll build regions recursively. Track which loops are "above" current.
   ArrayRef<Loop *> AllLoops = Info.Loops;

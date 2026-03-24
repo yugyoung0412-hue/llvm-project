@@ -50,6 +50,8 @@ PreservedAnalyses LoopTensorizePass::run(Function &F,
     // Build and print the initial TPlan (all PFs = 1).
     TPlan Plan = TPlan::buildInitial(*InfoOpt);
     LLVM_DEBUG(Plan.print(dbgs()));
+    errs() << "\n=== Stage 1: Initial TPlan ===\n";
+    Plan.print(errs());
 
     // Set per-dim parallel factors (tile sizes) and lower to IR.
     for (unsigned D = 0; D < InfoOpt->Depth; ++D)

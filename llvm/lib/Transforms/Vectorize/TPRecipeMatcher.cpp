@@ -39,11 +39,11 @@ static TPRecipeBase *skipIntermediateRecipes(TPValue *V) {
     if (!SDR)
       return nullptr;
     // SDR IS the recipe — no getDefiningRecipe() needed
-    if (SDR->getKind() == TPRecipeBase::RecipeKind::WidenCast) {
+    if (SDR->getTPRecipeID() == TPRecipeBase::TPWidenCastSC) {
       V = SDR->getOperand(0); // skip cast, follow source
       continue;
     }
-    if (SDR->getKind() == TPRecipeBase::RecipeKind::Widen &&
+    if (SDR->getTPRecipeID() == TPRecipeBase::TPWidenSC &&
         SDR->operands().size() == 1) {
       // Single-operand Widen = unary op; skip it.
       if (isa<UnaryOperator>(cast<TPWidenRecipe>(SDR)->getInstruction())) {
@@ -58,7 +58,7 @@ static TPRecipeBase *skipIntermediateRecipes(TPValue *V) {
 
 /// True if \p R is an fmul-like recipe.
 static bool isMulLike(const TPRecipeBase *R) {
-  if (!R || R->getKind() != TPRecipeBase::RecipeKind::Widen)
+  if (!R || R->getTPRecipeID() != TPRecipeBase::TPWidenSC)
     return false;
   auto *WR = cast<TPWidenRecipe>(R);
   return WR->getInstruction()->getOpcode() == Instruction::FMul;
@@ -68,15 +68,15 @@ static bool isMulLike(const TPRecipeBase *R) {
 /// a Widen recipe (fadd/fsub etc.) whose one operand is defined by a
 /// TPReductionPHIRecipe.
 static bool isReductionUpdate(const TPRecipeBase *R) {
-  if (!R || R->getKind() != TPRecipeBase::RecipeKind::Widen)
+  if (!R || R->getTPRecipeID() != TPRecipeBase::TPWidenSC)
     return false;
   auto *WR = cast<TPWidenRecipe>(R);
   if (!isa<BinaryOperator>(WR->getInstruction()))
     return false;
   for (TPValue *Op : R->operands()) {
-    if (!isa<TPSingleDefRecipe>(Op))
-      continue;
-    if (isa<TPReductionPHIRecipe>(cast<TPSingleDefRecipe>(Op)))
+    auto *RV = dyn_cast<TPRecipeValue>(Op);
+    if (!RV) continue;
+    if (isa<TPReductionPHIRecipe>(RV->getDefiningRecipe()))
       return true;
   }
   return false;
@@ -86,8 +86,8 @@ static bool isReductionUpdate(const TPRecipeBase *R) {
 /// Precondition: isReductionUpdate(R) == true.
 static TPValue *getReductionInput(const TPRecipeBase *R) {
   for (TPValue *Op : R->operands()) {
-    if (!isa<TPSingleDefRecipe>(Op) ||
-        !isa<TPReductionPHIRecipe>(cast<TPSingleDefRecipe>(Op)))
+    auto *RV = dyn_cast<TPRecipeValue>(Op);
+    if (!RV || !isa<TPReductionPHIRecipe>(RV->getDefiningRecipe()))
       return Op;
   }
   return nullptr;
@@ -199,7 +199,7 @@ void llvm::TPRecipePatternMatcher_match(const TPlan &Plan,
       RecipeClassification C;
       if (isReductionUpdate(&R)) {
         C = classifyReduction(R, Plan);
-      } else if (R.getKind() == TPRecipeBase::RecipeKind::Widen &&
+      } else if (R.getTPRecipeID() == TPRecipeBase::TPWidenSC &&
                  isa<BinaryOperator>(
                      cast<TPWidenRecipe>(R).getInstruction()) &&
                  R.operands().size() == 2) {

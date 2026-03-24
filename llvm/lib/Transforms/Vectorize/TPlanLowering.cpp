@@ -17,6 +17,7 @@
 
 #include "llvm/Transforms/Vectorize/TPlan.h"
 #include "llvm/Transforms/Vectorize/TPRecipeMatcher.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/IR/Dominators.h"
@@ -25,10 +26,69 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
 
 #define DEBUG_TYPE "tplan-lower"
+
+//===----------------------------------------------------------------------===//
+// Stage-print helpers (unconditional; not gated by LLVM_DEBUG)
+//===----------------------------------------------------------------------===//
+
+static StringRef kindToStr(TensorOpKind K) {
+  switch (K) {
+  case TensorOpKind::Scalar:          return "Scalar";
+  case TensorOpKind::ElementWise:     return "ElementWise";
+  case TensorOpKind::BroadcastBinary: return "BroadcastBinary";
+  case TensorOpKind::OuterProduct:    return "OuterProduct";
+  case TensorOpKind::Contraction:     return "Contraction";
+  case TensorOpKind::PlainReduction:  return "PlainReduction";
+  }
+  return "Unknown";
+}
+
+static void collectAllBBs(TPBlockBase *Start,
+                            SmallVectorImpl<TPBasicBlock *> &Out,
+                            SmallPtrSet<TPBlockBase *, 32> &Visited) {
+  if (!Start || !Visited.insert(Start).second)
+    return;
+  if (auto *BB = dyn_cast<TPBasicBlock>(Start))
+    Out.push_back(BB);
+  if (auto *R = dyn_cast<TPRegionBlock>(Start))
+    if (R->getEntry())
+      collectAllBBs(R->getEntry(), Out, Visited);
+  for (TPBlockBase *Succ : Start->getSuccessors())
+    collectAllBBs(Succ, Out, Visited);
+}
+
+static void printClassificationSummary(const TPlan &Plan,
+                                        const RecipeClassMap &CM,
+                                        raw_ostream &OS) {
+  OS << "Recipe classifications (non-Scalar):\n";
+  SmallVector<TPBasicBlock *, 32> AllBBs;
+  SmallPtrSet<TPBlockBase *, 32> Visited;
+  if (Plan.getEntry())
+    collectAllBBs(const_cast<TPBlockBase *>(Plan.getEntry()), AllBBs, Visited);
+  bool Any = false;
+  for (TPBasicBlock *BB : AllBBs) {
+    for (const TPRecipeBase &R : *BB) {
+      auto It = CM.find(&R);
+      if (It == CM.end())
+        continue;
+      const auto &C = It->second;
+      if (C.Kind == TensorOpKind::Scalar)
+        continue;
+      OS << "  [" << BB->getName() << "] " << kindToStr(C.Kind);
+      if (C.ContractDim >= 0)
+        OS << " (contractDim=" << C.ContractDim << ")";
+      OS << "\n";
+      Any = true;
+    }
+  }
+  if (!Any)
+    OS << "  (none)\n";
+}
 
 //===----------------------------------------------------------------------===//
 // Helper: emit @llvm.matrix.multiply for a Contraction reduction
@@ -205,10 +265,15 @@ bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
                                 ScalarEvolution &SE, DominatorTree &DT) {
   // 1. Propagate DimSets via BFS.
   TPlanWidener_widen(Plan);
+  errs() << "\n=== Stage 2: After Widening (DimSets propagated) ===\n";
+  Plan.print(errs());
 
   // 2. Classify every recipe by DimSet patterns.
   RecipeClassMap CM;
   TPRecipePatternMatcher_match(Plan, CM);
+  errs() << "\n=== Stage 3: After Pattern Matching (recipe classifications) ===\n";
+  Plan.print(errs());
+  printClassificationSummary(Plan, CM, errs());
 
   // 3. Lower: walk block CFG in construction order.
   IRBuilder<> Builder(F.getContext());
