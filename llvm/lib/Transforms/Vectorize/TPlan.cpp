@@ -97,6 +97,18 @@ TPRecipeBase *TPValue::getDefiningRecipe() { return nullptr; }
 const TPRecipeBase *TPValue::getDefiningRecipe() const { return nullptr; }
 
 //===----------------------------------------------------------------------===//
+// TPPhiAccessors
+//===----------------------------------------------------------------------===//
+
+void TPPhiAccessors::printPhiOperands(raw_ostream &OS,
+                                       TPSlotTracker &SlotTracker) const {
+  for (unsigned I = 0, E = getNumIncoming(); I != E; ++I) {
+    if (I > 0) OS << ", ";
+    getIncomingValue(I)->printAsOperand(OS, SlotTracker);
+  }
+}
+
+//===----------------------------------------------------------------------===//
 // TPRecipeBase insertion/movement helpers
 //===----------------------------------------------------------------------===//
 

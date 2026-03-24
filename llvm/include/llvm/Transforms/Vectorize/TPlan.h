@@ -722,9 +722,43 @@ inline void TPBasicBlock::appendRecipe(TPRecipeBase *R) {
 }
 
 //===----------------------------------------------------------------------===//
+// TPPhiAccessors — mixin for PHI-like recipes (mirrors VPPhiAccessors)
+//===----------------------------------------------------------------------===//
+class TPPhiAccessors {
+protected:
+  virtual const TPRecipeBase *getAsRecipe() const = 0;
+
+public:
+  virtual ~TPPhiAccessors() = default;
+
+  unsigned getNumIncoming() const {
+    return getAsRecipe()->getNumOperands();
+  }
+
+  TPValue *getIncomingValue(unsigned Idx) const {
+    return getAsRecipe()->getOperand(Idx);
+  }
+
+  TPUser::const_operand_range incoming_values() const {
+    return getAsRecipe()->operands_range();
+  }
+
+  /// Remove operand at index \p Idx.
+  /// Block-based overload is deferred — no current consumer uses it.
+  void removeIncomingValueFor(unsigned Idx) {
+    const_cast<TPRecipeBase *>(getAsRecipe())->removeOperand(Idx);
+  }
+
+  void printPhiOperands(raw_ostream &OS, TPSlotTracker &SlotTracker) const;
+};
+
+//===----------------------------------------------------------------------===//
 // TPWidenInductionRecipe — WIDEN-INDUCTION: loop IV PHIs
 //===----------------------------------------------------------------------===//
-class TPWidenInductionRecipe : public TPSingleDefRecipe {
+class TPWidenInductionRecipe : public TPSingleDefRecipe, public TPPhiAccessors {
+protected:
+  const TPRecipeBase *getAsRecipe() const override { return this; }
+
 public:
   TPWidenInductionRecipe(PHINode *IV, TPValue *StartVal, TPValue *StepVal,
                           unsigned DimIdx = 0)
@@ -750,7 +784,10 @@ private:
 //===----------------------------------------------------------------------===//
 // TPReductionPHIRecipe — WIDEN-REDUCTION-PHI: accumulator PHIs
 //===----------------------------------------------------------------------===//
-class TPReductionPHIRecipe : public TPSingleDefRecipe {
+class TPReductionPHIRecipe : public TPSingleDefRecipe, public TPPhiAccessors {
+protected:
+  const TPRecipeBase *getAsRecipe() const override { return this; }
+
 public:
   TPReductionPHIRecipe(PHINode *Phi, TPValue *InitVal, TPValue *LoopVal)
       : TPSingleDefRecipe(TPReductionPHISC, {InitVal, LoopVal}),
@@ -883,7 +920,10 @@ private:
 //===----------------------------------------------------------------------===//
 // TPCanonicalIVRecipe — CANONICAL-INDUCTION: synthetic loop counter phi
 //===----------------------------------------------------------------------===//
-class TPCanonicalIVRecipe : public TPSingleDefRecipe {
+class TPCanonicalIVRecipe : public TPSingleDefRecipe, public TPPhiAccessors {
+protected:
+  const TPRecipeBase *getAsRecipe() const override { return this; }
+
 public:
   /// StartVal: TPIRValue for ir<0>. StepVal: patched after
   /// TPCanonicalIVIncrRecipe is created.
