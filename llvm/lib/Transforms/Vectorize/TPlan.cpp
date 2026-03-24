@@ -335,6 +335,54 @@ void TPReductionPHIRecipe::print(raw_ostream &OS, unsigned Indent,
   OS << "\n";
 }
 
+void TPFirstOrderRecurrencePHIRecipe::print(raw_ostream &OS, unsigned Indent,
+                                             TPSlotTracker &Tracker) const {
+  printIndent(OS, Indent);
+  OS << "FIRST-ORDER-RECURRENCE-PHI ";
+  printAsOperand(OS, Tracker); // TODO: print incoming values
+  OS << "\n";
+}
+
+void TPActiveLaneMaskPHIRecipe::print(raw_ostream &OS, unsigned Indent,
+                                       TPSlotTracker &Tracker) const {
+  printIndent(OS, Indent);
+  OS << "ACTIVE-LANE-MASK-PHI ";
+  printAsOperand(OS, Tracker); // TODO: print incoming values
+  OS << "\n";
+}
+
+void TPEVLBasedIVPHIRecipe::print(raw_ostream &OS, unsigned Indent,
+                                   TPSlotTracker &Tracker) const {
+  printIndent(OS, Indent);
+  OS << "EVL-BASED-IV-PHI ";
+  printAsOperand(OS, Tracker); // TODO: print incoming values
+  OS << "\n";
+}
+
+void TPWidenPHIRecipe::print(raw_ostream &OS, unsigned Indent,
+                              TPSlotTracker &Tracker) const {
+  printIndent(OS, Indent);
+  OS << "WIDEN-PHI ";
+  printAsOperand(OS, Tracker); // TODO: print incoming values
+  OS << "\n";
+}
+
+void TPPredInstPHIRecipe::print(raw_ostream &OS, unsigned Indent,
+                                 TPSlotTracker &Tracker) const {
+  printIndent(OS, Indent);
+  OS << "PRED-PHI ";
+  printAsOperand(OS, Tracker); // TODO: print incoming values
+  OS << "\n";
+}
+
+void TPPhi::print(raw_ostream &OS, unsigned Indent,
+                  TPSlotTracker &Tracker) const {
+  printIndent(OS, Indent);
+  OS << "PHI ";
+  printAsOperand(OS, Tracker); // TODO: print incoming values
+  OS << "\n";
+}
+
 void TPWidenRecipe::print(raw_ostream &OS, unsigned Indent,
                           TPSlotTracker &Tracker) const {
   printIndent(OS, Indent);

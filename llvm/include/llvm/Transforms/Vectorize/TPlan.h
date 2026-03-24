@@ -606,13 +606,22 @@ public:
     TPWidenCastSC,
 
     // PHI-like recipes (range: [TPFirstPHISC, TPLastPHISC])
-    TPWidenPHISC,           // placeholder — no concrete class yet
+    TPWidenPHISC,           // TPWidenPHIRecipe
 
     // Header PHI recipes (subset: [TPFirstHeaderPHISC, TPLastHeaderPHISC])
     TPCanonicalIVSC,
     TPWidenIntOrFpInductionSC,  // replaces TPWidenInductionSC
     TPWidenPointerInductionSC,  // NEW
     TPReductionPHISC,
+
+    // Header PHI stubs (Commit 2)
+    TPFirstOrderRecurrencePHISC,
+    TPActiveLaneMaskPHISC,
+    TPEVLBasedIVPHISC,
+
+    // Non-header PHI stubs (Commit 2)
+    TPPredInstPHISC,
+    TPPhiSC,
 
     // Canonical IV companion recipes (outside PHI range)
     TPCanonicalIVIncrSC,
@@ -621,8 +630,8 @@ public:
     // Range markers
     TPFirstPHISC       = TPWidenPHISC,
     TPFirstHeaderPHISC = TPCanonicalIVSC,
-    TPLastHeaderPHISC  = TPReductionPHISC,
-    TPLastPHISC        = TPReductionPHISC,
+    TPLastHeaderPHISC  = TPEVLBasedIVPHISC,   // was TPReductionPHISC
+    TPLastPHISC        = TPPhiSC,              // was TPReductionPHISC
   };
 
   unsigned getTPRecipeID() const { return SubclassID; }
@@ -678,11 +687,16 @@ public:
     case TPWidenIntOrFpInductionSC:
     case TPWidenPointerInductionSC:
     case TPReductionPHISC:
+    case TPWidenPHISC:
+    case TPFirstOrderRecurrencePHISC:
+    case TPActiveLaneMaskPHISC:
+    case TPEVLBasedIVPHISC:
+    case TPPredInstPHISC:
+    case TPPhiSC:
     case TPCanonicalIVIncrSC:
     case TPCanonicalIVExitCmpSC:
       return true;
     case TPWidenStoreSC:
-    case TPWidenPHISC:  // no concrete class yet
       return false;
     }
     llvm_unreachable("unknown TPRecipeTy");
@@ -937,6 +951,100 @@ public:
 
 private:
   PHINode *RedPhi;
+};
+
+//===----------------------------------------------------------------------===//
+// TPFirstOrderRecurrencePHIRecipe — first-order recurrence PHI stub
+//===----------------------------------------------------------------------===//
+class TPFirstOrderRecurrencePHIRecipe : public TPHeaderPHIRecipe {
+public:
+  explicit TPFirstOrderRecurrencePHIRecipe(TPValue *StartVal)
+      : TPHeaderPHIRecipe(TPFirstOrderRecurrencePHISC, {StartVal}) {}
+  static bool classof(const TPRecipeBase *R) {
+    return R->getTPRecipeID() == TPFirstOrderRecurrencePHISC;
+  }
+  void execute(TPTransformState &State) const override;
+  void print(raw_ostream &OS, unsigned Indent,
+             TPSlotTracker &Tracker) const override;
+};
+
+//===----------------------------------------------------------------------===//
+// TPActiveLaneMaskPHIRecipe — active-lane-mask PHI stub
+//===----------------------------------------------------------------------===//
+class TPActiveLaneMaskPHIRecipe : public TPHeaderPHIRecipe {
+public:
+  explicit TPActiveLaneMaskPHIRecipe(TPValue *StartVal)
+      : TPHeaderPHIRecipe(TPActiveLaneMaskPHISC, {StartVal}) {}
+  static bool classof(const TPRecipeBase *R) {
+    return R->getTPRecipeID() == TPActiveLaneMaskPHISC;
+  }
+  void execute(TPTransformState &State) const override;
+  void print(raw_ostream &OS, unsigned Indent,
+             TPSlotTracker &Tracker) const override;
+};
+
+//===----------------------------------------------------------------------===//
+// TPEVLBasedIVPHIRecipe — EVL-based IV PHI stub
+//===----------------------------------------------------------------------===//
+class TPEVLBasedIVPHIRecipe : public TPHeaderPHIRecipe {
+public:
+  explicit TPEVLBasedIVPHIRecipe(TPValue *StartVal)
+      : TPHeaderPHIRecipe(TPEVLBasedIVPHISC, {StartVal}) {}
+  static bool classof(const TPRecipeBase *R) {
+    return R->getTPRecipeID() == TPEVLBasedIVPHISC;
+  }
+  void execute(TPTransformState &State) const override;
+  void print(raw_ostream &OS, unsigned Indent,
+             TPSlotTracker &Tracker) const override;
+};
+
+//===----------------------------------------------------------------------===//
+// TPWidenPHIRecipe — generic widen-PHI (fills existing placeholder)
+//===----------------------------------------------------------------------===//
+class TPWidenPHIRecipe : public TPSingleDefRecipe, public TPPhiAccessors {
+protected:
+  const TPRecipeBase *getAsRecipe() const override { return this; }
+public:
+  explicit TPWidenPHIRecipe(TPValue *StartVal)
+      : TPSingleDefRecipe(TPWidenPHISC, {StartVal}) {}
+  static bool classof(const TPRecipeBase *R) {
+    return R->getTPRecipeID() == TPWidenPHISC;
+  }
+  void execute(TPTransformState &State) const override;
+  void print(raw_ostream &OS, unsigned Indent,
+             TPSlotTracker &Tracker) const override;
+};
+
+//===----------------------------------------------------------------------===//
+// TPPredInstPHIRecipe — predicated-instruction result PHI stub
+//===----------------------------------------------------------------------===//
+class TPPredInstPHIRecipe : public TPSingleDefRecipe {
+public:
+  explicit TPPredInstPHIRecipe(TPValue *PredVal)
+      : TPSingleDefRecipe(TPPredInstPHISC, {PredVal}) {}
+  static bool classof(const TPRecipeBase *R) {
+    return R->getTPRecipeID() == TPPredInstPHISC;
+  }
+  void execute(TPTransformState &State) const override;
+  void print(raw_ostream &OS, unsigned Indent,
+             TPSlotTracker &Tracker) const override;
+};
+
+//===----------------------------------------------------------------------===//
+// TPPhi — generic PHI stub
+//===----------------------------------------------------------------------===//
+class TPPhi : public TPSingleDefRecipe, public TPPhiAccessors {
+protected:
+  const TPRecipeBase *getAsRecipe() const override { return this; }
+public:
+  explicit TPPhi(ArrayRef<TPValue *> Operands)
+      : TPSingleDefRecipe(TPPhiSC, Operands) {}
+  static bool classof(const TPRecipeBase *R) {
+    return R->getTPRecipeID() == TPPhiSC;
+  }
+  void execute(TPTransformState &State) const override;
+  void print(raw_ostream &OS, unsigned Indent,
+             TPSlotTracker &Tracker) const override;
 };
 
 //===----------------------------------------------------------------------===//

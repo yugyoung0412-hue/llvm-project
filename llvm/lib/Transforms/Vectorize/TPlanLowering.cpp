@@ -188,6 +188,25 @@ void TPReductionPHIRecipe::execute(TPTransformState &State) const {
   State.setValue(this, RedPhi);
 }
 
+void TPFirstOrderRecurrencePHIRecipe::execute(TPTransformState &) const {
+  // TODO: implement when lowering supports this recipe
+}
+void TPActiveLaneMaskPHIRecipe::execute(TPTransformState &) const {
+  // TODO: implement when lowering supports this recipe
+}
+void TPEVLBasedIVPHIRecipe::execute(TPTransformState &) const {
+  // TODO: implement when lowering supports this recipe
+}
+void TPWidenPHIRecipe::execute(TPTransformState &) const {
+  // TODO: implement when lowering supports this recipe
+}
+void TPPredInstPHIRecipe::execute(TPTransformState &) const {
+  // TODO: implement when lowering supports this recipe
+}
+void TPPhi::execute(TPTransformState &) const {
+  // TODO: implement when lowering supports this recipe
+}
+
 void TPWidenCastRecipe::execute(TPTransformState &State) const {
   auto *SrcDR = dyn_cast<TPSingleDefRecipe>(getOperand(0));
   Value *Src = SrcDR ? State.getValue(SrcDR) : nullptr;
