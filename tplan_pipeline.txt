@@ -1,0 +1,83 @@
+TPlan Pipeline
+==============
+
+IR (Function)
+     |
+     v
++-----------------------------------------------------+
+|  Stage 1: TPlan::buildInitial()                     |
+|  LoopTensorize.cpp                                  |
+|                                                     |
+|  * Walk LoopNestInfo (loop headers, IVs, latches)   |
+|  * Create TPBasicBlock / TPRegionBlock CFG          |
+|  * Emit one recipe per IR instruction:              |
+|      TPWidenInductionRecipe  (IV PHIs)              |
+|      TPReductionPHIRecipe    (reduction PHIs)       |
+|      TPCanonicalIVRecipe     (synthetic counter)    |
+|      TPWidenRecipe           (arithmetic / icmp)    |
+|      TPWidenGEPRecipe        (GEP)                  |
+|      TPWidenLoadRecipe       (load)                 |
+|      TPWidenStoreRecipe      (store)                |
+|      TPWidenCastRecipe       (bitcast/ext/trunc)    |
+|  * DimSet = {} on all recipes                       |
++-----------------------------------------------------+
+     |
+     v  (print: "=== Stage 1: Initial TPlan ===")
+     |
+     v
++-----------------------------------------------------+
+|  Stage 2: TPlanWidener_widen()                      |
+|  TPlanWidener.cpp                                   |
+|                                                     |
+|  * Seed: each TPWidenInductionRecipe[dim D]         |
+|          gets DimSet = {D}                          |
+|  * BFS union propagation through def-use edges:     |
+|      for each user U of V: U.DimSet |= V.DimSet     |
+|  * Fixpoint when no DimSet gains new bits           |
++-----------------------------------------------------+
+     |
+     v  (print: "=== Stage 2: After Widening (DimSets propagated) ===")
+     |
+     v
++-----------------------------------------------------+
+|  Stage 3: TPRecipePatternMatcher_match()            |
+|  TPRecipeMatcher.cpp                                |
+|                                                     |
+|  Classifies each recipe by DimSet pattern:          |
+|    Scalar          -- DimSet = {}                   |
+|    ElementWise     -- operand DimSets equal         |
+|    BroadcastBinary -- one DimSet is subset other    |
+|    OuterProduct    -- DimSets disjoint              |
+|    Contraction     -- reduction update where        |
+|                       fused fmul has a shared dim   |
+|                       in ReductionDims              |
+|    PlainReduction  -- reduction, no fuseable mul    |
++-----------------------------------------------------+
+     |
+     v  (print: "=== Stage 3: After Pattern Matching (recipe classifications) ===")
+     |
+     v
++-----------------------------------------------------+
+|  Stage 4: execute() -- recipe lowering              |
+|  TPlanLowering.cpp                                  |
+|                                                     |
+|  Walk block CFG in construction order;              |
+|  dispatch each recipe by classification:            |
+|    Contraction    -> @llvm.matrix.multiply          |
+|    ElementWise /                                    |
+|    BroadcastBin   -> (TODO: vector intrinsics)      |
+|    OuterProduct   -> (TODO: outer-product intrinsic)|
+|    Scalar / PHI   -> clone original IR instruction  |
++-----------------------------------------------------+
+     |
+     v
+IR (transformed Function)
+
+
+Key data item: DimSet (SmallBitVector on TPSingleDefRecipe)
+-----------------------------------------------------------
+Records which loop dimensions a value "spans".
+Seeded at Stage 2 from induction variable recipes; propagated
+forward through all def-use edges. Read at Stage 3 to classify
+each recipe as Scalar / ElementWise / BroadcastBinary /
+OuterProduct / Contraction / PlainReduction.
