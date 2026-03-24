@@ -5,6 +5,10 @@ add_llvm_component_library(LLVMVectorize
   LoopVectorize.cpp
   LoopTensorize.cpp
   LoopNestAnalyzer.cpp
+  TPlan.cpp
+  TPlanWidener.cpp
+  TPRecipeMatcher.cpp
+  TPlanLowering.cpp
   TensorPatternClassifier.cpp
   TensorTransformSpace.cpp
   TensorCodeGen.cpp

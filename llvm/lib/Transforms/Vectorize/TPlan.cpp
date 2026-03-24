@@ -472,6 +472,7 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
   if (!AllLoops.empty())
     P.RootRegion = BuildRegion(0);
 
+  P.ReductionDims = Info.ReductionDims;
   return P;
 }
 

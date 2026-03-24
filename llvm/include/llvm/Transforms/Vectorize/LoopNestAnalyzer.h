@@ -9,6 +9,7 @@
 #define LLVM_TRANSFORMS_VECTORIZE_LOOPNESTANALYZER_H
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Instructions.h"
 #include <optional>
@@ -44,6 +45,7 @@ struct LoopNestInfo {
   bool                       IsPerfectNest = false;
   bool                       IsAffine      = false;
   unsigned                   Depth         = 0;
+  SmallBitVector             ReductionDims; // dims not in any store IndexExpr
 };
 
 /// Collects outermost loop nests from a function's LoopInfo.

@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Vectorize/LoopNestAnalyzer.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/Analysis/DependenceAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopNestAnalysis.h"
@@ -106,5 +107,36 @@ llvm::analyzeLoopNest(ArrayRef<Loop *> Nest, ScalarEvolution &SE,
   }
 
   Info.Loops = SmallVector<Loop *>(Nest);
+
+  // Populate ReductionDims: a dim is a reduction dim if IndVar[d] does not
+  // appear as an AddRec over Nest[d] in any write MemAccess IndexExpr.
+  Info.ReductionDims.resize(Info.Depth, false);
+  for (unsigned D = 0; D < Info.Depth; ++D) {
+    bool AppearInStore = false;
+    for (const MemAccess &MA : Info.Accesses) {
+      if (MA.Kind == AccessKind::Read)
+        continue;
+      for (const SCEV *IdxExpr : MA.IndexExprs) {
+        // Check if IdxExpr contains an AddRec over Nest[D].
+        struct AddRecFinder {
+          Loop *L;
+          bool Found = false;
+          bool follow(const SCEV *S) {
+            if (auto *AR = dyn_cast<SCEVAddRecExpr>(S))
+              if (AR->getLoop() == L) { Found = true; return false; }
+            return !Found;
+          }
+          bool isDone() const { return Found; }
+        } Finder{Nest[D]};
+        SCEVTraversal<AddRecFinder> T(Finder);
+        T.visitAll(IdxExpr);
+        if (Finder.Found) { AppearInStore = true; break; }
+      }
+      if (AppearInStore) break;
+    }
+    if (!AppearInStore)
+      Info.ReductionDims.set(D);
+  }
+
   return Info;
 }

@@ -9,18 +9,25 @@
 #define LLVM_TRANSFORMS_VECTORIZE_TPLAN_H
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/ilist.h"
 #include "llvm/ADT/ilist_node.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Vectorize/LoopNestAnalyzer.h"
+#include "llvm/Transforms/Vectorize/TPlanTypes.h"
 #include <memory>
 
 namespace llvm {
 
+class DominatorTree;
+class Function;
 class Instruction;
 class Loop;
+class LoopInfo;
 class SCEV;
+class ScalarEvolution;
 class TPDefVal;
 class TPlan;
 class TPLoopRegion;
@@ -117,8 +124,41 @@ public:
   TPRecipeBase *getDefiningRecipe() const { return DefRecipe; }
   void printAsOperand(raw_ostream &OS, TPSlotTracker &Tracker) const override;
 
+  SmallBitVector DimSet;  // loop dim indices this value spans; set by widener
+
 private:
   TPRecipeBase *DefRecipe;
+};
+
+//===----------------------------------------------------------------------===//
+// TPTransformState — passed to execute() during lowering
+//===----------------------------------------------------------------------===//
+struct TPTransformState {
+  IRBuilder<> &Builder;
+  const TPlan &Plan;
+  const RecipeClassMap *ClassMap = nullptr;
+  DenseMap<const TPDefVal *, Value *> ValueMap;
+
+  TPTransformState(IRBuilder<> &B, const TPlan &P) : Builder(B), Plan(P) {}
+
+  Value *getValue(const TPDefVal *V) const { return ValueMap.lookup(V); }
+  void setValue(const TPDefVal *V, Value *IRV) { ValueMap[V] = IRV; }
+
+  TensorOpKind getKind(const TPRecipeBase *R) const {
+    if (!ClassMap) return TensorOpKind::Scalar;
+    auto It = ClassMap->find(R);
+    return It != ClassMap->end() ? It->second.Kind : TensorOpKind::Scalar;
+  }
+  int getContractDim(const TPRecipeBase *R) const {
+    if (!ClassMap) return -1;
+    auto It = ClassMap->find(R);
+    return It != ClassMap->end() ? It->second.ContractDim : -1;
+  }
+  TPRecipeBase *getFusedMulRecipe(const TPRecipeBase *R) const {
+    if (!ClassMap) return nullptr;
+    auto It = ClassMap->find(R);
+    return It != ClassMap->end() ? It->second.FusedMulRecipe : nullptr;
+  }
 };
 
 //===----------------------------------------------------------------------===//
@@ -146,6 +186,7 @@ public:
 
   virtual void print(raw_ostream &OS, unsigned Indent,
                      TPSlotTracker &Tracker) const = 0;
+  virtual void execute(TPTransformState &State) const = 0;
   virtual ~TPRecipeBase() = default;
 
 protected:
@@ -175,6 +216,7 @@ public:
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::WidenInduction;
@@ -200,6 +242,7 @@ public:
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::ReductionPHI;
@@ -222,8 +265,19 @@ public:
 
   Instruction *getInstruction() const { return Inst; }
 
+  /// True if this recipe is a reduction update (one operand is a ReductionPHI).
+  bool isReductionUpdateRecipe() const {
+    for (TPValue *Op : operands()) {
+      if (auto *DV = dyn_cast<TPDefVal>(Op))
+        if (dyn_cast<TPReductionPHIRecipe>(DV->getDefiningRecipe()))
+          return true;
+    }
+    return false;
+  }
+
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::Widen;
@@ -248,6 +302,7 @@ public:
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::WidenGEP;
@@ -271,6 +326,7 @@ public:
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::WidenLoad;
@@ -296,6 +352,7 @@ public:
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::WidenStore;
@@ -319,6 +376,7 @@ public:
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::WidenCast;
@@ -343,6 +401,7 @@ public:
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::CanonicalIV;
@@ -363,6 +422,7 @@ public:
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::CanonicalIVIncr;
@@ -384,6 +444,7 @@ public:
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  void execute(TPTransformState &State) const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getKind() == RecipeKind::CanonicalIVExitCmp;
@@ -407,6 +468,7 @@ public:
   Loop *getLoop() const { return OwnerLoop; }
   const SCEV *getTripCount() const { return TripCount; }
   iplist<TPRecipeBase> &getRecipes() { return Recipes; }
+  const iplist<TPRecipeBase> &getRecipes() const { return Recipes; }
 
   void print(raw_ostream &OS, unsigned Indent, TPSlotTracker &Tracker) const;
 
@@ -433,8 +495,20 @@ public:
 
   const TPSyntheticValue *getPF() const { return &PF; }
 
+  const SmallBitVector &getReductionDims() const { return ReductionDims; }
+
+  /// Returns the parallel factor for dimension \p Dim.
+  /// Default: 1 (scalar). Set via setDimPF().
+  unsigned getPFForDim(unsigned Dim) const {
+    auto It = DimPFMap.find(Dim);
+    return It != DimPFMap.end() ? It->second : 1u;
+  }
+  void setDimPF(unsigned Dim, unsigned PF) { DimPFMap[Dim] = PF; }
+
 private:
   TPSyntheticValue PF{"PF"};
+  SmallBitVector ReductionDims;
+  DenseMap<unsigned, unsigned> DimPFMap; // dim index → parallel factor
   std::string FuncName;
   unsigned Depth = 0;
   SmallVector<std::unique_ptr<TPLiveIn>> LiveIns;
@@ -447,6 +521,15 @@ private:
   TPLiveIn *getOrCreateLiveIn(Value *V);
   TPValue *getTPValue(Value *V);
 };
+
+/// Propagates DimSets from induction variables through the def-use graph.
+/// Must be called before TPRecipePatternMatcher_match().
+void TPlanWidener_widen(TPlan &Plan);
+
+/// Lower \p Plan to LLVM IR inside function \p F.
+bool TPlanLowering_lower(TPlan &Plan, Function &F,
+                          LoopInfo &LI, ScalarEvolution &SE,
+                          DominatorTree &DT);
 
 } // namespace llvm
 #endif // LLVM_TRANSFORMS_VECTORIZE_TPLAN_H
