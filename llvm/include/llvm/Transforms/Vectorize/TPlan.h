@@ -753,6 +753,97 @@ public:
 };
 
 //===----------------------------------------------------------------------===//
+// TPIRFlags — per-instruction poison/flags storage (mirrors VPIRFlags)
+//===----------------------------------------------------------------------===//
+class TPIRFlags {
+public:
+  enum class OperationType : unsigned char {
+    Cmp, FCmp, OverflowingBinOp, Trunc,
+    DisjointOp, PossiblyExactOp, GEPOp, FPMathOp, NonNegOp, Other,
+  };
+
+private:
+  OperationType OpType = OperationType::Other;
+  union {
+    unsigned char AllFlags = 0;
+    struct { bool HasNUW : 1; bool HasNSW : 1; } OvflowFlags;
+    struct { bool IsExact : 1; } ExactFlags;
+    struct { bool IsDisjoint : 1; } DisjointFlags;
+    struct { bool IsNonNeg : 1; } NonNegFlags;
+  };
+  FastMathFlags FMF;
+  CmpInst::Predicate CmpPred = CmpInst::BAD_ICMP_PREDICATE;
+
+public:
+  TPIRFlags() = default;
+  explicit TPIRFlags(Instruction &I);
+
+  void applyFlags(Instruction &I) const;
+
+  void dropPoisonGeneratingFlags() {
+    switch (OpType) {
+    case OperationType::OverflowingBinOp:
+      OvflowFlags.HasNUW = OvflowFlags.HasNSW = false; break;
+    case OperationType::PossiblyExactOp:
+      ExactFlags.IsExact = false; break;
+    case OperationType::DisjointOp:
+      DisjointFlags.IsDisjoint = false; break;
+    case OperationType::NonNegOp:
+      NonNegFlags.IsNonNeg = false; break;
+    case OperationType::FPMathOp:
+    case OperationType::FCmp:
+      FMF.setNoNaNs(false); FMF.setNoInfs(false); break;
+    default: break;
+    }
+  }
+
+  OperationType      getOperationType()   const { return OpType; }
+  bool hasNoUnsignedWrap()               const { return OvflowFlags.HasNUW; }
+  bool hasNoSignedWrap()                 const { return OvflowFlags.HasNSW; }
+  bool isDisjoint()                      const { return DisjointFlags.IsDisjoint; }
+  bool isNonNeg()                        const { return NonNegFlags.IsNonNeg; }
+  bool isExact()                         const { return ExactFlags.IsExact; }
+  FastMathFlags   getFastMathFlags()     const { return FMF; }
+  CmpInst::Predicate getPredicate()      const { return CmpPred; }
+};
+
+//===----------------------------------------------------------------------===//
+// TPIRMetadata — per-instruction propagatable metadata (mirrors VPIRMetadata)
+//===----------------------------------------------------------------------===//
+class TPIRMetadata {
+  SmallVector<std::pair<unsigned, MDNode *>, 4> Metadata;
+
+public:
+  TPIRMetadata() = default;
+  explicit TPIRMetadata(Instruction &I);
+
+  void applyMetadata(Instruction &I) const;
+  void setMetadata(unsigned Kind, MDNode *Node);
+  MDNode *getMetadata(unsigned Kind) const;
+  void intersect(const TPIRMetadata &Other);
+};
+
+//===----------------------------------------------------------------------===//
+// TPRecipeWithIRFlags — single-def recipe that also stores IR flags
+//===----------------------------------------------------------------------===//
+struct TPRecipeWithIRFlags : public TPSingleDefRecipe, public TPIRFlags {
+  TPRecipeWithIRFlags(unsigned char SC, ArrayRef<TPValue *> Ops,
+                      Instruction &FlagSrc, Value *UV = nullptr)
+      : TPSingleDefRecipe(SC, Ops, UV), TPIRFlags(FlagSrc) {}
+
+  static bool classof(const TPRecipeBase *R) {
+    switch (R->getTPRecipeID()) {
+    case TPWidenSC:
+    case TPWidenGEPSC:
+    case TPWidenCastSC:
+      return true;
+    default:
+      return false;
+    }
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // TPWidenInductionRecipe — WIDEN-INDUCTION: loop IV PHIs
 //===----------------------------------------------------------------------===//
 class TPWidenInductionRecipe : public TPSingleDefRecipe, public TPPhiAccessors {
@@ -810,10 +901,10 @@ private:
 //===----------------------------------------------------------------------===//
 // TPWidenRecipe — WIDEN: arithmetic/icmp/generic instructions
 //===----------------------------------------------------------------------===//
-class TPWidenRecipe : public TPSingleDefRecipe {
+class TPWidenRecipe : public TPRecipeWithIRFlags {
 public:
   TPWidenRecipe(Instruction *I, SmallVectorImpl<TPValue *> &Ops)
-      : TPSingleDefRecipe(TPWidenSC, Ops), Inst(I) {}
+      : TPRecipeWithIRFlags(TPWidenSC, Ops, *I), Inst(I) {}
 
   Instruction *getInstruction() const { return Inst; }
 
@@ -832,10 +923,10 @@ private:
 //===----------------------------------------------------------------------===//
 // TPWidenGEPRecipe — WIDEN-GEP: getelementptr
 //===----------------------------------------------------------------------===//
-class TPWidenGEPRecipe : public TPSingleDefRecipe {
+class TPWidenGEPRecipe : public TPRecipeWithIRFlags {
 public:
   TPWidenGEPRecipe(Instruction *GEP, SmallVectorImpl<TPValue *> &Ops)
-      : TPSingleDefRecipe(TPWidenGEPSC, Ops), GEPInst(GEP) {}
+      : TPRecipeWithIRFlags(TPWidenGEPSC, Ops, *GEP), GEPInst(GEP) {}
 
   Instruction *getInstruction() const { return GEPInst; }
 
@@ -898,10 +989,10 @@ private:
 //===----------------------------------------------------------------------===//
 // TPWidenCastRecipe — WIDEN-CAST: bitcast, sext, zext, trunc
 //===----------------------------------------------------------------------===//
-class TPWidenCastRecipe : public TPSingleDefRecipe {
+class TPWidenCastRecipe : public TPRecipeWithIRFlags {
 public:
   TPWidenCastRecipe(Instruction *Cast, TPValue *SrcOp)
-      : TPSingleDefRecipe(TPWidenCastSC, {SrcOp}), CastInst(Cast) {}
+      : TPRecipeWithIRFlags(TPWidenCastSC, {SrcOp}, *Cast), CastInst(Cast) {}
 
   Instruction *getInstruction() const { return CastInst; }
 

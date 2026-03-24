@@ -109,6 +109,98 @@ void TPPhiAccessors::printPhiOperands(raw_ostream &OS,
 }
 
 //===----------------------------------------------------------------------===//
+// TPIRFlags
+//===----------------------------------------------------------------------===//
+
+TPIRFlags::TPIRFlags(Instruction &I) {
+  if (auto *OBO = dyn_cast<OverflowingBinaryOperator>(&I)) {
+    OpType = OperationType::OverflowingBinOp;
+    OvflowFlags.HasNUW = OBO->hasNoUnsignedWrap();
+    OvflowFlags.HasNSW = OBO->hasNoSignedWrap();
+  } else if (isa<TruncInst>(&I)) {
+    OpType = OperationType::Trunc;
+  } else if (auto *CI = dyn_cast<ICmpInst>(&I)) {
+    OpType = OperationType::Cmp;
+    CmpPred = CI->getPredicate();
+  } else if (auto *FCI = dyn_cast<FCmpInst>(&I)) {
+    OpType = OperationType::FCmp;
+    CmpPred = FCI->getPredicate();
+    FMF = FCI->getFastMathFlags();
+  } else if (auto *FPO = dyn_cast<FPMathOperator>(&I)) {
+    OpType = OperationType::FPMathOp;
+    FMF = FPO->getFastMathFlags();
+  } else if (isa<GetElementPtrInst>(&I)) {
+    OpType = OperationType::GEPOp;
+  } else if (auto *PEO = dyn_cast<PossiblyExactOperator>(&I)) {
+    OpType = OperationType::PossiblyExactOp;
+    ExactFlags.IsExact = PEO->isExact();
+  } else if (auto *PDO = dyn_cast<PossiblyDisjointInst>(&I)) {
+    OpType = OperationType::DisjointOp;
+    DisjointFlags.IsDisjoint = PDO->isDisjoint();
+  }
+}
+
+void TPIRFlags::applyFlags(Instruction &I) const {
+  switch (OpType) {
+  case OperationType::OverflowingBinOp:
+    I.setHasNoUnsignedWrap(OvflowFlags.HasNUW);
+    I.setHasNoSignedWrap(OvflowFlags.HasNSW);
+    break;
+  case OperationType::FCmp:
+  case OperationType::FPMathOp:
+    I.setFastMathFlags(FMF);
+    break;
+  case OperationType::PossiblyExactOp:
+    I.setIsExact(ExactFlags.IsExact);
+    break;
+  case OperationType::DisjointOp:
+    cast<PossiblyDisjointInst>(&I)->setIsDisjoint(DisjointFlags.IsDisjoint);
+    break;
+  default:
+    break;
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// TPIRMetadata
+//===----------------------------------------------------------------------===//
+
+TPIRMetadata::TPIRMetadata(Instruction &I) {
+  SmallVector<std::pair<unsigned, MDNode *>, 8> All;
+  I.getAllMetadataOtherThanDebugLoc(All);
+  for (auto &[Kind, Node] : All) {
+    if (Kind == LLVMContext::MD_tbaa ||
+        Kind == LLVMContext::MD_fpmath ||
+        Kind == LLVMContext::MD_access_group)
+      Metadata.push_back({Kind, Node});
+  }
+}
+
+void TPIRMetadata::applyMetadata(Instruction &I) const {
+  for (auto &[Kind, Node] : Metadata)
+    I.setMetadata(Kind, Node);
+}
+
+void TPIRMetadata::setMetadata(unsigned Kind, MDNode *Node) {
+  for (auto &P : Metadata) {
+    if (P.first == Kind) { P.second = Node; return; }
+  }
+  Metadata.push_back({Kind, Node});
+}
+
+MDNode *TPIRMetadata::getMetadata(unsigned Kind) const {
+  for (auto &P : Metadata)
+    if (P.first == Kind) return P.second;
+  return nullptr;
+}
+
+void TPIRMetadata::intersect(const TPIRMetadata &Other) {
+  Metadata.erase(llvm::remove_if(Metadata, [&](auto &P) {
+    return Other.getMetadata(P.first) == nullptr;
+  }), Metadata.end());
+}
+
+//===----------------------------------------------------------------------===//
 // TPRecipeBase insertion/movement helpers
 //===----------------------------------------------------------------------===//
 

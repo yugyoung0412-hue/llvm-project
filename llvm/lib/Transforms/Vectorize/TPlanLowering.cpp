@@ -189,11 +189,13 @@ void TPWidenCastRecipe::execute(TPTransformState &State) const {
   Value *Src = SrcDR ? State.getValue(SrcDR) : nullptr;
   if (!Src) return;
   Value *Result = State.Builder.Insert(CastInst->clone());
+  applyFlags(*cast<Instruction>(Result));
   State.setValue(this, Result);
 }
 
 void TPWidenGEPRecipe::execute(TPTransformState &State) const {
   Value *Result = State.Builder.Insert(GEPInst->clone());
+  applyFlags(*cast<Instruction>(Result));
   State.setValue(this, Result);
 }
 
@@ -226,6 +228,7 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
   case TensorOpKind::ElementWise:
   case TensorOpKind::Scalar: {
     Value *Result = State.Builder.Insert(Inst->clone());
+    applyFlags(*cast<Instruction>(Result));
     State.setValue(this, Result);
     return;
   }
@@ -235,6 +238,7 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
     LLVM_DEBUG(dbgs() << "TPlanLowering: BroadcastBinary not yet implemented, "
                          "falling back to scalar clone\n");
     Value *Result = State.Builder.Insert(Inst->clone());
+    applyFlags(*cast<Instruction>(Result));
     State.setValue(this, Result);
     return;
   }
@@ -244,6 +248,7 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
     LLVM_DEBUG(dbgs() << "TPlanLowering: OuterProduct not yet implemented, "
                          "falling back to scalar clone\n");
     Value *Result = State.Builder.Insert(Inst->clone());
+    applyFlags(*cast<Instruction>(Result));
     State.setValue(this, Result);
     return;
   }
@@ -251,6 +256,7 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
   case TensorOpKind::PlainReduction: {
     // Reduction update with no fuseable mul-like producer — clone as scalar.
     Value *Result = State.Builder.Insert(Inst->clone());
+    applyFlags(*cast<Instruction>(Result));
     State.setValue(this, Result);
     return;
   }
