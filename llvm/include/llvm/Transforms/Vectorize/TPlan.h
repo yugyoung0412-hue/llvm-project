@@ -610,7 +610,8 @@ public:
 
     // Header PHI recipes (subset: [TPFirstHeaderPHISC, TPLastHeaderPHISC])
     TPCanonicalIVSC,
-    TPWidenInductionSC,
+    TPWidenIntOrFpInductionSC,  // replaces TPWidenInductionSC
+    TPWidenPointerInductionSC,  // NEW
     TPReductionPHISC,
 
     // Canonical IV companion recipes (outside PHI range)
@@ -674,7 +675,8 @@ public:
     case TPWidenLoadSC:
     case TPWidenCastSC:
     case TPCanonicalIVSC:
-    case TPWidenInductionSC:
+    case TPWidenIntOrFpInductionSC:
+    case TPWidenPointerInductionSC:
     case TPReductionPHISC:
     case TPCanonicalIVIncrSC:
     case TPCanonicalIVExitCmpSC:
@@ -844,44 +846,83 @@ struct TPRecipeWithIRFlags : public TPSingleDefRecipe, public TPIRFlags {
 };
 
 //===----------------------------------------------------------------------===//
-// TPWidenInductionRecipe — WIDEN-INDUCTION: loop IV PHIs
+// TPHeaderPHIRecipe — abstract base for all header PHI recipes (mirrors VPHeaderPHIRecipe)
 //===----------------------------------------------------------------------===//
-class TPWidenInductionRecipe : public TPSingleDefRecipe, public TPPhiAccessors {
+class TPHeaderPHIRecipe : public TPSingleDefRecipe, public TPPhiAccessors {
 protected:
+  TPHeaderPHIRecipe(TPRecipeTy ID, ArrayRef<TPValue *> Operands)
+      : TPSingleDefRecipe(ID, Operands) {}
   const TPRecipeBase *getAsRecipe() const override { return this; }
-
 public:
-  TPWidenInductionRecipe(PHINode *IV, TPValue *StartVal, TPValue *StepVal,
-                          unsigned DimIdx = 0)
-      : TPSingleDefRecipe(TPWidenInductionSC, {StartVal, StepVal}),
-        IVPhi(IV), DimIndex(DimIdx) {}
+  static bool classof(const TPRecipeBase *R) {
+    return R->getTPRecipeID() >= TPFirstHeaderPHISC &&
+           R->getTPRecipeID() <= TPLastHeaderPHISC;
+  }
+  TPValue *getStartValue() const { return getOperand(0); }
+  void setStartValue(TPValue *V) { setOperand(0, V); }
+};
 
-  PHINode *getIVPhi() const { return IVPhi; }
+//===----------------------------------------------------------------------===//
+// TPWidenInductionRecipe — abstract base for IV PHIs (mirrors VPWidenInductionRecipe)
+//===----------------------------------------------------------------------===//
+class TPWidenInductionRecipe : public TPHeaderPHIRecipe {
+protected:
+  PHINode *IVPhi;    // was private in the old concrete class — now protected
+  unsigned DimIndex; // no default initializer (constructor always receives an explicit Dim)
+  TPWidenInductionRecipe(TPRecipeTy ID, PHINode *Phi,
+                         TPValue *Start, TPValue *Step, unsigned Dim)
+      : TPHeaderPHIRecipe(ID, {Start, Step}),
+        IVPhi(Phi), DimIndex(Dim) {}
+public:
+  static bool classof(const TPRecipeBase *R) {
+    return R->getTPRecipeID() == TPWidenIntOrFpInductionSC ||
+           R->getTPRecipeID() == TPWidenPointerInductionSC;
+  }
+  PHINode *getIVPhi()    const { return IVPhi; }
   unsigned getDimIndex() const { return DimIndex; }
+};
 
+//===----------------------------------------------------------------------===//
+// TPWidenIntOrFpInductionRecipe — integer or FP IV
+//===----------------------------------------------------------------------===//
+class TPWidenIntOrFpInductionRecipe : public TPWidenInductionRecipe {
+public:
+  TPWidenIntOrFpInductionRecipe(PHINode *Phi, TPValue *Start,
+                                 TPValue *Step, unsigned Dim)
+      : TPWidenInductionRecipe(TPWidenIntOrFpInductionSC, Phi,
+                               Start, Step, Dim) {}
+  static bool classof(const TPRecipeBase *R) {
+    return R->getTPRecipeID() == TPWidenIntOrFpInductionSC;
+  }
+  void execute(TPTransformState &State) const override;
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
-  void execute(TPTransformState &State) const override;
+};
 
+//===----------------------------------------------------------------------===//
+// TPWidenPointerInductionRecipe — pointer IV
+//===----------------------------------------------------------------------===//
+class TPWidenPointerInductionRecipe : public TPWidenInductionRecipe {
+public:
+  TPWidenPointerInductionRecipe(PHINode *Phi, TPValue *Start,
+                                 TPValue *Step, unsigned Dim)
+      : TPWidenInductionRecipe(TPWidenPointerInductionSC, Phi,
+                               Start, Step, Dim) {}
   static bool classof(const TPRecipeBase *R) {
-    return R->getTPRecipeID() == TPWidenInductionSC;
+    return R->getTPRecipeID() == TPWidenPointerInductionSC;
   }
-
-private:
-  PHINode *IVPhi;
-  unsigned DimIndex = 0; ///< Index in LoopNestInfo::IVs (0 = outermost).
+  void execute(TPTransformState &State) const override;
+  void print(raw_ostream &OS, unsigned Indent,
+             TPSlotTracker &Tracker) const override;
 };
 
 //===----------------------------------------------------------------------===//
 // TPReductionPHIRecipe — WIDEN-REDUCTION-PHI: accumulator PHIs
 //===----------------------------------------------------------------------===//
-class TPReductionPHIRecipe : public TPSingleDefRecipe, public TPPhiAccessors {
-protected:
-  const TPRecipeBase *getAsRecipe() const override { return this; }
-
+class TPReductionPHIRecipe : public TPHeaderPHIRecipe {
 public:
   TPReductionPHIRecipe(PHINode *Phi, TPValue *InitVal, TPValue *LoopVal)
-      : TPSingleDefRecipe(TPReductionPHISC, {InitVal, LoopVal}),
+      : TPHeaderPHIRecipe(TPReductionPHISC, {InitVal, LoopVal}),
         RedPhi(Phi) {}
 
   PHINode *getPhi() const { return RedPhi; }
@@ -1011,15 +1052,12 @@ private:
 //===----------------------------------------------------------------------===//
 // TPCanonicalIVRecipe — CANONICAL-INDUCTION: synthetic loop counter phi
 //===----------------------------------------------------------------------===//
-class TPCanonicalIVRecipe : public TPSingleDefRecipe, public TPPhiAccessors {
-protected:
-  const TPRecipeBase *getAsRecipe() const override { return this; }
-
+class TPCanonicalIVRecipe : public TPHeaderPHIRecipe {
 public:
   /// StartVal: TPIRValue for ir<0>. StepVal: patched after
   /// TPCanonicalIVIncrRecipe is created.
   TPCanonicalIVRecipe(TPValue *StartVal, TPValue *StepVal)
-      : TPSingleDefRecipe(TPCanonicalIVSC, {StartVal, StepVal}) {}
+      : TPHeaderPHIRecipe(TPCanonicalIVSC, {StartVal, StepVal}) {}
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;

@@ -175,8 +175,12 @@ void TPCanonicalIVExitCmpRecipe::execute(TPTransformState &) const {
   // Same as above — no direct IR emission.
 }
 
-void TPWidenInductionRecipe::execute(TPTransformState &State) const {
+void TPWidenIntOrFpInductionRecipe::execute(TPTransformState &State) const {
   // IV values are loop PHIs already present in IR; register them in ValueMap.
+  State.setValue(this, IVPhi);
+}
+
+void TPWidenPointerInductionRecipe::execute(TPTransformState &State) const {
   State.setValue(this, IVPhi);
 }
 

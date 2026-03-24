@@ -299,10 +299,22 @@ static void printBlockSuccessors(raw_ostream &OS, const Twine &Indent,
   OS << "\n";
 }
 
-void TPWidenInductionRecipe::print(raw_ostream &OS, unsigned Indent,
-                                   TPSlotTracker &Tracker) const {
+void TPWidenIntOrFpInductionRecipe::print(raw_ostream &OS, unsigned Indent,
+                                          TPSlotTracker &Tracker) const {
   printIndent(OS, Indent);
   OS << "WIDEN-INDUCTION ";
+  printAsOperand(OS, Tracker);
+  OS << " = phi ";
+  Operands[0]->printAsOperand(OS, Tracker);
+  OS << ", ";
+  Operands[1]->printAsOperand(OS, Tracker);
+  OS << "\n";
+}
+
+void TPWidenPointerInductionRecipe::print(raw_ostream &OS, unsigned Indent,
+                                           TPSlotTracker &Tracker) const {
+  printIndent(OS, Indent);
+  OS << "WIDEN-POINTER-INDUCTION ";
   printAsOperand(OS, Tracker);
   OS << " = phi ";
   Operands[0]->printAsOperand(OS, Tracker);
@@ -662,9 +674,15 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
         // We'll handle step as a live-in initially and patch below.
         (void)StepVal; // handled in post-pass
 
-        auto *R = new TPWidenInductionRecipe(
-            &Phi, StartTP,
-            StartTP /* placeholder; patched after body */, Idx);
+        TPWidenInductionRecipe *R;
+        if (Phi.getType()->isPointerTy())
+          R = new TPWidenPointerInductionRecipe(
+              &Phi, StartTP,
+              StartTP /* placeholder; patched after body */, Idx);
+        else
+          R = new TPWidenIntOrFpInductionRecipe(
+              &Phi, StartTP,
+              StartTP /* placeholder; patched after body */, Idx);
         HeaderBB->appendRecipe(R);
         P.ValueMap[PhiV] = R;
         // Note: Region->setIV(R) removed — IV tracking is via P.ValueMap
