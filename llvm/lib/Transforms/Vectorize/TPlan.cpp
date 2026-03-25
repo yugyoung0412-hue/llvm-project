@@ -570,7 +570,7 @@ void TPRegionBlock::print(raw_ostream &OS, const Twine &Indent,
 }
 
 //===----------------------------------------------------------------------===//
-// TPBlockBase subclass execute() stubs (rewired in commit 2)
+// TPBlockBase subclass execute() stubs
 //===----------------------------------------------------------------------===//
 
 void TPBasicBlock::execute(TPTransformState &State) {
@@ -612,6 +612,9 @@ void TPRegionBlock::printFlat(raw_ostream &OS, const Twine &Indent,
 }
 
 void TPRegionBlock::executeFlat(TPTransformState &State) {
+  // Walk internal CFG in construction order (DFS pre-order from Entry).
+  // The latch block's recipes (IV incr + cmp) have no successors within the
+  // region, so execution order matches the def-use requirements.
   if (Entry)
     for (TPBlockBase *B : constructionOrder(Entry))
       B->execute(State);
