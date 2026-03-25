@@ -53,13 +53,20 @@ void llvm::TPlanWidener_widen(TPlan &Plan) {
 
   SmallVector<TPSingleDefRecipe *, 32> Worklist;
 
-  // Phase 1: Seed from TPWidenInductionRecipe.
+  // Phase 1: Seed DimSets and default PFs from TPWidenInductionRecipe.
+  // Each IV recipe seeds DimSet = {getDimIndex()} and Plan.DimPFMap[dim] = 256
+  // (the default parallel factor per dimension).  Downstream recipes inherit
+  // the DimSet via the BFS union in Phase 2; they read the PF at lowering time
+  // via Plan.getPFForDim(d) for each d in their DimSet.
   for (TPBasicBlock *BB : AllBBs) {
     for (TPRecipeBase &R : *BB) {
       if (auto *WI = dyn_cast<TPWidenInductionRecipe>(&R)) {
         unsigned Dim = WI->getDimIndex();
         WI->DimSet.resize(std::max(WI->DimSet.size(), (size_t)(Dim + 1)));
         WI->DimSet.set(Dim);
+        // Default PF=256 per dimension; may be overridden by the caller after
+        // this function returns (e.g. from a target-specific cost model).
+        Plan.setDimPF(Dim, 256u);
         Worklist.push_back(WI);
       }
     }

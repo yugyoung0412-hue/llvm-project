@@ -47,15 +47,15 @@ PreservedAnalyses LoopTensorizePass::run(Function &F,
     if (!InfoOpt)
       continue;
 
-    // Build and print the initial TPlan (all PFs = 1).
+    // Build and print the initial TPlan.
     TPlan Plan = TPlan::buildInitial(*InfoOpt);
     LLVM_DEBUG(Plan.print(dbgs()));
     errs() << "\n=== Stage 1: Initial TPlan ===\n";
     Plan.print(errs());
 
-    // Set per-dim parallel factors (tile sizes) and lower to IR.
-    for (unsigned D = 0; D < InfoOpt->Depth; ++D)
-      Plan.setDimPF(D, 1); // placeholder; real heuristic to come
+    // Lower to IR.  TPlanWidener_widen() (called inside lower()) seeds
+    // Plan.DimPFMap with the default PF=256 for each IV dimension.
+    // Override specific dims here if a target-specific tile size is needed.
     TPlanLowering_lower(Plan, F, LI, SE, DT);
 
     PatternHint Hint = classifyPattern(*InfoOpt);
