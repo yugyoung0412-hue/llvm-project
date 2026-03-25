@@ -604,7 +604,8 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
   }
   P.Depth = Info.Depth;
 
-  // Create one synthetic PF value per loop dimension.
+  // DimPFs[D] is the per-dimension parallel-factor for DimIdx D.
+  // After DimIdx reversal: DimPFs[0]=innermost loop PF, DimPFs[Depth-1]=outermost.
   for (unsigned D = 0; D < P.Depth; ++D)
     P.DimPFs.push_back(
         std::make_unique<TPSymbolicValue>("PF[" + std::to_string(D) + "]"));
@@ -843,10 +844,10 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
       // Populate named structural fields.
       Region->setHeaderForLoop(L, HeaderBB);
       Region->setLatchForLoop(L, LatchBB);
-      // Note: setMiddle/setScalar here sets the child-level (intermediate) region's
-      // MiddleBB and ScalarPH as allocated inside this BuildRegion(Idx) call. For
-      // whatever level becomes Outer (Idx==0), Step 11 will overwrite these with the
-      // outermost MiddleBB/ScalarPH created in the top-level wiring block.
+      // setMiddle/setScalar: for Idx>0 (intermediate levels) these are the correct
+      // final values. For Idx==0 (outermost), the top-level wiring block will
+      // overwrite these with the outermost MiddleBB/ScalarPH (safe — top-level
+      // runs after this return).
       Region->setMiddle(MiddleBB);
       Region->setScalar(ScalarPH);
       Region->setInner(Child);
@@ -953,7 +954,9 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
       Outer->setScalar(ScalarPH);
     }
 
-    // Create the SCEV-expansion preheader (empty; will be wired in a future commit).
+    // tensor.preheader: reserved for SCEV expansions. Not connected to the CFG
+    // in this commit — will be wired as predecessor of Entry in a future commit.
+    // Do not use getPreheader() before it is wired.
     P.Preheader = P.createTPBasicBlock("tensor.preheader");
   }
 

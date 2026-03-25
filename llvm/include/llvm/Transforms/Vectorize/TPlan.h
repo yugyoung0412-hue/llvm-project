@@ -1286,8 +1286,7 @@ public:
 
   /// Returns the TPRegionBlock that owns loop \p L, or nullptr.
   TPRegionBlock *getRegionForLoop(Loop *L) const {
-    auto It = LoopIdx2TPRB.find(L);
-    return It != LoopIdx2TPRB.end() ? It->second : nullptr;
+    return LoopIdx2TPRB.lookup(L);
   }
 
   /// Factory methods — allocate and track blocks.
@@ -1308,7 +1307,7 @@ public:
   }
 
 private:
-  SmallVector<std::unique_ptr<TPSymbolicValue>> DimPFs; ///< PF[0]…PF[Depth-1]
+  SmallVector<std::unique_ptr<TPSymbolicValue>> DimPFs; ///< Per-dim PFs; DimPFs[0]=innermost (DimIdx convention).
   std::string FuncName;
   unsigned Depth = 0;
   SmallBitVector ReductionDims;              ///< Dims not in any store IndexExpr.
