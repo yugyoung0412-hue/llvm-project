@@ -666,7 +666,8 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
     (void)TC; // Trip count stored for future use
 
     // Compute per-level naming suffix.
-    unsigned Level = P.Depth - 1 - Idx;
+    unsigned Level  = P.Depth - 1 - Idx;
+    unsigned DimIdx = Level; // innermost=0, outermost=Depth-1 (equals Level)
     std::string LevelStr = std::to_string(Level);
 
     // Get the loop exit bound: latch branch condition ICmpInst RHS.
@@ -726,11 +727,11 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
         if (Phi.getType()->isPointerTy())
           R = new TPWidenPointerInductionRecipe(
               &Phi, StartTP,
-              StartTP /* placeholder; patched after body */, Idx);
+              StartTP /* placeholder; patched after body */, DimIdx);
         else
           R = new TPWidenIntOrFpInductionRecipe(
               &Phi, StartTP,
-              StartTP /* placeholder; patched after body */, Idx);
+              StartTP /* placeholder; patched after body */, DimIdx);
         HeaderBB->appendRecipe(R);
         P.ValueMap[PhiV] = R;
         // Note: Region->setIV(R) removed — IV tracking is via P.ValueMap
@@ -809,7 +810,7 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
 
       // Append canonical IV companion recipes to LatchBB.
       if (BoundTP) {
-        auto *IncrRecipe = new TPCanonicalIVIncrRecipe(CanonIV, P.DimPFs[Idx].get());
+        auto *IncrRecipe = new TPCanonicalIVIncrRecipe(CanonIV, P.DimPFs[DimIdx].get());
         LatchBB->appendRecipe(IncrRecipe);
         CanonIV->setOperand(1, IncrRecipe);
         IncrRecipe->addUser(CanonIV);
@@ -839,6 +840,21 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
         }
       }
 
+      // Populate named structural fields.
+      Region->setHeaderForLoop(L, HeaderBB);
+      Region->setLatchForLoop(L, LatchBB);
+      // Note: setMiddle/setScalar here sets the child-level (intermediate) region's
+      // MiddleBB and ScalarPH as allocated inside this BuildRegion(Idx) call. For
+      // whatever level becomes Outer (Idx==0), Step 11 will overwrite these with the
+      // outermost MiddleBB/ScalarPH created in the top-level wiring block.
+      Region->setMiddle(MiddleBB);
+      Region->setScalar(ScalarPH);
+      Region->setInner(Child);
+
+      // Register region — innermost pushes first (recursion unwinds inner → outer).
+      P.Regions.push_back(Region);
+      P.LoopIdx2TPRB[L] = Region;
+
       return Region;
     }
 
@@ -863,7 +879,7 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
 
     // Append canonical IV companion recipes to LatchBB.
     if (BoundTP) {
-      auto *IncrRecipe = new TPCanonicalIVIncrRecipe(CanonIV, P.DimPFs[Idx].get());
+      auto *IncrRecipe = new TPCanonicalIVIncrRecipe(CanonIV, P.DimPFs[DimIdx].get());
       LatchBB->appendRecipe(IncrRecipe);
       CanonIV->setOperand(1, IncrRecipe);
       IncrRecipe->addUser(CanonIV);
@@ -893,6 +909,14 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
       }
     }
 
+    // Populate named structural fields.
+    Region->setHeaderForLoop(L, HeaderBB);
+    Region->setLatchForLoop(L, LatchBB);
+    // Middle, Scalar, Inner stay null for leaf region.
+
+    P.Regions.push_back(Region);
+    P.LoopIdx2TPRB[L] = Region;
+
     return Region;
   };
 
@@ -920,9 +944,26 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
     // ScalarPH: no successors at top level.
 
     P.setEntry(OuterPH);
+
+    // Wire Middle/Scalar on the outermost region (created outside BuildRegion).
+    // For depth-1 plans Outer is also the leaf region — Middle/Scalar must stay null
+    // (leaf-region invariant). Only set them for multi-level nests.
+    if (P.Depth > 1) {
+      Outer->setMiddle(MiddleBB);
+      Outer->setScalar(ScalarPH);
+    }
+
+    // Create the SCEV-expansion preheader (empty; will be wired in a future commit).
+    P.Preheader = P.createTPBasicBlock("tensor.preheader");
   }
 
-  P.ReductionDims = Info.ReductionDims;
+  // Remap ReductionDims from outermost=0 (LoopNestAnalyzer convention) to
+  // innermost=0 (TPlan DimIdx convention). Always test Info.ReductionDims —
+  // never P.ReductionDims — to avoid reading back previously written bits.
+  P.ReductionDims.resize(P.Depth);
+  for (unsigned I = 0; I < P.Depth; ++I)
+    if (I < Info.ReductionDims.size() && Info.ReductionDims.test(I))
+      P.ReductionDims.set(P.Depth - 1 - I);
   return P;
 }
 

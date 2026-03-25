@@ -17,6 +17,7 @@
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/ADT/ilist.h"
 #include "llvm/ADT/ilist_node.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/FMF.h"
 #include "llvm/IR/InstrTypes.h"
@@ -460,13 +461,35 @@ public:
 
   bool isReplicator() const { return IsReplicator; }
 
+  TPBlockBase   *getMiddle() const          { return Middle; }
+  void           setMiddle(TPBlockBase *B)  { Middle = B; }
+
+  TPBlockBase   *getScalar() const          { return Scalar; }
+  void           setScalar(TPBlockBase *B)  { Scalar = B; }
+
+  TPRegionBlock *getInner() const               { return Inner; }
+  void           setInner(TPRegionBlock *R)     { Inner = R; }
+
+  /// Returns the header block for loop \p L. Cast to TPIRBasicBlock* to access
+  /// the underlying BasicBlock*.
+  TPBlockBase *getHeaderForLoop(Loop *L) const { return Loop2HeaderTPB.lookup(L); }
+  void setHeaderForLoop(Loop *L, TPBlockBase *B) { Loop2HeaderTPB[L] = B; }
+
+  TPBlockBase *getLatchForLoop(Loop *L) const { return Loop2LatchTPB.lookup(L); }
+  void setLatchForLoop(Loop *L, TPBlockBase *B) { Loop2LatchTPB[L] = B; }
+
   void execute(TPTransformState &State) override;
   void print(raw_ostream &OS, const Twine &Indent,
              TPSlotTracker &Tracker) const override;
 
 private:
-  TPBlockBase *Entry = nullptr;
-  TPBlockBase *Exiting = nullptr;
+  TPBlockBase *Entry    = nullptr;
+  TPBlockBase *Exiting  = nullptr;
+  TPBlockBase *Middle   = nullptr;  ///< Epilogue-check block; null for innermost.
+  TPBlockBase *Scalar   = nullptr;  ///< Scalar preheader; null for innermost.
+  TPRegionBlock *Inner  = nullptr;  ///< Next-inner nested region; null if leaf.
+  DenseMap<Loop *, TPBlockBase *> Loop2HeaderTPB;
+  DenseMap<Loop *, TPBlockBase *> Loop2LatchTPB;
   bool IsReplicator = false;
 };
 
@@ -1254,6 +1277,19 @@ public:
   /// Set the plan's outermost entry block.
   void setEntry(TPBlockBase *B) { Entry = B; }
 
+  /// Preheader block reserved for SCEV expansions (empty in initial plan).
+  TPBasicBlock *getPreheader() const           { return Preheader; }
+  void          setPreheader(TPBasicBlock *B)  { Preheader = B; }
+
+  /// All TPRegionBlocks: Regions[0]=innermost, Regions[N-1]=outermost.
+  ArrayRef<TPRegionBlock *> getRegions() const { return Regions; }
+
+  /// Returns the TPRegionBlock that owns loop \p L, or nullptr.
+  TPRegionBlock *getRegionForLoop(Loop *L) const {
+    auto It = LoopIdx2TPRB.find(L);
+    return It != LoopIdx2TPRB.end() ? It->second : nullptr;
+  }
+
   /// Factory methods — allocate and track blocks.
   TPBasicBlock *createTPBasicBlock(StringRef Name) {
     auto *B = new TPBasicBlock(Name);
@@ -1279,6 +1315,9 @@ private:
   DenseMap<unsigned, unsigned> DimPFMap;     ///< dim index → parallel factor.
   SmallVector<std::unique_ptr<TPIRValue>> LiveIns;
   TPBlockBase *Entry = nullptr;                 ///< Outermost preheader block.
+  TPBasicBlock *Preheader = nullptr;               ///< Reserved for SCEV expansions.
+  SmallVector<TPRegionBlock *, 4> Regions;         ///< [0]=innermost, [N-1]=outermost.
+  MapVector<Loop *, TPRegionBlock *> LoopIdx2TPRB; ///< Insertion-order for deterministic iteration.
   SmallVector<TPBlockBase *> CreatedBlocks;      ///< Owns all blocks.
   mutable TPSlotTracker Tracker;
 
