@@ -400,11 +400,19 @@ public:
   void print(raw_ostream &OS, const Twine &Indent,
              TPSlotTracker &Tracker) const override;
 
+  /// Set the IR basic block at which recipes in this block should be inserted.
+  /// When set, execute() repositions the builder to this block's first non-PHI
+  /// before executing recipes.  Used for synthetic latch blocks that correspond
+  /// to a real IR latch but keep a "tensor.latch*" name for TPlan printing.
+  void setInsertionBB(BasicBlock *BB) { InsertionBB = BB; }
+  BasicBlock *getInsertionBB() const { return InsertionBB; }
+
 protected:
   explicit TPBasicBlock(unsigned char SC, StringRef Name)
       : TPBlockBase(SC, Name) {}
 
   RecipeListTy Recipes;
+  BasicBlock *InsertionBB = nullptr; ///< Optional IR BB for builder positioning.
 };
 
 //===----------------------------------------------------------------------===//

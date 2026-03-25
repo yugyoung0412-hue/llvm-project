@@ -737,24 +737,3 @@ Recipe classifications (non-Scalar):
   [tensor.latch0] Contraction (contractDim=0)
   [tensor.latch0] Contraction (contractDim=0)
   [tensor.latch0] BroadcastBinary
-Instruction does not dominate all uses!
-  %127 = phi float [ 0.000000e+00, %111 ], [ %165, %133 ]
-  store float %127, ptr %115, align 4, !tbaa !14
-LLVM ERROR: Broken module found, compilation aborted!
-PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace and instructions to reproduce the bug.
-Stack dump:
-0.	Program arguments: build/bin/opt -passes=loop-tensorize ggml_compute_forward_mul_mat.ll -o /dev/null
-1.	Running pass "verify" on module "ggml_compute_forward_mul_mat.ll"
- #0 0x0000000105814ee8 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (/Users/yun-yugyeong/Dev/llvm/build/bin/opt+0x10167cee8)
- #1 0x0000000105812c8c llvm::sys::RunSignalHandlers() (/Users/yun-yugyeong/Dev/llvm/build/bin/opt+0x10167ac8c)
- #2 0x00000001058159e0 SignalHandler(int, __siginfo*, void*) (/Users/yun-yugyeong/Dev/llvm/build/bin/opt+0x10167d9e0)
- #3 0x000000018e1e2de4 (/usr/lib/system/libsystem_platform.dylib+0x180482de4)
- #4 0x000000018e1abf70 (/usr/lib/system/libsystem_pthread.dylib+0x18044bf70)
- #5 0x000000018e0b8908 (/usr/lib/system/libsystem_c.dylib+0x180358908)
- #6 0x0000000105775268 llvm::report_fatal_error(llvm::Twine const&, bool) (/Users/yun-yugyeong/Dev/llvm/build/bin/opt+0x1015dd268)
- #7 0x0000000105775098 llvm::report_fatal_error(llvm::Twine const&, bool) (/Users/yun-yugyeong/Dev/llvm/build/bin/opt+0x1015dd098)
- #8 0x0000000104f8dc44 llvm::VerifierPass::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/Users/yun-yugyeong/Dev/llvm/build/bin/opt+0x100df5c44)
- #9 0x0000000104f60a88 llvm::PassManager<llvm::Module, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/Users/yun-yugyeong/Dev/llvm/build/bin/opt+0x100dc8a88)
-#10 0x0000000105cd1564 llvm::runPassPipeline(llvm::StringRef, llvm::Module&, llvm::TargetMachine*, llvm::TargetLibraryInfoImpl*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::StringRef, llvm::ArrayRef<llvm::PassPlugin>, llvm::ArrayRef<std::__1::function<void (llvm::PassBuilder&)>>, llvm::opt_tool::OutputKind, llvm::opt_tool::VerifierKind, bool, bool, bool, bool, bool, bool, bool, bool) (/Users/yun-yugyeong/Dev/llvm/build/bin/opt+0x101b39564)
-#11 0x0000000105cda3f4 optMain (/Users/yun-yugyeong/Dev/llvm/build/bin/opt+0x101b423f4)
-#12 0x000000018de2c274

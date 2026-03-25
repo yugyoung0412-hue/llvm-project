@@ -574,7 +574,14 @@ void TPRegionBlock::print(raw_ostream &OS, const Twine &Indent,
 //===----------------------------------------------------------------------===//
 
 void TPBasicBlock::execute(TPTransformState &State) {
-  // Each recipe handles its own IR emission using State.Builder.
+  // If an explicit IR BB was provided (e.g. a synthetic latch block that wraps
+  // the loop's real latch), reposition the builder there so that cloned
+  // instructions are inserted in the correct IR block.  Without this, the
+  // builder stays at whatever position the preceding TPIRBasicBlock (the loop
+  // header) left it, causing dominance violations when recipes reference
+  // values defined in the latch (e.g. reduction-accumulator PHIs).
+  if (InsertionBB)
+    State.Builder.SetInsertPoint(&*InsertionBB->getFirstNonPHIIt());
   for (TPRecipeBase &R : Recipes)
     R.execute(State);
 }
@@ -811,8 +818,13 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
     EmitBlock(Header, HeaderBB);
 
     // Emit latch non-PHI instructions to LatchBB.
-    if (BasicBlock *Latch = L->getLoopLatch())
+    // Also record the IR latch BB so that TPBasicBlock::execute() can reposition
+    // the builder there, preventing dominance violations when latch recipes
+    // (e.g. reduction-accumulator stores) reference PHIs defined in the latch.
+    if (BasicBlock *Latch = L->getLoopLatch()) {
       EmitBlock(Latch, LatchBB);
+      LatchBB->setInsertionBB(Latch);
+    }
 
     if (Idx + 1 < AllLoops.size()) {
       // Non-innermost: create inner preheader + recurse.
@@ -826,6 +838,13 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
       auto *ScalarPH = P.createTPBasicBlock("scalar.ph" + ChildStr);
 
       // Emit body blocks (not header, not latch, not in inner loops) to InnerPH.
+      // Pin InnerPH to the outer loop header so that its clones are inserted
+      // at a block that dominates all inner content.  This is required because
+      // InnerPH is visited in intraRegionOrder AFTER tensor.latch (which
+      // repositions the builder to the actual IR latch); without an explicit
+      // InsertionBB the clones would land in the latch block, which does not
+      // dominate the inner loop body, causing verifier failures.
+      InnerPH->setInsertionBB(L->getHeader());
       Loop *InnerLoop = AllLoops[Idx + 1];
       for (BasicBlock *BB : L->blocks()) {
         if (BB == L->getHeader() || BB == L->getLoopLatch()) continue;
