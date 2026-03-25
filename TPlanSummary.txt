@@ -1,0 +1,205 @@
+// TPlan class relationship summary (multiple TPRegionBlocks)
+
+Below is a concise, **high‑level** summary of the class hierarchy and object‑graph that drives the *multiple‑region* (i.e. “nested‑region”) representation used by `TPlan`.  All of the source lives in `llvm/include/llvm/Transforms/Tensorize/TPlan.h`, so the description only references the public members that matter for the relationships.
+
+---
+
+## 1. Core building block – `TPBlockBase`
+
+```text
+class TPBlockBase
+   ├─ Sub‑class‑id (TPRegionBlockSC, TPBasicBlockSC, TPIRBasicBlockSC)
+   ├─ std::string   Name
+   ├─ TPRegionBlock *Parent               // immediate region that owns this block
+   ├─ SmallVector<TPBlockBase *> Predecessors
+   ├─ SmallVector<TPBlockBase *> Successors
+   └─ TPlan *Plan                         // only set on the *entry* block of a plan
+```
+* **Purpose** – Abstract node of the hierarchical control‑flow graph (H‑CFG) that a `TPlan` owns.
+* **Key operations** – manage predecessor / successor links, expose `getPlan()`, `getParent()`, `execute()`, `cost()`, `dropAllReferences()`, etc.
+* **Never instantiated directly** – always used through one of its three concrete subclasses.
+
+---
+
+## 2. Concrete block types
+
+| Concrete class | Meaning | Inheritance | Notable members |
+|----------------|---------|-------------|-----------------|
+| **`TPBasicBlock`** | Leaf node. Holds a linear list of *recipes* (individual IR‑generation steps). | `public TPBlockBase` (`TPBlockID = TPBasicBlockSC`) | `RecipeListTy Recipes` (iplist of `TPRecipeBase`), iterators, `appendRecipe()`, `splitAt()`. |
+| **`TPIRBasicBlock`** | Wrapper around an existing LLVM `BasicBlock`. Used when the plan needs to “import” a real BB (e.g. the original scalar pre‑header). | `public TPBasicBlock` (`TPBlockID = TPIRBasicBlockSC`) | `BasicBlock *IRBB`. |
+| **`TPRegionBlock`** | **Hierarchical region** – a *single‑entry, single‑exit* sub‑graph (SESE). Can contain either: <br> * A single `TPBasicBlock`/`TPIRBasicBlock` (when the region is just a straight‑line) <br> * A *nested* region (`Inner`) → allows *multiple* `TPRegionBlock`s to be chained, forming a tree. | `public TPBlockBase` (`TPBlockID = TPRegionBlockSC`) | `TPBlockBase *Entry, *Exiting, *Middle, *Scalar;` <br> `TPRegionBlock *Inner;` <br> `DenseMap<Loop*,TPBlockBase*> Loop2HeaderTPB / Loop2LatchTPB` (maps LLVM loops to the blocks that act as region‑header / region‑latch), <br> `bool IsReplicator;` (true for “replicated” regions that will be materialised *per‑part*). |
+
+### 2.1. `TPRegionBlock` internal structure
+
+```
+TPRegionBlock
+ ├─ Entry   : TPBlockBase*   // first block of the region (often a TPBasicBlock)
+ ├─ Exiting : TPBlockBase*   // last block of the region (single exit)
+ ├─ Middle  : TPBlockBase*   // “middle” block used for epilogue checks (optional)
+ ├─ Scalar  : TPBlockBase*   // scalar‑pre‑header when a scalar epilogue is needed
+ └─ Inner   : TPRegionBlock* // nested region (null if leaf)
+```
+* **`Entry` → … → `Exiting`** must form a **single‑entry, single‑exit** sub‑graph.
+* The **region may have **additional blocks** (e.g. `Middle`, `Scalar`) that are *outside* the SESE but still owned by the same region object.
+* A region can be **nested** (`Inner != nullptr`). The nesting depth corresponds to the loop nest depth of the tensorization pattern.
+
+---
+
+## 3. Relationship to `TPlan`
+
+```text
+class TPlan
+   ├─ TPBasicBlock *Entry            // top‑level entry of the whole VPlan
+   ├─ TPBasicBlock *Preheader        // original scalar pre‑header (used for SCEV expansions)
+   ├─ SmallVector<TPRegionBlock*,4> Regions   // one per loop depth (outer‑most first)
+   ├─ DenseMap<Value*,TPValue*>  Value2TPValue   // live‑in mapping
+   └─ MapVector<Loop*,TPRegionBlock*> LoopIdx2TPRB   // convenience mapping
+```
+* **`Entry`** is a *dummy* block that only connects to the **vector‑loop region** (`TPRegionBlock`) – it never contains recipes.
+* **`Preheader`** is a leaf `TPBasicBlock` that lives *before* any region, used to hold `TPExpandSCEVRecipe`s that compute SCEV‑derived values needed by later blocks.
+* **`Regions`** – for a nest of *N* loops:  
+  
+  ```
+  Region[0] = outer‑most TPRegionBlock   (controls loop N‑1)
+  Region[1] = next‑inner TPRegionBlock   (controls loop N‑2)
+  …
+  Region[N‑1] = innermost TPRegionBlock (controls loop 0)
+  ```
+  Each `TPRegionBlock` can contain its own `Inner` pointer, which points to the **next** region in this vector (so `Region[i].Inner == Region[i+1]`).
+* The **hierarchical CFG** is built by linking each region’s `Entry`/`Exiting` blocks together, then linking the **outer‑region’s** exit to the **inner‑region’s** entry, etc.
+* `TPRegionBlock`s are also reachable through the **loop‑to‑region maps** (`Loop2HeaderTPB`, `Loop2LatchTPB`) – these are filled by `LoopTensorizer` when it creates the plan, and they allow quick lookup of the `TPBlockBase` that implements a particular loop header/latch.
+
+---
+
+## 4. Recipes (`TPRecipeBase` hierarchy)
+
+All *instructions* that will be emitted are modeled as **recipes**.  A recipe is **owned** by a `TPBasicBlock` (or, rarely, a `TPIRBasicBlock`). The most common base classes are:
+
+```
+TPRecipeBase               // abstract, derives from ilist_node_with_parent<TPRecipeBase, TPBasicBlock>
+   ├─ TPSingleDefRecipe       // defines a single result value (e.g. loads, calls, casts)
+   │    ├─ TPInstruction     // generic instruction (opcode & operands)
+   │    ├─ TPWidenRecipe     // vector‑widened version of a scalar instruction
+   │    ├─ TPWidenCastRecipe
+   │    ├─ TPWidenLoadRecipe
+   │    ├─ TPWidenStoreRecipe
+   │    ├─ TPWidenCallRecipe
+   │    └─ …
+   ├─ TPHeaderPHIRecipe       // PHI‑like recipes used for loop‑induction/reductions
+   │    ├─ TPCanonicalIVPHIRecipe
+   │    ├─ TPWidenIntOrFpInductionRecipe
+   │    ├─ TPWidenPointerInductionRecipe
+   │    ├─ TPReductionPHIRecipe
+   │    └─ …
+   ├─ TPBlendRecipe           // mask‑based phi (blend) for vector predicates
+   ├─ TPReplicateRecipe       // “scalar‑replicate” of a scalar instruction
+   ├─ TPBranchOnMaskRecipe    // conditional branch on a mask
+   └─ …
+```
+* **Ownership** – `TPBasicBlock::Recipes` is an `iplist<TPRecipeBase>`. The list node embeds a back‑pointer to its parent block, so a recipe always knows which block it belongs to.
+* **Def‑Use** – A `TPValue` either represents a **live‑in** LLVM `Value` (wrapped by `TPValue(V)`) or the **result** of a recipe (`TPValue(Recipe*)`). All recipes expose their operands as `TPValue*`. This forms a *data‑flow* graph that is *parallel* to the H‑CFG.
+
+---
+
+## 5. How *multiple* `TPRegionBlock`s appear in a single `TPlan`
+
+Consider a 3‑level loop nest (`L2` outer, `L1` middle, `L0` inner).  When Tensorize builds a plan, the following shape is created (simplified ASCII diagram):
+
+```
+TPlan
+ ├─ Entry (empty BB) ──►  TPRegionBlock (Region[0] – outer loop L2)
+ │                         ├─ Entry  ──► TPBasicBlock   (prologue code)
+ │                         │
+ │                         ├─ Exiting ──► TPBasicBlock   (loop‑body of L2)
+ │                         │
+ │                         └─ Inner ──► TPRegionBlock (Region[1] – middle loop L1)
+ │                                   ├─ Entry  ──► TPBasicBlock   (prologue code)
+ │                                   │
+ │                                   ├─ Exiting ──► TPBasicBlock   (loop‑body of L1)
+ │                                   │
+ │                                   └─ Inner ──► TPRegionBlock (Region[2] – inner loop L0)
+ │                                             ├─ Entry  ──► TPBasicBlock   (prologue code)
+ │                                             │
+ │                                             ├─ Exiting ──► TPBasicBlock   (loop‑body of L0)
+ │                                             │
+ │                                             └─ (no Inner)   // leaf region
+ │
+ └─ Preheader (leaf BB)  // holds SCEV expansions
+```
+
+Key points:
+* **Each loop level gets its own `TPRegionBlock`.**
+* The **nesting** is represented by the `Inner` pointer, **not** by separate containers.
+* The **entry / exiting** blocks of a region are *ordinary* `TPBasicBlock`s (or sometimes `TPIRBasicBlock`s) that contain the recipes that implement the loop header/latch logic, phi updates, etc.
+* The **region‑level metadata** (`Loop2HeaderTPB`, `Loop2LatchTPB`) maps the original LLVM `Loop*` objects to the *specific* basic blocks that act as that loop’s header and latch *inside the region*. This is what enables later passes (`LoopTensorize`, `LoopVectorize`) to ask “what block should generate the canonical induction for Loop *L*?” and get an answer directly.
+
+---
+
+## 6. Typical life‑cycle
+
+1. **Plan creation** (`TPlan::createInitialTPlan`) builds:
+   * A *pre‑header* leaf `TPBasicBlock` (`Preheader`)
+   * The **outermost** `TPRegionBlock` (its `Entry`/`Exiting` are empty leaf `TPBasicBlock`s)
+   * For each LLVM `Loop` in the pattern, a deeper `TPRegionBlock` is created and linked via `Inner`.
+2. **Skeleton fill‑in** – `LoopTensorizer` walks the original loop nest, and for each loop it:
+   * Creates the **canonical IV header PHI** (`TPCanonicalIVPHIRecipe`) inside the region’s `Entry` block.
+   * Adds **widen‑IV** recipes (`TPWidenIntOrFpInductionRecipe` or `TPWidenPointerInductionRecipe`) inside the *body* block (`Exiting`).
+   * Populates the **induction‑step** and **back‑edge taken count** values (`BackedgeTakenCount`, `TensorTripCount`).
+3. **Instruction mapping** – All scalar instructions inside the original loop are transformed into a sequence of `TPRecipeBase`s living in the appropriate region’s *body* block.
+   * If the instruction is vector‑widenable → `TPWidenRecipe`.
+   * If it is a load/store → `TPWidenLoadRecipe` / `TPWidenStoreRecipe`.
+   * If it is a reduction → a `TPReductionPHIRecipe` + accompanying `TPWidenCanonicalIVRecipe`.
+4. **Final lowering** – When `TPlan::execute` runs, it traverses the H‑CFG depth‑first:
+   * Calls `TPRegionBlock::execute` → walks the region’s entry/body blocks.
+   * Each `TPBasicBlock::execute` iterates over its `Recipes` and calls `TPRecipeBase::execute` → emits real LLVM IR (vectors, masks, scalar tails, etc.).
+
+Because each region is a **self‑contained SESE sub‑graph**, the planner can:
+* **Duplicate** a region for “replicated” unrolled parts (`IsReplicator == true`).
+* **Fold** epilogue checks by inserting a `Middle` block that decides whether to execute the scalar tail.
+* **Apply different vector widths** to each nested region independently (the `TF`/`UF` vectors are stored per‑loop in `TPlan`).
+
+---
+
+## 7. Quick reference table – what points where
+
+| Class | What it *contains* | What it *is contained by* | Primary purpose |
+|------|-------------------|---------------------------|-----------------|
+| `TPBlockBase` | `Parent` (region), `Predecessors`, `Successors`, optional `Plan` | `TPRegionBlock` (as Entry/Exiting/Middle/Scalar) **or** `TPBasicBlock` (as a leaf) | Abstract CFG node |
+| `TPBasicBlock` | `RecipeListTy Recipes` (linear list of `TPRecipeBase`) | Owned by `TPRegionBlock::Entry` or `TPRegionBlock::Exiting` (or as a stand‑alone pre‑header) | Leaf block – generates IR |
+| `TPIRBasicBlock` | `BasicBlock *IRBB` | Same as `TPBasicBlock` | Wrapper for an existing LLVM BB (used for the original scalar pre‑header) |
+| `TPRegionBlock` | `Entry`, `Exiting`, `Middle`, `Scalar` (all `TPBlockBase*`), optional `Inner` (nested `TPRegionBlock*`) | Owned **only** by the top‑level `TPlan` (via `Regions` vector) | Hierarchical SESE region – may be nested |
+| `TPRecipeBase` (and its subclasses) | Operands (`TPValue*`), DebugLoc, PF, etc. | Owned by a `TPBasicBlock` (via its `iplist`) | Describe a single IR operation (load, call, phi, etc.) |
+| `TPValue` | Either a live‑in `Value*` **or** a link to the defining `TPRecipeBase` | Stored in `TPlan::Value2TPValue` (for live‑ins) **or** as the *result* of a recipe | Unified data‑flow node; used by recipes as operands |
+
+---
+
+## 8. Visual cheat‑sheet (ASCII)
+
+```
++-------------------+                +-------------------+          +-------------------+
+|      TPlan        |                |   TPlan::Entry    |          |   TPlan::Preheader|
+|-------------------|                | (empty TPBasicBlk)|          | (leaf TPBasicBlk)|
+| Regions[0] -------+----> TPRegionBlock (outer)                 |  (SCEV recipes) |
+|   …               |                |  Entry  ──► TPBasicBlk (prologue)|
+|                   |                |  Exiting ─► TPBasicBlk (loop‑body)|
++-------------------+                |  Inner  ──► TPRegionBlock (next level)|
+                                     +-------------------+          +-------------------+
+
+Each TPRegionBlock (depth i):
+   Entry   – header code, canonical IV phi, step phi, etc.
+   Exiting – the “loop body” of that level (may contain many recipes)
+   Middle  – optional block used for scalar‑epilogue check
+   Scalar  – optional scalar pre‑header (for scalar tail)
+   Inner   – pointer to the region that models the *next inner* loop.
+```
+
+---
+
+**TL;DR**
+* **`TPBlockBase`** = abstract graph node.
+* **`TPBasicBlock`** = leaf node that *contains* a linear list of **recipes** (`TPRecipeBase`).
+* **`TPRegionBlock`** = *hierarchical* node that groups an **entry** block, an **exiting** block, optional **middle/scalar** blocks, and optionally a **nested `Inner` region** → this is how *multiple* regions appear in a single `TPlan`.
+* `TPlan` owns a **vector of regions** (`Regions`) – one per loop depth – and a **root entry block** that connects to the outermost region.
+* The **data‑flow** (values) lives in `TPValue`/`TPRecipeBase` objects that are attached to the leaf `TPBasicBlock`s, while the **control‑flow** is completely expressed by the `TPBlockBase` → `TPRegionBlock` hierarchy.
+
+This structure lets the tensorizer build a **tree of SESE regions**, each with its own header/latch logic, while still keeping a **flat linear list of recipes** inside the leaf blocks where the actual IR is emitted.
