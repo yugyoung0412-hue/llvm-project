@@ -482,6 +482,11 @@ public:
   void print(raw_ostream &OS, const Twine &Indent,
              TPSlotTracker &Tracker) const override;
 
+  /// Flat alternatives using constructionOrder (original behavior, for debugging).
+  void printFlat(raw_ostream &OS, const Twine &Indent,
+                 TPSlotTracker &Tracker) const;
+  void executeFlat(TPTransformState &State);
+
 private:
   TPBlockBase *Entry    = nullptr;
   TPBlockBase *Exiting  = nullptr;

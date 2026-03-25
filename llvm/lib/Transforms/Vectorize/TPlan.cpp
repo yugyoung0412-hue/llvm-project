@@ -286,6 +286,30 @@ llvm::constructionOrder(TPBlockBase *Start) {
   return Order;
 }
 
+/// DFS pre-order from \p Start, treating TPRegionBlock nodes as opaque leaves
+/// (adds them to the result but does not descend into their internal CFG).
+/// Used to traverse a single region's own blocks without crossing into nested regions.
+static SmallVector<TPBlockBase *, 8>
+intraRegionOrder(TPBlockBase *Start) {
+  SmallVector<TPBlockBase *, 8> Order;
+  SmallPtrSet<TPBlockBase *, 8> Visited;
+  SmallVector<TPBlockBase *, 8> Stack;
+  Stack.push_back(Start);
+  while (!Stack.empty()) {
+    TPBlockBase *B = Stack.pop_back_val();
+    if (!Visited.insert(B).second)
+      continue;
+    Order.push_back(B);
+    // Do NOT descend into nested regions — treat them as opaque leaves.
+    if (isa<TPRegionBlock>(B))
+      continue;
+    for (TPBlockBase *Succ : llvm::reverse(B->getSuccessors()))
+      if (!Visited.count(Succ))
+        Stack.push_back(Succ);
+  }
+  return Order;
+}
+
 static void printBlockSuccessors(raw_ostream &OS, const Twine &Indent,
                                   const TPBlockBase *B) {
   OS << Indent;
@@ -532,11 +556,13 @@ void TPRegionBlock::print(raw_ostream &OS, const Twine &Indent,
                            TPSlotTracker &Tracker) const {
   OS << Indent << "<x1> " << getName() << ": {\n";
   if (Entry) {
-    // Materialise the indent string — Twine is a non-owning ref type and
-    // must not be stored as a named variable (dangling reference UB).
     std::string InnerIndentStr = (Indent + "  ").str();
-    for (TPBlockBase *B : constructionOrder(Entry))
-      B->print(OS, InnerIndentStr, Tracker);
+    for (TPBlockBase *B : intraRegionOrder(Entry)) {
+      if (Inner && B == Inner)
+        Inner->print(OS, InnerIndentStr, Tracker);
+      else
+        B->print(OS, InnerIndentStr, Tracker);
+    }
   }
   OS << Indent << "}\n";
   printBlockSuccessors(OS, Indent, this);
@@ -562,9 +588,30 @@ void TPIRBasicBlock::execute(TPTransformState &State) {
 }
 
 void TPRegionBlock::execute(TPTransformState &State) {
-  // Walk internal CFG in construction order (DFS pre-order from Entry).
-  // The latch block's recipes (IV incr + cmp) have no successors within the
-  // region, so execution order matches the def-use requirements.
+  if (!Entry)
+    return;
+  for (TPBlockBase *B : intraRegionOrder(Entry)) {
+    if (Inner && B == Inner)
+      Inner->execute(State);
+    else
+      B->execute(State);
+  }
+}
+
+void TPRegionBlock::printFlat(raw_ostream &OS, const Twine &Indent,
+                               TPSlotTracker &Tracker) const {
+  OS << Indent << "<x1> " << getName() << ": {\n";
+  if (Entry) {
+    std::string InnerIndentStr = (Indent + "  ").str();
+    for (TPBlockBase *B : constructionOrder(Entry))
+      B->print(OS, InnerIndentStr, Tracker);
+  }
+  OS << Indent << "}\n";
+  printBlockSuccessors(OS, Indent, this);
+  OS << "\n";
+}
+
+void TPRegionBlock::executeFlat(TPTransformState &State) {
   if (Entry)
     for (TPBlockBase *B : constructionOrder(Entry))
       B->execute(State);
