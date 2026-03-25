@@ -10,6 +10,7 @@
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -17,7 +18,6 @@
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/ADT/ilist.h"
 #include "llvm/ADT/ilist_node.h"
-#include "llvm/ADT/MapVector.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/FMF.h"
 #include "llvm/IR/InstrTypes.h"
