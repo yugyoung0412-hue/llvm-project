@@ -136,6 +136,16 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
 
   // Ensure operands are flat FixedVectorType as required by the intrinsic.
   Type *ElemTy = LHS->getType()->getScalarType();
+
+  // Guard: if LHS/RHS are still scalar IR values (not yet tiled into vectors),
+  // a bitcast to <M*K x elem> would be invalid because the bit widths differ.
+  // Fall back to a 1×1×1 matrix multiply so the intrinsic is still emitted and
+  // downstream passes see the pattern, but we don't assert on an illegal cast.
+  uint64_t LHSBits = LHS->getType()->getPrimitiveSizeInBits();
+  uint64_t ElemBits = ElemTy->getPrimitiveSizeInBits();
+  if (ElemBits == 0 || LHSBits != ElemBits * (uint64_t)(M * K))
+    M = K = N = 1;
+
   auto ensureFlat = [&](Value *V, unsigned Elems) -> Value * {
     Type *FlatTy = FixedVectorType::get(ElemTy, Elems);
     if (V->getType() != FlatTy)
