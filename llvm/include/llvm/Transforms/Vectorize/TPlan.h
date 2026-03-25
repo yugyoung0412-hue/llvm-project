@@ -1271,10 +1271,12 @@ public:
 
   /// Returns the parallel factor for dimension \p Dim. Default: 1 (scalar).
   /// Set by LoopTensorize via setDimPF() before lowering.
+  /// \p Dim uses the DimIdx convention (innermost=0, outermost=Depth-1).
   unsigned getPFForDim(unsigned Dim) const {
     auto It = DimPFMap.find(Dim);
     return It != DimPFMap.end() ? It->second : 1u;
   }
+  /// \p Dim uses the DimIdx convention (innermost=0, outermost=Depth-1).
   void setDimPF(unsigned Dim, unsigned PF) { DimPFMap[Dim] = PF; }
 
   /// Entry block (outermost preheader, a TPBasicBlock).
@@ -1283,6 +1285,8 @@ public:
   void setEntry(TPBlockBase *B) { Entry = B; }
 
   /// Preheader block reserved for SCEV expansions (empty in initial plan).
+  /// Not connected to the plan CFG until the SCEV-expansion wiring commit;
+  /// do not traverse to it via successor edges before then.
   TPBasicBlock *getPreheader() const           { return Preheader; }
   void          setPreheader(TPBasicBlock *B)  { Preheader = B; }
 
@@ -1316,7 +1320,7 @@ private:
   std::string FuncName;
   unsigned Depth = 0;
   SmallBitVector ReductionDims;              ///< Dims not in any store IndexExpr.
-  DenseMap<unsigned, unsigned> DimPFMap;     ///< dim index → parallel factor.
+  DenseMap<unsigned, unsigned> DimPFMap;     ///< dim index (DimIdx, innermost=0) → parallel factor.
   SmallVector<std::unique_ptr<TPIRValue>> LiveIns;
   TPBlockBase *Entry = nullptr;                 ///< Outermost preheader block.
   TPBasicBlock *Preheader = nullptr;               ///< Reserved for SCEV expansions.
