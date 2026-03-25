@@ -1,0 +1,15 @@
+LV: Interleaving disabled by the pass manager
+LV: Interleaving disabled by the pass manager
+LV: Interleaving disabled by the pass manager
+LV: Interleaving disabled by the pass manager
+LV: Interleaving disabled by the pass manager
+LV: Interleaving disabled by the pass manager
+
+LV: Checking a loop in '_Z9do_conv2diiiiiiPKfS0_lllPf' from do_conv2d.ll
+LV: Loop hints: force=? width=0 interleave=1
+LV: Found a loop: for.body24
+LV: Found an induction variable.
+LV: Found FP op with unsafe algebra.
+LV: Found FP op with unsafe algebra.
+LV: We can vectorize this loop!
+LV: loop not vectorized: cannot prove it is safe to reorder floating-point operations

@@ -1,0 +1,14 @@
+build/bin/opt: WARNING: failed to create target machine for 'aarch64': unable to get target for 'aarch64', see --version and --triple.
+LV: Interleaving disabled by the pass manager
+LV: Interleaving disabled by the pass manager
+LV: Interleaving disabled by the pass manager
+LV: Interleaving disabled by the pass manager
+
+LV: Checking a loop in '_ZL32ggml_compute_forward_mul_mat_f32PK11ggml_tensorS1_PS_' from ggml_compute_forward_mul_mat.ll
+LV: Loop hints: force=? width=0 interleave=0
+LV: Found a loop: 
+LV: Found an induction variable.
+LV: Found FP op with unsafe algebra.
+LV: Found FP op with unsafe algebra.
+LV: We can vectorize this loop!
+LV: loop not vectorized: cannot prove it is safe to reorder floating-point operations

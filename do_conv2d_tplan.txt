@@ -1,0 +1,133 @@
+TPlan '_Z9do_conv2diiiiiiPKfS0_lllPf' (depth=7) {
+Live-in tp<%0> = PF
+Live-in ir<16>
+Live-in ir<0>
+Live-in ir<14>
+Live-in ir<%X>
+Live-in ir<%OC>
+Live-in ir<1>
+Live-in ir<144>
+Live-in ir<%OH>
+Live-in ir<%conv>
+Live-in ir<%conv25>
+Live-in ir<%OW>
+Live-in ir<%conv28>
+Live-in ir<%conv30>
+Live-in ir<32>
+Live-in ir<30>
+Live-in ir<%o_data>
+Live-in ir<%sum.3>
+Live-in ir<0>
+Live-in ir<9>
+Live-in ir<10>
+Live-in ir<3>
+Live-in ir<%conv26>
+Live-in ir<15>
+Live-in ir<6>
+Live-in ir<%conv32>
+Live-in ir<-1>
+Live-in ir<%W>
+
+<x1> loop[0] (trip=15) {
+  CANONICAL-INDUCTION tp<%1> = phi ir<0>, tp<%2>
+  WIDEN-INDUCTION tp<%3> = phi ir<0>, tp<%4>
+  WIDEN tp<%5> = shl tp<%3>, ir<14>
+  WIDEN-GEP tp<%6> = getelementptr ir<%X>, tp<%5>
+  WIDEN tp<%7> = mul tp<%3>, ir<%OC>
+  WIDEN tp<%4> = add tp<%3>, ir<1>
+  WIDEN tp<%8> = icmp tp<%4>, ir<16>
+  CANONICAL-INDUCTION-INC tp<%2> = add tp<%1>, tp<%0>
+  CANONICAL-INDUCTION-CMP tp<%9> = icmp tp<%2>, ir<16>
+  <x1> loop[1] (trip=(-1 + %OC)) {
+    CANONICAL-INDUCTION tp<%10> = phi ir<0>, tp<%11>
+    WIDEN-INDUCTION tp<%12> = phi ir<0>, tp<%13>
+    WIDEN tp<%14> = mul tp<%12>, ir<144>
+    WIDEN tp<%15> = add tp<%12>, tp<%7>
+    WIDEN tp<%16> = mul tp<%15>, ir<%OH>
+    WIDEN tp<%13> = add tp<%12>, ir<1>
+    WIDEN tp<%17> = icmp tp<%13>, ir<%OC>
+    CANONICAL-INDUCTION-INC tp<%11> = add tp<%10>, tp<%0>
+    CANONICAL-INDUCTION-CMP tp<%18> = icmp tp<%11>, ir<%OC>
+    <x1> loop[2] (trip=(-1 + %OH)) {
+      CANONICAL-INDUCTION tp<%19> = phi ir<0>, tp<%20>
+      WIDEN-INDUCTION tp<%21> = phi ir<0>, tp<%22>
+      WIDEN tp<%23> = mul tp<%21>, ir<%conv>
+      WIDEN tp<%24> = sub tp<%23>, ir<%conv25>
+      WIDEN tp<%25> = add tp<%16>, tp<%21>
+      WIDEN tp<%26> = mul tp<%25>, ir<%OW>
+      WIDEN tp<%22> = add tp<%21>, ir<1>
+      WIDEN tp<%27> = icmp tp<%22>, ir<%OH>
+      CANONICAL-INDUCTION-INC tp<%20> = add tp<%19>, tp<%0>
+      CANONICAL-INDUCTION-CMP tp<%28> = icmp tp<%20>, ir<%OH>
+      <x1> loop[3] (trip=(-1 + %OW)) {
+        CANONICAL-INDUCTION tp<%29> = phi ir<0>, tp<%30>
+        WIDEN-INDUCTION tp<%31> = phi ir<0>, tp<%32>
+        WIDEN tp<%33> = mul tp<%31>, ir<%conv28>
+        WIDEN tp<%34> = sub tp<%33>, ir<%conv30>
+        WIDEN tp<%35> = add tp<%31>, tp<%26>
+        WIDEN tp<%36> = shl tp<%35>, ir<32>
+        WIDEN tp<%37> = ashr tp<%36>, ir<30>
+        WIDEN-GEP tp<%38> = getelementptr ir<%o_data>, tp<%37>
+        WIDEN store tp<%38>, ir<%sum.3>
+        WIDEN tp<%32> = add tp<%31>, ir<1>
+        WIDEN tp<%39> = icmp tp<%32>, ir<%OW>
+        CANONICAL-INDUCTION-INC tp<%30> = add tp<%29>, tp<%0>
+        CANONICAL-INDUCTION-CMP tp<%40> = icmp tp<%30>, ir<%OW>
+        <x1> loop[4] (trip=15) {
+          CANONICAL-INDUCTION tp<%41> = phi ir<0>, tp<%42>
+          WIDEN-INDUCTION tp<%43> = phi ir<0>, tp<%44>
+          WIDEN-REDUCTION-PHI tp<%45> = phi ir<0>, ir<%sum.3>
+          WIDEN tp<%46> = mul tp<%43>, ir<9>
+          WIDEN tp<%47> = add tp<%46>, tp<%14>
+          WIDEN tp<%48> = shl tp<%43>, ir<10>
+          WIDEN-GEP tp<%49> = getelementptr tp<%6>, tp<%48>
+          WIDEN tp<%44> = add tp<%43>, ir<1>
+          WIDEN tp<%50> = icmp tp<%44>, ir<16>
+          CANONICAL-INDUCTION-INC tp<%42> = add tp<%41>, tp<%0>
+          CANONICAL-INDUCTION-CMP tp<%51> = icmp tp<%42>, ir<16>
+          <x1> loop[5] (trip=2) {
+            CANONICAL-INDUCTION tp<%52> = phi ir<0>, tp<%53>
+            WIDEN-INDUCTION tp<%54> = phi ir<0>, tp<%55>
+            WIDEN-REDUCTION-PHI tp<%56> = phi tp<%45>, ir<%sum.3>
+            WIDEN tp<%57> = mul tp<%54>, ir<%conv26>
+            WIDEN tp<%58> = add tp<%57>, tp<%24>
+            WIDEN tp<%59> = icmp tp<%58>, ir<15>
+            WIDEN tp<%60> = mul tp<%58>, ir<3>
+            WIDEN tp<%61> = add tp<%47>, tp<%60>
+            WIDEN tp<%62> = shl tp<%58>, ir<6>
+            WIDEN-GEP tp<%63> = getelementptr tp<%49>, tp<%62>
+            WIDEN tp<%55> = add tp<%54>, ir<1>
+            WIDEN tp<%64> = icmp tp<%55>, ir<3>
+            CANONICAL-INDUCTION-INC tp<%53> = add tp<%52>, tp<%0>
+            CANONICAL-INDUCTION-CMP tp<%65> = icmp tp<%53>, ir<3>
+            <x1> loop[6] (trip=2) {
+              CANONICAL-INDUCTION tp<%66> = phi ir<0>, tp<%67>
+              WIDEN-INDUCTION tp<%68> = phi ir<0>, tp<%69>
+              WIDEN-REDUCTION-PHI tp<%70> = phi tp<%56>, ir<%sum.3>
+              WIDEN tp<%71> = mul tp<%68>, ir<%conv32>
+              WIDEN tp<%72> = add tp<%71>, tp<%34>
+              WIDEN tp<%73> = icmp tp<%72>, ir<15>
+              WIDEN tp<%74> = select tp<%73>, ir<-1>, tp<%59>
+              WIDEN tp<%75> = add tp<%61>, tp<%68>
+              WIDEN tp<%76> = shl tp<%75>, ir<32>
+              WIDEN tp<%77> = ashr tp<%76>, ir<30>
+              WIDEN-GEP tp<%78> = getelementptr ir<%W>, tp<%77>
+              WIDEN tp<%79> = load tp<%78>
+              WIDEN-GEP tp<%80> = getelementptr tp<%63>, tp<%72>
+              WIDEN tp<%81> = load tp<%80>
+              WIDEN tp<%82> = fmul tp<%79>, tp<%81>
+              WIDEN tp<%83> = fadd tp<%70>, tp<%82>
+              WIDEN tp<%69> = add tp<%68>, ir<1>
+              WIDEN tp<%84> = icmp tp<%69>, ir<3>
+              CANONICAL-INDUCTION-INC tp<%67> = add tp<%66>, tp<%0>
+              CANONICAL-INDUCTION-CMP tp<%85> = icmp tp<%67>, ir<3>
+            }
+          }
+        }
+      }
+    }
+  }
+}
+}
+PatternHint: Generic
+Best cost: 5.898240e-02 transforms: 1

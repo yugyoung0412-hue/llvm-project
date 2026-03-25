@@ -1,0 +1,109 @@
+/Users/yun-yugyeong/Dev/llvm/build/bin/opt: WARNING: failed to create target machine for 'aarch64': unable to get target for 'aarch64', see --version and --triple.
+TPlan '_ZL32ggml_compute_forward_mul_mat_f32PK11ggml_tensorS1_PS_' (depth=5) {
+Live-in tp<%0> = PF
+Live-in ir<%17>
+Live-in ir<0>
+Live-in ir<%7>
+Live-in ir<%25>
+Live-in ir<%43>
+Live-in ir<%33>
+Live-in ir<%45>
+Live-in ir<%41>
+Live-in ir<%47>
+Live-in ir<1>
+Live-in ir<%15>
+Live-in ir<%5>
+Live-in ir<%23>
+Live-in ir<%31>
+Live-in ir<%39>
+Live-in ir<%13>
+Live-in ir<%29>
+Live-in ir<%37>
+Live-in ir<%11>
+Live-in ir<%21>
+Live-in ir<%35>
+Live-in ir<%96>
+Live-in ir<%9>
+Live-in ir<0>
+Live-in ir<%114>
+Live-in ir<%19>
+Live-in ir<%27>
+
+<x1> loop[0] (trip=(-1 + %17)) {
+  CANONICAL-INDUCTION tp<%1> = phi ir<0>, tp<%2>
+  WIDEN-INDUCTION tp<%3> = phi ir<0>, tp<%4>
+  WIDEN tp<%5> = srem tp<%3>, ir<%7>
+  WIDEN tp<%6> = mul tp<%5>, ir<%25>
+  WIDEN-GEP tp<%7> = getelementptr ir<%43>, tp<%6>
+  WIDEN tp<%8> = mul tp<%3>, ir<%33>
+  WIDEN-GEP tp<%9> = getelementptr ir<%45>, tp<%8>
+  WIDEN tp<%10> = mul tp<%3>, ir<%41>
+  WIDEN-GEP tp<%11> = getelementptr ir<%47>, tp<%10>
+  WIDEN tp<%4> = add tp<%3>, ir<1>
+  WIDEN tp<%12> = icmp tp<%4>, ir<%17>
+  CANONICAL-INDUCTION-INC tp<%2> = add tp<%1>, tp<%0>
+  CANONICAL-INDUCTION-CMP tp<%13> = icmp tp<%2>, ir<%17>
+  <x1> loop[1] (trip=(-1 + %15)) {
+    CANONICAL-INDUCTION tp<%14> = phi ir<0>, tp<%15>
+    WIDEN-INDUCTION tp<%16> = phi ir<0>, tp<%17>
+    WIDEN tp<%18> = srem tp<%16>, ir<%5>
+    WIDEN tp<%19> = mul tp<%18>, ir<%23>
+    WIDEN-GEP tp<%20> = getelementptr tp<%7>, tp<%19>
+    WIDEN tp<%21> = mul tp<%16>, ir<%31>
+    WIDEN-GEP tp<%22> = getelementptr tp<%9>, tp<%21>
+    WIDEN tp<%23> = mul tp<%16>, ir<%39>
+    WIDEN-GEP tp<%24> = getelementptr tp<%11>, tp<%23>
+    WIDEN tp<%17> = add tp<%16>, ir<1>
+    WIDEN tp<%25> = icmp tp<%17>, ir<%15>
+    CANONICAL-INDUCTION-INC tp<%15> = add tp<%14>, tp<%0>
+    CANONICAL-INDUCTION-CMP tp<%26> = icmp tp<%15>, ir<%15>
+    <x1> loop[2] (trip=(-1 + %13)) {
+      CANONICAL-INDUCTION tp<%27> = phi ir<0>, tp<%28>
+      WIDEN-INDUCTION tp<%29> = phi ir<0>, tp<%30>
+      WIDEN tp<%31> = mul tp<%29>, ir<%29>
+      WIDEN tp<%32> = mul tp<%29>, ir<%37>
+      WIDEN-GEP tp<%33> = getelementptr tp<%22>, tp<%31>
+      WIDEN-GEP tp<%34> = getelementptr tp<%24>, tp<%32>
+      WIDEN tp<%30> = add tp<%29>, ir<1>
+      WIDEN tp<%35> = icmp tp<%30>, ir<%13>
+      CANONICAL-INDUCTION-INC tp<%28> = add tp<%27>, tp<%0>
+      CANONICAL-INDUCTION-CMP tp<%36> = icmp tp<%28>, ir<%13>
+      <x1> loop[3] (trip=(-1 + %11)) {
+        CANONICAL-INDUCTION tp<%37> = phi ir<0>, tp<%38>
+        WIDEN-INDUCTION tp<%39> = phi ir<0>, tp<%40>
+        WIDEN tp<%41> = mul tp<%39>, ir<%21>
+        WIDEN-GEP tp<%42> = getelementptr tp<%20>, tp<%41>
+        WIDEN tp<%43> = mul tp<%39>, ir<%35>
+        WIDEN-GEP tp<%44> = getelementptr tp<%34>, tp<%43>
+        WIDEN-CAST tp<%45> = bitcast tp<%44>
+        WIDEN store tp<%45>, ir<%96>
+        WIDEN tp<%40> = add tp<%39>, ir<1>
+        WIDEN tp<%46> = icmp tp<%40>, ir<%11>
+        CANONICAL-INDUCTION-INC tp<%38> = add tp<%37>, tp<%0>
+        CANONICAL-INDUCTION-CMP tp<%47> = icmp tp<%38>, ir<%11>
+        <x1> loop[4] (trip=(-1 + %9)) {
+          CANONICAL-INDUCTION tp<%48> = phi ir<0>, tp<%49>
+          WIDEN-INDUCTION tp<%50> = phi ir<0>, tp<%51>
+          WIDEN-REDUCTION-PHI tp<%52> = phi ir<0>, ir<%114>
+          WIDEN tp<%53> = mul tp<%50>, ir<%19>
+          WIDEN-GEP tp<%54> = getelementptr tp<%42>, tp<%53>
+          WIDEN-CAST tp<%55> = bitcast tp<%54>
+          WIDEN tp<%56> = load tp<%55>
+          WIDEN tp<%57> = mul tp<%50>, ir<%27>
+          WIDEN-GEP tp<%58> = getelementptr tp<%33>, tp<%57>
+          WIDEN-CAST tp<%59> = bitcast tp<%58>
+          WIDEN tp<%60> = load tp<%59>
+          WIDEN tp<%61> = fmul tp<%56>, tp<%60>
+          WIDEN tp<%62> = fadd tp<%52>, tp<%61>
+          WIDEN tp<%51> = add tp<%50>, ir<1>
+          WIDEN tp<%63> = icmp tp<%51>, ir<%9>
+          CANONICAL-INDUCTION-INC tp<%49> = add tp<%48>, tp<%0>
+          CANONICAL-INDUCTION-CMP tp<%64> = icmp tp<%49>, ir<%9>
+        }
+      }
+    }
+  }
+}
+}
+PatternHint: Generic
+Best cost: 1.073742e+00 transforms: 4

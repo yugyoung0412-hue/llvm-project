@@ -1,0 +1,90 @@
+TPlan '_ZL32ggml_compute_forward_mul_mat_f32PK11ggml_tensorS1_PS_' (depth=5) {
+Live-in ir<0>
+Live-in ir<%7>
+Live-in ir<%25>
+Live-in ir<%43>
+Live-in ir<%33>
+Live-in ir<%45>
+Live-in ir<%41>
+Live-in ir<%47>
+Live-in ir<1>
+Live-in ir<%17>
+Live-in ir<%5>
+Live-in ir<%23>
+Live-in ir<%31>
+Live-in ir<%39>
+Live-in ir<%15>
+Live-in ir<%29>
+Live-in ir<%37>
+Live-in ir<%13>
+Live-in ir<%21>
+Live-in ir<%35>
+Live-in ir<%96>
+Live-in ir<%11>
+Live-in ir<0>
+Live-in ir<%114>
+Live-in ir<%19>
+Live-in ir<%27>
+Live-in ir<%9>
+
+<x1> loop[0] (trip=(-1 + %17)) {
+  WIDEN-INDUCTION tp<%0> = phi ir<0>, tp<%1>
+  WIDEN tp<%2> = srem tp<%0>, ir<%7>
+  WIDEN tp<%3> = mul tp<%2>, ir<%25>
+  WIDEN-GEP tp<%4> = getelementptr ir<%43>, tp<%3>
+  WIDEN tp<%5> = mul tp<%0>, ir<%33>
+  WIDEN-GEP tp<%6> = getelementptr ir<%45>, tp<%5>
+  WIDEN tp<%7> = mul tp<%0>, ir<%41>
+  WIDEN-GEP tp<%8> = getelementptr ir<%47>, tp<%7>
+  WIDEN tp<%1> = add tp<%0>, ir<1>
+  WIDEN tp<%9> = icmp tp<%1>, ir<%17>
+  <x1> loop[1] (trip=(-1 + %15)) {
+    WIDEN-INDUCTION tp<%10> = phi ir<0>, tp<%11>
+    WIDEN tp<%12> = srem tp<%10>, ir<%5>
+    WIDEN tp<%13> = mul tp<%12>, ir<%23>
+    WIDEN-GEP tp<%14> = getelementptr tp<%4>, tp<%13>
+    WIDEN tp<%15> = mul tp<%10>, ir<%31>
+    WIDEN-GEP tp<%16> = getelementptr tp<%6>, tp<%15>
+    WIDEN tp<%17> = mul tp<%10>, ir<%39>
+    WIDEN-GEP tp<%18> = getelementptr tp<%8>, tp<%17>
+    WIDEN tp<%11> = add tp<%10>, ir<1>
+    WIDEN tp<%19> = icmp tp<%11>, ir<%15>
+    <x1> loop[2] (trip=(-1 + %13)) {
+      WIDEN-INDUCTION tp<%20> = phi ir<0>, tp<%21>
+      WIDEN tp<%22> = mul tp<%20>, ir<%29>
+      WIDEN tp<%23> = mul tp<%20>, ir<%37>
+      WIDEN-GEP tp<%24> = getelementptr tp<%16>, tp<%22>
+      WIDEN-GEP tp<%25> = getelementptr tp<%18>, tp<%23>
+      WIDEN tp<%21> = add tp<%20>, ir<1>
+      WIDEN tp<%26> = icmp tp<%21>, ir<%13>
+      <x1> loop[3] (trip=(-1 + %11)) {
+        WIDEN-INDUCTION tp<%27> = phi ir<0>, tp<%28>
+        WIDEN tp<%29> = mul tp<%27>, ir<%21>
+        WIDEN-GEP tp<%30> = getelementptr tp<%14>, tp<%29>
+        WIDEN tp<%31> = mul tp<%27>, ir<%35>
+        WIDEN-GEP tp<%32> = getelementptr tp<%25>, tp<%31>
+        WIDEN-CAST tp<%33> = bitcast tp<%32>
+        WIDEN store tp<%33>, ir<%96>
+        WIDEN tp<%28> = add tp<%27>, ir<1>
+        WIDEN tp<%34> = icmp tp<%28>, ir<%11>
+        <x1> loop[4] (trip=(-1 + %9)) {
+          WIDEN-INDUCTION tp<%35> = phi ir<0>, tp<%36>
+          WIDEN-REDUCTION-PHI tp<%37> = phi ir<0>, ir<%114>
+          WIDEN tp<%38> = mul tp<%35>, ir<%19>
+          WIDEN-GEP tp<%39> = getelementptr tp<%30>, tp<%38>
+          WIDEN-CAST tp<%40> = bitcast tp<%39>
+          WIDEN tp<%41> = load tp<%40>
+          WIDEN tp<%42> = mul tp<%35>, ir<%27>
+          WIDEN-GEP tp<%43> = getelementptr tp<%24>, tp<%42>
+          WIDEN-CAST tp<%44> = bitcast tp<%43>
+          WIDEN tp<%45> = load tp<%44>
+          WIDEN tp<%46> = fmul tp<%41>, tp<%45>
+          WIDEN tp<%47> = fadd tp<%37>, tp<%46>
+          WIDEN tp<%36> = add tp<%35>, ir<1>
+          WIDEN tp<%48> = icmp tp<%36>, ir<%9>
+        }
+      }
+    }
+  }
+}
+}

@@ -1,0 +1,21 @@
+ TinyPtrVector<T> is an LLVM ADT optimized for the common case of 0 or 1 element:
+
+  Storage layout:
+    0 elements → nullptr (no heap)
+    1 element  → T* directly (no heap, pointer stored inline)
+    2+ elements → SmallVector<T,4>* on heap
+
+  Internally it uses PointerUnion<T*, SmallVector<T,4>*> — so for the single-element case (which is every single-def recipe in TPlan), it's literally just a raw pointer. Zero overhead vs.
+  storing TPRecipeValue* directly.
+
+  VPlan uses it in VPDef because most recipes define exactly one value, but a few (like VPInterleaveRecipe) define multiple. The TinyPtrVector handles both without paying a size penalty for
+   the common case.
+
+  For TPlan's current 10 recipe types, all single-def cases would always use the inline-pointer path — so TinyPtrVector<TPRecipeValue*> is effectively identical in cost to TPRecipeValue*,
+  but future-proofs for multi-def recipes.
+
+  ---
+  So going back to the choice: since TinyPtrVector has zero overhead for the single-element case, there's no practical cost difference between Approach A (TinyPtrVector) and Approach B
+  (plain pointer). Approach A is the right call.
+
+  Shall I proceed with Approach A and start presenting the detailed design?
