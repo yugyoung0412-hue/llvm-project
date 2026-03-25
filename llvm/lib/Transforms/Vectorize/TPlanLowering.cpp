@@ -211,24 +211,36 @@ void TPWidenCastRecipe::execute(TPTransformState &State) const {
   auto *SrcDR = dyn_cast<TPSingleDefRecipe>(getOperand(0));
   Value *Src = SrcDR ? State.getValue(SrcDR) : nullptr;
   if (!Src) return;
-  Value *Result = State.Builder.Insert(CastInst->clone());
+  auto *Clone = CastInst->clone();
+  State.remapClone(Clone);
+  Value *Result = State.Builder.Insert(Clone);
   applyFlags(*cast<Instruction>(Result));
+  State.EmittedMap[CastInst] = Result;
   State.setValue(this, Result);
 }
 
 void TPWidenGEPRecipe::execute(TPTransformState &State) const {
-  Value *Result = State.Builder.Insert(GEPInst->clone());
+  auto *Clone = GEPInst->clone();
+  State.remapClone(Clone);
+  Value *Result = State.Builder.Insert(Clone);
   applyFlags(*cast<Instruction>(Result));
+  State.EmittedMap[GEPInst] = Result;
   State.setValue(this, Result);
 }
 
 void TPWidenLoadRecipe::execute(TPTransformState &State) const {
-  Value *Result = State.Builder.Insert(LoadInst->clone());
+  auto *Clone = LoadInst->clone();
+  State.remapClone(Clone);
+  Value *Result = State.Builder.Insert(Clone);
+  State.EmittedMap[LoadInst] = Result;
   State.setValue(this, Result);
 }
 
 void TPWidenStoreRecipe::execute(TPTransformState &State) const {
-  State.Builder.Insert(StoreInst->clone());
+  auto *Clone = StoreInst->clone();
+  State.remapClone(Clone);
+  State.Builder.Insert(Clone);
+  State.EmittedMap[StoreInst] = Clone;
 }
 
 void TPWidenRecipe::execute(TPTransformState &State) const {
@@ -250,8 +262,11 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
 
   case TensorOpKind::ElementWise:
   case TensorOpKind::Scalar: {
-    Value *Result = State.Builder.Insert(Inst->clone());
+    auto *Clone = Inst->clone();
+    State.remapClone(Clone);
+    Value *Result = State.Builder.Insert(Clone);
     applyFlags(*cast<Instruction>(Result));
+    State.EmittedMap[Inst] = Result;
     State.setValue(this, Result);
     return;
   }
@@ -260,8 +275,11 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
     // TODO: emit broadcast intrinsic. For now, clone scalar op.
     LLVM_DEBUG(dbgs() << "TPlanLowering: BroadcastBinary not yet implemented, "
                          "falling back to scalar clone\n");
-    Value *Result = State.Builder.Insert(Inst->clone());
+    auto *Clone = Inst->clone();
+    State.remapClone(Clone);
+    Value *Result = State.Builder.Insert(Clone);
     applyFlags(*cast<Instruction>(Result));
+    State.EmittedMap[Inst] = Result;
     State.setValue(this, Result);
     return;
   }
@@ -270,16 +288,22 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
     // TODO: emit outer product intrinsic. For now, clone scalar op.
     LLVM_DEBUG(dbgs() << "TPlanLowering: OuterProduct not yet implemented, "
                          "falling back to scalar clone\n");
-    Value *Result = State.Builder.Insert(Inst->clone());
+    auto *Clone = Inst->clone();
+    State.remapClone(Clone);
+    Value *Result = State.Builder.Insert(Clone);
     applyFlags(*cast<Instruction>(Result));
+    State.EmittedMap[Inst] = Result;
     State.setValue(this, Result);
     return;
   }
 
   case TensorOpKind::PlainReduction: {
     // Reduction update with no fuseable mul-like producer — clone as scalar.
-    Value *Result = State.Builder.Insert(Inst->clone());
+    auto *Clone = Inst->clone();
+    State.remapClone(Clone);
+    Value *Result = State.Builder.Insert(Clone);
     applyFlags(*cast<Instruction>(Result));
+    State.EmittedMap[Inst] = Result;
     State.setValue(this, Result);
     return;
   }

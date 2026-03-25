@@ -1342,11 +1342,28 @@ struct TPTransformState {
   const TPlan &Plan;
   const RecipeClassMap *ClassMap = nullptr;
   DenseMap<const TPRecipeValue *, Value *> ValueMap;
+  /// Maps each original IR instruction to the most recently emitted clone.
+  /// Used by remapClone() to fix intra-block operand dominance: when a recipe
+  /// clones an instruction whose operands were defined later in the same BB,
+  /// remapClone() replaces those operands with the already-emitted clones.
+  DenseMap<Value *, Value *> EmittedMap;
 
   TPTransformState(IRBuilder<> &B, const TPlan &P) : Builder(B), Plan(P) {}
 
   Value *getValue(const TPRecipeValue *V) const { return ValueMap.lookup(V); }
   void setValue(const TPRecipeValue *V, Value *IRV) { ValueMap[V] = IRV; }
+
+  /// For each operand of Clone that is an original IR instruction tracked in
+  /// EmittedMap, replaces it with the corresponding emitted clone. Call this
+  /// after Instruction::clone() and before Builder.Insert() to avoid
+  /// use-before-def when the original instruction appears later in the same BB.
+  void remapClone(Instruction *Clone) const {
+    for (unsigned I = 0, E = Clone->getNumOperands(); I != E; ++I) {
+      auto It = EmittedMap.find(Clone->getOperand(I));
+      if (It != EmittedMap.end())
+        Clone->setOperand(I, It->second);
+    }
+  }
 
   TensorOpKind getKind(const TPRecipeBase *R) const {
     if (!ClassMap) return TensorOpKind::Scalar;
