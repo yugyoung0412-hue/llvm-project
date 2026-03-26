@@ -171,6 +171,14 @@ SmallVector<unsigned> llvm::getTPValueShape(const TPSingleDefRecipe &V,
   return Shape;
 }
 
+SmallVector<uint64_t> llvm::getTPValueStrides(const TPSingleDefRecipe &V,
+                                               const TPlan &Plan) {
+  SmallVector<uint64_t> Strides;
+  for (int D = V.DimSet.find_first(); D >= 0; D = V.DimSet.find_next(D))
+    Strides.push_back(V.getMemStride(static_cast<unsigned>(D), Plan));
+  return Strides;
+}
+
 /// Collect all TPBasicBlock instances by recursively walking block successors
 /// and descending into TPRegionBlock interiors.
 static void collectBBs(TPBlockBase *Start,
