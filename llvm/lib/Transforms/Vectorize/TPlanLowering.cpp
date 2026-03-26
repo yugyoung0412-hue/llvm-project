@@ -25,12 +25,59 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
 
 #define DEBUG_TYPE "tplan-lower"
+
+//===----------------------------------------------------------------------===//
+// Intrinsic declaration helpers
+//===----------------------------------------------------------------------===//
+
+/// Returns (creating if needed) @llvm.tensor.matmul.<type>.
+/// Signature: void(ptr C, i64 M, i64 N, i64 ldc,
+///                 ptr A, i64 M, i64 K, i64 lda,
+///                 ptr B, i64 K, i64 N, i64 ldb)
+static FunctionCallee getTensorMatmulFn(Module &M, Type *ElemTy) {
+  LLVMContext &Ctx = M.getContext();
+  std::string Name = "llvm.tensor.matmul.";
+  Name += ElemTy->isFloatTy() ? "f32" : "f64";
+  Type *PtrTy = PointerType::getUnqual(Ctx);
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+  FunctionType *FT = FunctionType::get(
+      Type::getVoidTy(Ctx),
+      {PtrTy, I64Ty, I64Ty, I64Ty,
+       PtrTy, I64Ty, I64Ty, I64Ty,
+       PtrTy, I64Ty, I64Ty, I64Ty},
+      /*isVarArg=*/false);
+  return M.getOrInsertFunction(Name, FT);
+}
+
+/// Returns (creating if needed) @llvm.tensor.elementwise.<op>.<rank>d.<type>.
+/// Signature: void( (ptr, i64×Rank) × 3 tensors,  i64×Rank dims )
+static FunctionCallee getTensorElementwiseFn(Module &M, StringRef OpName,
+                                              unsigned Rank, Type *ElemTy) {
+  LLVMContext &Ctx = M.getContext();
+  std::string Name = "llvm.tensor.elementwise.";
+  Name += OpName.str();
+  Name += "." + std::to_string(Rank) + "d.";
+  Name += ElemTy->isFloatTy() ? "f32" : "f64";
+  Type *PtrTy = PointerType::getUnqual(Ctx);
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+  SmallVector<Type *> Params;
+  for (unsigned T = 0; T < 3; ++T) {
+    Params.push_back(PtrTy);
+    for (unsigned R = 0; R < Rank; ++R)
+      Params.push_back(I64Ty);
+  }
+  for (unsigned R = 0; R < Rank; ++R)
+    Params.push_back(I64Ty);
+  FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), Params, false);
+  return M.getOrInsertFunction(Name, FT);
+}
 
 //===----------------------------------------------------------------------===//
 // Stage-print helpers (unconditional; not gated by LLVM_DEBUG)
