@@ -185,15 +185,19 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   SmallVector<uint64_t>  RHSStrides = getTPValueStrides(*RHSDR, State.Plan);
 
   int ContractDim = State.getContractDim(ReductionUpdate);
-  if (ContractDim < 0) {
-    LLVM_DEBUG(dbgs() << "TPlanLowering: Contraction has no contract dim\n");
+  if (ContractDim < 0 ||
+      !LHSDR->DimSet.test(static_cast<unsigned>(ContractDim)) ||
+      !RHSDR->DimSet.test(static_cast<unsigned>(ContractDim))) {
+    LLVM_DEBUG(dbgs() << "TPlanLowering: Contraction dim not in operand DimSets\n");
     return nullptr;
   }
+  // findPos: returns position of Dim in DimSet iteration order (innermost-first).
+  // The guards above guarantee Dim is present, so the fallback 0 is never reached.
   auto findPos = [](const SmallBitVector &DS, int Dim) -> unsigned {
     unsigned Pos = 0;
     for (int D = DS.find_first(); D >= 0; D = DS.find_next(D), ++Pos)
       if (D == Dim) return Pos;
-    return 0;
+    return 0; // unreachable given caller's DimSet membership guard
   };
   unsigned LHSPos = findPos(LHSDR->DimSet, ContractDim);
   unsigned RHSPos = findPos(RHSDR->DimSet, ContractDim);
@@ -507,6 +511,8 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
       for (unsigned D : RHSShape) N *= D;
 
       // Store operand 0 is pointer, operand 1 is value.
+      // Primary: recipe-level user walk. Fallback: IR-level store users
+      // (same pattern as emitContraction, for stores in outer-loop latches).
       Value *CPtr = nullptr;
       if (auto *DefVal = this->getDefinedValue()) {
         for (TPUser *U : DefVal->users()) {
@@ -515,6 +521,18 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
           if (auto *SR = dyn_cast<TPWidenStoreRecipe>(RB)) {
             auto *PtrDR = dyn_cast<TPSingleDefRecipe>(SR->getOperand(0));
             if (PtrDR) CPtr = State.getValue(PtrDR);
+            break;
+          }
+        }
+      }
+      if (!CPtr) {
+        for (User *U : LHSLoad->getInstruction()->users()) {
+          if (auto *SI = dyn_cast<StoreInst>(U)) {
+            Value *Ptr = SI->getPointerOperand();
+            if (auto *GEP = dyn_cast<GetElementPtrInst>(Ptr))
+              CPtr = GEP->getPointerOperand();
+            else
+              CPtr = Ptr;
             break;
           }
         }

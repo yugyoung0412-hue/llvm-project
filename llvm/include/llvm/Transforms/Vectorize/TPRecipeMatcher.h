@@ -5,8 +5,8 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-/// Declares TPRecipePatternMatcher_match() and getTPValueShape().
-/// Requires TPlanWidener_widen() to have been called first.
+/// Declares TPRecipePatternMatcher_match(), getTPValueShape(), and
+/// getTPValueStrides(). Requires TPlanWidener_widen() to have been called first.
 //===----------------------------------------------------------------------===//
 #ifndef LLVM_TRANSFORMS_VECTORIZE_TRECIPEMATCHER_H
 #define LLVM_TRANSFORMS_VECTORIZE_TRECIPEMATCHER_H
@@ -25,8 +25,9 @@ SmallVector<unsigned> getTPValueShape(const TPSingleDefRecipe &V, const TPlan &P
 
 /// Returns the effective memory stride for each dim in V.DimSet (innermost
 /// first). Each entry is V.getMemStride(D, Plan): a recipe override if set,
-/// else the TPlan dense default. Only meaningful for load/store recipes;
-/// arithmetic recipes return dense defaults (which may be incorrect for them).
+/// else the TPlan dense default. Only meaningful for load recipes
+/// (TPWidenLoadRecipe); arithmetic recipes return dense defaults, which may
+/// differ from the actual memory strides and produce incorrect results.
 SmallVector<uint64_t> getTPValueStrides(const TPSingleDefRecipe &V,
                                          const TPlan &Plan);
 
