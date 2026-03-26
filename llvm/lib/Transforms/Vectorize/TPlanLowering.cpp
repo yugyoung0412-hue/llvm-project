@@ -210,6 +210,9 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
 
   // Locate the C accumulator pointer from the store recipe that consumes
   // the reduction result.
+  //
+  // Primary: walk recipe-level users of the ReductionUpdate defined value.
+  // This works when the store is in the same TPBasicBlock.
   Value *CPtr = nullptr;
   if (auto *DefVal = ReductionUpdate->getDefinedValue()) {
     for (TPUser *U : DefVal->users()) {
@@ -220,6 +223,25 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
         if (PtrDR)
           CPtr = State.getValue(PtrDR);
         break;
+      }
+    }
+  }
+  // Fallback: walk IR-level uses of the reduction result instruction.
+  // The store to C may be in a different block (e.g., the outer loop latch)
+  // and reference %sum as an IR live-in rather than a recipe TPUser.
+  // We trace through any GEP to the base pointer so the result always
+  // dominates the current insertion point.
+  if (!CPtr) {
+    if (auto *WR = dyn_cast<TPWidenRecipe>(ReductionUpdate)) {
+      for (User *U : WR->getInstruction()->users()) {
+        if (auto *SI = dyn_cast<StoreInst>(U)) {
+          Value *Ptr = SI->getPointerOperand();
+          if (auto *GEP = dyn_cast<GetElementPtrInst>(Ptr))
+            CPtr = GEP->getPointerOperand(); // base ptr (e.g. %C arg)
+          else
+            CPtr = Ptr;
+          break;
+        }
       }
     }
   }
@@ -392,7 +414,10 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
       SmallVector<unsigned>  Shape    = getTPValueShape(*ADR, State.Plan);
       SmallVector<uint64_t>  AStrides = getTPValueStrides(*ADR, State.Plan);
       SmallVector<uint64_t>  BStrides = getTPValueStrides(*BDR, State.Plan);
-      SmallVector<uint64_t>  CStrides = AStrides; // same DimSet for elementwise
+      // C shares the same DimSet as A/B in an elementwise op, so its dense
+      // strides match AStrides. Phase 1 does not yet populate MemStrides for C
+      // independently; when strided-C support is added, query the store recipe.
+      SmallVector<uint64_t>  CStrides = AStrides;
 
       Type *ElemTy = ALoad->getInstruction()->getType()->getScalarType();
       if (!ElemTy->isFloatTy() && !ElemTy->isDoubleTy()) return false;

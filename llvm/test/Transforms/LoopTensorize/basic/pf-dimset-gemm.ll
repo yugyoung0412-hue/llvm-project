@@ -45,6 +45,10 @@ inner.latch:
   br i1 %k.done, label %middle.latch, label %inner
 
 middle.latch:
+  %ci = mul i64 %i, %N
+  %cij = add i64 %ci, %j
+  %cptr = getelementptr float, ptr %C, i64 %cij
+  store float %sum, ptr %cptr, align 4
   %j.next = add nuw nsw i64 %j, 1
   %j.done = icmp eq i64 %j.next, %N
   br i1 %j.done, label %outer.latch, label %middle
