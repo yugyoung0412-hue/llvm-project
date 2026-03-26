@@ -711,6 +711,18 @@ public:
   /// Loop dim indices this value spans; set by TPlanWidener_widen().
   SmallBitVector DimSet;
 
+  /// Per-dim memory stride overrides (load/store recipes only).
+  /// Key: dim index (innermost=0). Value: stride in elements.
+  /// Absent entry → use Plan.getDenseStrideForDim(D).
+  /// Phase 1: always empty; SCEV-based population is future work.
+  /// Note: spec uses TPValue* for dynamic strides; uint64_t is a deliberate
+  /// Phase 1 scope reduction.
+  DenseMap<unsigned, uint64_t> MemStrides;
+
+  /// Returns the effective memory stride for \p Dim.
+  /// Returns MemStrides[Dim] if set, else Plan.getDenseStrideForDim(Dim).
+  uint64_t getMemStride(unsigned Dim, const TPlan &Plan) const;
+
   void printAsOperand(raw_ostream &OS, TPSlotTracker &Tracker) const override;
 
   static bool classof(const TPRecipeBase *R) {
@@ -1399,6 +1411,15 @@ struct TPTransformState {
     return It != ClassMap->end() ? It->second.FusedMulRecipe : nullptr;
   }
 };
+
+//===----------------------------------------------------------------------===//
+// Inline definitions requiring complete TPlan
+//===----------------------------------------------------------------------===//
+inline uint64_t TPSingleDefRecipe::getMemStride(unsigned Dim,
+                                               const TPlan &Plan) const {
+  auto It = MemStrides.find(Dim);
+  return It != MemStrides.end() ? It->second : Plan.getDenseStrideForDim(Dim);
+}
 
 /// Propagates DimSets from induction variables through the def-use graph
 /// using BFS with union rule. Must be called before TPRecipePatternMatcher_match().
