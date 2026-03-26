@@ -138,7 +138,7 @@ static void printClassificationSummary(const TPlan &Plan,
 }
 
 //===----------------------------------------------------------------------===//
-// Helper: emit @llvm.matrix.multiply for a Contraction reduction
+// Helper: emit @llvm.tensor.matmul for a Contraction reduction
 //===----------------------------------------------------------------------===//
 
 static Value *emitContraction(const TPRecipeBase *FusedMul,
@@ -151,24 +151,39 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   auto *RHSDR = dyn_cast<TPSingleDefRecipe>(FusedMul->getOperand(1));
   if (!LHSDR || !RHSDR)
     return nullptr;
-
-  // Dimension safety: require exactly 2D operands.
   if (LHSDR->DimSet.count() != 2 || RHSDR->DimSet.count() != 2) {
-    LLVM_DEBUG(dbgs() << "TPlanLowering: Contraction requires 2D operands, "
-                         "falling back to scalar clone\n");
+    LLVM_DEBUG(dbgs() << "TPlanLowering: Contraction requires 2D operands\n");
     return nullptr;
   }
 
-  Value *LHS = State.getValue(LHSDR);
-  Value *RHS = State.getValue(RHSDR);
-  if (!LHS || !RHS) return nullptr;
+  // The LHS/RHS recipes are load recipes; we need their pointer operands for
+  // the @llvm.tensor.matmul intrinsic (ptr-based API).
+  auto *LHSLoad = dyn_cast<TPWidenLoadRecipe>(LHSDR);
+  auto *RHSLoad = dyn_cast<TPWidenLoadRecipe>(RHSDR);
+  if (!LHSLoad || !RHSLoad)
+    return nullptr;
 
-  SmallVector<unsigned> LHSShape = getTPValueShape(*LHSDR, State.Plan);
-  SmallVector<unsigned> RHSShape = getTPValueShape(*RHSDR, State.Plan);
+  auto *LHSPtrDR = dyn_cast<TPSingleDefRecipe>(LHSLoad->getOperand(0));
+  auto *RHSPtrDR = dyn_cast<TPSingleDefRecipe>(RHSLoad->getOperand(0));
+  if (!LHSPtrDR || !RHSPtrDR)
+    return nullptr;
+
+  Value *LHSPtr = State.getValue(LHSPtrDR);
+  Value *RHSPtr = State.getValue(RHSPtrDR);
+  if (!LHSPtr || !RHSPtr)
+    return nullptr;
+
+  // Determine element type from the load instruction.
+  Type *ElemTy = LHSLoad->getInstruction()->getType();
+  if (!ElemTy->isFloatTy() && !ElemTy->isDoubleTy())
+    return nullptr;
+
+  SmallVector<unsigned>  LHSShape   = getTPValueShape(*LHSDR, State.Plan);
+  SmallVector<unsigned>  RHSShape   = getTPValueShape(*RHSDR, State.Plan);
+  SmallVector<uint64_t>  LHSStrides = getTPValueStrides(*LHSDR, State.Plan);
+  SmallVector<uint64_t>  RHSStrides = getTPValueStrides(*RHSDR, State.Plan);
 
   int ContractDim = State.getContractDim(ReductionUpdate);
-
-  // Find position of ContractDim in each operand's sorted DimSet.
   auto findPos = [](const SmallBitVector &DS, int Dim) -> unsigned {
     unsigned Pos = 0;
     for (int D = DS.find_first(); D >= 0; D = DS.find_next(D), ++Pos)
@@ -177,43 +192,45 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   };
   unsigned LHSPos = findPos(LHSDR->DimSet, ContractDim);
   unsigned RHSPos = findPos(RHSDR->DimSet, ContractDim);
-  unsigned M = LHSShape[1 - LHSPos];
-  unsigned K = LHSShape[LHSPos];
-  unsigned N = RHSShape[1 - RHSPos];
 
-  // Ensure operands are flat FixedVectorType as required by the intrinsic.
-  Type *ElemTy = LHS->getType()->getScalarType();
+  uint64_t M = LHSShape[1 - LHSPos];
+  uint64_t K = LHSShape[LHSPos];
+  uint64_t N = RHSShape[1 - RHSPos];
+  // lda/ldb: leading dimension = stride of the outermost dim (last in
+  // innermost-first DimSet order), regardless of where K sits.
+  uint64_t LDA = LHSStrides.back();
+  uint64_t LDB = RHSStrides.back();
+  uint64_t LDC = State.Plan.getDenseStrideForDim(
+      static_cast<unsigned>(LHSDR->DimSet.find_last()) + 1u);
 
-  // Guard: if LHS/RHS are still scalar IR values (not yet tiled into vectors),
-  // a bitcast to <M*K x elem> would be invalid because the bit widths differ.
-  // Fall back to a 1×1×1 matrix multiply so the intrinsic is still emitted and
-  // downstream passes see the pattern, but we don't assert on an illegal cast.
-  uint64_t LHSBits = LHS->getType()->getPrimitiveSizeInBits();
-  uint64_t ElemBits = ElemTy->getPrimitiveSizeInBits();
-  if (ElemBits == 0 || LHSBits != ElemBits * (uint64_t)(M * K))
-    M = K = N = 1;
+  // Locate the C accumulator pointer from the store recipe that consumes
+  // the reduction result.
+  Value *CPtr = nullptr;
+  if (auto *DefVal = ReductionUpdate->getDefinedValue()) {
+    for (TPUser *U : DefVal->users()) {
+      auto *RB = dyn_cast<TPRecipeBase>(U);
+      if (!RB) continue;
+      if (auto *SR = dyn_cast<TPWidenStoreRecipe>(RB)) {
+        auto *PtrDR = dyn_cast<TPSingleDefRecipe>(SR->getOperand(0));
+        if (PtrDR)
+          CPtr = State.getValue(PtrDR);
+        break;
+      }
+    }
+  }
+  if (!CPtr)
+    CPtr = Constant::getNullValue(PointerType::getUnqual(
+        State.Builder.getContext()));
 
-  auto ensureFlat = [&](Value *V, unsigned Elems) -> Value * {
-    Type *FlatTy = FixedVectorType::get(ElemTy, Elems);
-    if (V->getType() != FlatTy)
-      return State.Builder.CreateBitCast(V, FlatTy);
-    return V;
-  };
-  LHS = ensureFlat(LHS, M * K);
-  RHS = ensureFlat(RHS, K * N);
+  Module *Mod = State.Builder.GetInsertBlock()->getModule();
+  auto MatmulFn = getTensorMatmulFn(*Mod, ElemTy);
+  IRBuilder<> &B = State.Builder;
+  auto I64 = [&](uint64_t V) -> Value * { return B.getInt64(V); };
 
-  // Emit @llvm.matrix.multiply(LHS, RHS, M, K, N)
-  Type *ResTy = FixedVectorType::get(ElemTy, M * N);
-  Function *MatMulFn = Intrinsic::getOrInsertDeclaration(
-      State.Builder.GetInsertBlock()->getModule(),
-      Intrinsic::matrix_multiply,
-      {ResTy, LHS->getType(), RHS->getType()});
-  return State.Builder.CreateCall(
-      MatMulFn,
-      {LHS, RHS,
-       State.Builder.getInt32(M),
-       State.Builder.getInt32(K),
-       State.Builder.getInt32(N)});
+  return B.CreateCall(MatmulFn,
+      {CPtr,    I64(M), I64(N), I64(LDC),
+       LHSPtr,  I64(M), I64(K), I64(LDA),
+       RHSPtr,  I64(K), I64(N), I64(LDB)});
 }
 
 //===----------------------------------------------------------------------===//
