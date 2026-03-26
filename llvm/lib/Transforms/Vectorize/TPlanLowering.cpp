@@ -173,8 +173,9 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   if (!LHSPtr || !RHSPtr)
     return nullptr;
 
-  // Determine element type from the load instruction.
-  Type *ElemTy = LHSLoad->getInstruction()->getType();
+  // Determine element type from the load instruction. Use getScalarType() to
+  // handle both scalar (load float) and vector (load <N x float>) loads.
+  Type *ElemTy = LHSLoad->getInstruction()->getType()->getScalarType();
   if (!ElemTy->isFloatTy() && !ElemTy->isDoubleTy())
     return nullptr;
 
@@ -184,6 +185,10 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   SmallVector<uint64_t>  RHSStrides = getTPValueStrides(*RHSDR, State.Plan);
 
   int ContractDim = State.getContractDim(ReductionUpdate);
+  if (ContractDim < 0) {
+    LLVM_DEBUG(dbgs() << "TPlanLowering: Contraction has no contract dim\n");
+    return nullptr;
+  }
   auto findPos = [](const SmallBitVector &DS, int Dim) -> unsigned {
     unsigned Pos = 0;
     for (int D = DS.find_first(); D >= 0; D = DS.find_next(D), ++Pos)
@@ -218,9 +223,10 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
       }
     }
   }
-  if (!CPtr)
-    CPtr = Constant::getNullValue(PointerType::getUnqual(
-        State.Builder.getContext()));
+  if (!CPtr) {
+    LLVM_DEBUG(dbgs() << "TPlanLowering: Contraction cannot find C pointer\n");
+    return nullptr;
+  }
 
   Module *Mod = State.Builder.GetInsertBlock()->getModule();
   auto MatmulFn = getTensorMatmulFn(*Mod, ElemTy);
@@ -392,15 +398,19 @@ bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
                                 ScalarEvolution &SE, DominatorTree &DT) {
   // 1. Propagate DimSets via BFS.
   TPlanWidener_widen(Plan);
-  errs() << "\n=== Stage 2: After Widening (DimSets propagated) ===\n";
-  Plan.print(errs());
+  LLVM_DEBUG({
+    dbgs() << "\n=== Stage 2: After Widening (DimSets propagated) ===\n";
+    Plan.print(dbgs());
+  });
 
   // 2. Classify every recipe by DimSet patterns.
   RecipeClassMap CM;
   TPRecipePatternMatcher_match(Plan, CM);
-  errs() << "\n=== Stage 3: After Pattern Matching (recipe classifications) ===\n";
-  Plan.print(errs());
-  printClassificationSummary(Plan, CM, errs());
+  LLVM_DEBUG({
+    dbgs() << "\n=== Stage 3: After Pattern Matching (recipe classifications) ===\n";
+    Plan.print(dbgs());
+    printClassificationSummary(Plan, CM, dbgs());
+  });
 
   // 3. Lower: walk block CFG in construction order.
   IRBuilder<> Builder(F.getContext());
