@@ -1,0 +1,455 @@
+TPlan DimSet System: Motivation, Design, and Pipeline
+======================================================
+Technical Delivery Document — LoopTensorizeByClaude Branch
+Date: 2026-03-26
+
+TPlan is the compiler IR used by LoopTensorize to transform scalar nested-loop
+nests into tensor operations. This document covers the motivation and design
+goals behind the DimSet annotation and the per-dimension Parallelism Factor
+(PF), and walks through how both are built and consumed across the full
+four-stage TPlan pipeline.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. MOTIVATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A loop nest of depth D has D induction variables (IVs). Each IV drives a
+distinct dimension of iteration. Values computed inside the loop body may
+depend on one, several, or all of these IVs — and that dependency pattern
+determines what tensor operation the value represents.
+
+Consider a depth-2 loop computing a matrix multiply:
+
+    for i in range(M):          // dim 0 — output row
+      for k in range(K):        // dim 1 — contraction (reduction)
+        acc += A[i][k] * B[k]   // load A varies over {dim0, dim1}
+                                 // load B varies over {dim1}
+                                 // fmul operands share dim1 => contraction
+
+Without knowing which dimensions each value spans, every value looks scalar
+to the compiler. The compiler cannot distinguish an elementwise broadcast
+from an outer product from a contraction. It has no basis for choosing
+@llvm.matrix.multiply over a scalar clone.
+
+Two questions must be answered for every value in the plan:
+
+  Q1 (shape):  Which loop dimensions does this value span?
+  Q2 (size):   How many scalar iterations are tiled per dimension?
+
+DimSet answers Q1. The Parallelism Factor (PF) answers Q2.
+
+Without DimSet, pattern matching (Stage 3) is impossible.
+Without PF, code generation (Stage 4) cannot determine the M×K×N tile sizes
+required by @llvm.matrix.multiply.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. DESIGN GOALS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DimSet and PF were designed to satisfy the following requirements:
+
+  G1. Single injection point.
+      DimSet is seeded only at induction-variable recipes. Every other value
+      derives its dimensionality by data-flow propagation. This keeps the
+      annotation consistent with the actual def-use graph.
+
+  G2. Monotonic, terminating propagation.
+      DimSet bits are only ever added (|=), never removed. Combined with an
+      upper bound of D bits per value (the loop nest depth), BFS propagation
+      is guaranteed to reach a fixpoint in O(D × |recipes|) steps.
+
+  G3. Reduction accumulators are excluded.
+      TPReductionPHIRecipe carries a scalar running sum, not a tensor tile.
+      It is intentionally seeded with DimSet={} so it does not pollute the
+      data-flow graph with spurious dimension bits.
+
+  G4. PF is independent and per-dimension.
+      Each loop dimension gets its own PF value. PF[D] can be set to any
+      positive integer by LoopTensorize before lowering, independently of
+      other dimensions. Default is 1 (no tiling).
+
+  G5. DimSet drives shape; PF drives size.
+      getTPValueShape() combines both: it iterates over the set bits in a
+      value's DimSet and looks up PF[D] for each, producing the ordered
+      shape vector used as M, K, N arguments to matrix.multiply.
+
+  G6. Canonical IVs count by PF; user-visible IVs count by 1.
+      The canonical IV (tile counter) uses PF[D] as its step and controls
+      the outer tile loop. The widen-induction IV (user-visible) still
+      steps by 1 in the scalar domain and is what seeds DimSet={D}.
+      These two IVs are distinct and serve different purposes.
+
+  G7. The contract between stages is explicit.
+      Stage 2 writes DimSet. Stage 3 reads DimSet and writes RecipeClassMap.
+      Stage 4 reads RecipeClassMap and DimPFMap. Each stage has a single,
+      well-defined input and output, enabling independent testing.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. TPLAN PIPELINE DIAGRAM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  IR (LLVM Function with nested loops)
+        |
+        | LoopNestAnalyzer: discovers loop order, IVs,
+        |   trip counts, ReductionDims
+        v
+  +------------------------------------------------------------------+
+  | Stage 1: TPlan::buildInitial()           [TPlan.cpp]            |
+  |                                                                  |
+  |  For each loop dim D:                                            |
+  |    - Emit TPCanonicalIVRecipe             (tile counter)         |
+  |    - Emit TPWidenInductionRecipe          (user IV, step=1)      |
+  |    - Emit TPReductionPHIRecipe            (if reduction)         |
+  |    - Create TPSymbolicValue PF[D]         (step of canonical IV) |
+  |  For each non-PHI instruction:                                   |
+  |    - Emit TPWidenRecipe / TPWidenGEPRecipe / TPWidenLoadRecipe   |
+  |      / TPWidenStoreRecipe / TPWidenCastRecipe                    |
+  |                                                                  |
+  |  ALL DimSet fields are EMPTY at this point.                      |
+  +------------------------------------------------------------------+
+        |
+        | print: "=== Stage 1: Initial TPlan ==="
+        v
+  +------------------------------------------------------------------+
+  | Stage 2: TPlanWidener_widen()            [TPlanWidener.cpp]     |
+  |                                                                  |
+  |  Phase 1 — Seed:                                                 |
+  |    for each TPWidenInductionRecipe at dim D:                     |
+  |        recipe.DimSet = {D}                                       |
+  |    (TPReductionPHIRecipe intentionally left empty)               |
+  |                                                                  |
+  |  Phase 2 — BFS union propagation to fixpoint:                   |
+  |    while worklist not empty:                                     |
+  |        V = pop()                                                 |
+  |        for each user U defining DV:                              |
+  |            DV.DimSet |= V.DimSet                                 |
+  |            if DV.DimSet grew: push DV                           |
+  |                                                                  |
+  |  Terminates because DimSet is monotonically non-decreasing       |
+  |  and bounded by D bits (loop nest depth).                        |
+  +------------------------------------------------------------------+
+        |
+        | print: "=== Stage 2: After Widening (DimSets propagated) ==="
+        v
+  +------------------------------------------------------------------+
+  | Stage 3: TPRecipePatternMatcher_match()  [TPRecipeMatcher.cpp]  |
+  |                                                                  |
+  |  Reads DimSet of each recipe's operands; writes RecipeClassMap:  |
+  |                                                                  |
+  |    DimSet(A) == {}                 =>  Scalar                    |
+  |    DimSet(A) == DimSet(B)          =>  ElementWise               |
+  |    DimSet(A) ⊂ DimSet(B)  (or B⊂A) =>  BroadcastBinary           |
+  |    DimSet(A) ∩ DimSet(B) == {}    =>  OuterProduct               |
+  |    reduction update where fused fmul has shared dim              |
+  |        in ReductionDims            =>  Contraction(contractDim)  |
+  |    reduction update, no fmul       =>  PlainReduction            |
+  +------------------------------------------------------------------+
+        |
+        | print: "=== Stage 3: After Pattern Matching ==="
+        v
+  +------------------------------------------------------------------+
+  | Stage 4: execute() — TPlanLowering_lower()  [TPlanLowering.cpp] |
+  |                                                                  |
+  |  Walk CFG in construction order; dispatch by RecipeClassMap:     |
+  |                                                                  |
+  |    Contraction    ->  getTPValueShape() yields {M, K} / {K, N}   |
+  |                       emit @llvm.matrix.multiply(LHS,RHS,M,K,N)  |
+  |    ElementWise    ->  (TODO: elementwise vector intrinsic)        |
+  |    BroadcastBin.  ->  (TODO: broadcast intrinsic)                |
+  |    OuterProduct   ->  (TODO: outer-product intrinsic)            |
+  |    Scalar / PHI   ->  clone original IR instruction              |
+  |    Load/Store/GEP ->  clone original IR instruction              |
+  +------------------------------------------------------------------+
+        |
+        v
+  IR (transformed Function — tensor intrinsics inserted)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. PER-STAGE NARRATIVE AND CODE SNAPSHOTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+────────────────────────────────────────────────────────
+4.1  Stage 1 — buildInitial(): Constructing the TPlan
+────────────────────────────────────────────────────────
+
+buildInitial() walks the LoopNestInfo and produces a TPlan CFG that mirrors
+the original loop nest structure. Its two DimSet/PF-relevant responsibilities
+are (a) allocating one symbolic PF value per dimension, and (b) emitting the
+per-loop IV recipes that will later seed DimSet propagation.
+
+Each PF[D] is a TPSymbolicValue — an IR-less synthetic live-in used only as
+the step operand of the canonical IV increment recipe for that dimension.
+
+  // llvm/lib/Transforms/Vectorize/TPlan.cpp : TPlan::buildInitial()
+
+  // Create one synthetic PF value per loop dimension.
+  for (unsigned D = 0; D < P.Depth; ++D)
+    P.DimPFs.push_back(
+        std::make_unique<TPSymbolicValue>("PF[" + std::to_string(D) + "]"));
+
+The canonical IV increment is then constructed with PF[D] as its step,
+establishing that the tile counter advances by PF[D] iterations per step:
+
+  // TPlan.cpp : inside the per-loop region construction loop
+
+  auto *IncrRecipe =
+      new TPCanonicalIVIncrRecipe(CanonIV, P.DimPFs[Idx].get());
+  LatchBB->appendRecipe(IncrRecipe);
+  CanonIV->setOperand(1, IncrRecipe);
+
+At this point all DimSet fields on all recipes are empty. The TPlan is a
+structural skeleton without dimensionality information.
+
+The PF values are declared in the TPlan class as:
+
+  // llvm/include/llvm/Transforms/Vectorize/TPlan.h : TPlan (private fields)
+
+  SmallVector<std::unique_ptr<TPSymbolicValue>> DimPFs; ///< PF[0]…PF[Depth-1]
+  SmallBitVector ReductionDims;              ///< Dims not in any store IndexExpr.
+  DenseMap<unsigned, unsigned> DimPFMap;     ///< dim index -> parallel factor.
+
+getPFForDim() and setDimPF() are the only external API for reading and writing
+concrete PF values. LoopTensorize calls setDimPF() before lowering:
+
+  // llvm/include/llvm/Transforms/Vectorize/TPlan.h
+
+  unsigned getPFForDim(unsigned Dim) const {
+    auto It = DimPFMap.find(Dim);
+    return It != DimPFMap.end() ? It->second : 1u;
+  }
+  void setDimPF(unsigned Dim, unsigned PF) { DimPFMap[Dim] = PF; }
+
+
+────────────────────────────────────────────────────────
+4.2  Stage 2 — TPlanWidener_widen(): DimSet Propagation
+────────────────────────────────────────────────────────
+
+This stage answers the question "which loop dimensions does each value span?"
+by injecting dimensionality at IV recipes and propagating it forward through
+the def-use graph via BFS.
+
+DimSet is a SmallBitVector field on TPSingleDefRecipe — the base class for
+every recipe that produces exactly one SSA value:
+
+  // llvm/include/llvm/Transforms/Vectorize/TPlan.h : TPSingleDefRecipe
+
+  class TPSingleDefRecipe : public TPRecipeBase, public TPRecipeValue {
+  public:
+    /// Loop dim indices this value spans; set by TPlanWidener_widen().
+    SmallBitVector DimSet;
+    ...
+  };
+
+The full propagation algorithm in TPlanWidener.cpp:
+
+  // llvm/lib/Transforms/Vectorize/TPlanWidener.cpp : TPlanWidener_widen()
+
+  SmallVector<TPSingleDefRecipe *, 32> Worklist;
+
+  // Phase 1: Seed from TPWidenInductionRecipe.
+  for (TPBasicBlock *BB : AllBBs) {
+    for (TPRecipeBase &R : *BB) {
+      if (auto *WI = dyn_cast<TPWidenInductionRecipe>(&R)) {
+        unsigned Dim = WI->getDimIndex();
+        WI->DimSet.resize(std::max(WI->DimSet.size(), (size_t)(Dim + 1)));
+        WI->DimSet.set(Dim);
+        Worklist.push_back(WI);
+      }
+    }
+  }
+
+  // Phase 2: BFS union propagation to fixpoint.
+  // A DV may be re-enqueued whenever its DimSet gains new bits. Termination
+  // is guaranteed because DimSet is monotonically non-decreasing and bounded
+  // by the loop nest depth (at most Depth bits per DV).
+  while (!Worklist.empty()) {
+    TPSingleDefRecipe *V = Worklist.pop_back_val();
+    for (TPUser *U : V->users()) {
+      auto *Recipe = dyn_cast<TPRecipeBase>(U);
+      if (!Recipe) continue;
+      TPSingleDefRecipe *DV = Recipe->getDefinedValue();
+      if (!DV) continue;
+      unsigned NeedSize = V->DimSet.size();
+      if (DV->DimSet.size() < NeedSize)
+        DV->DimSet.resize(NeedSize);
+      SmallBitVector Before = DV->DimSet;
+      DV->DimSet |= V->DimSet;
+      if (DV->DimSet != Before)
+        Worklist.push_back(DV);
+    }
+  }
+
+Key observation: TPReductionPHIRecipe is never seeded and never participates
+as a DimSet source in the BFS. It holds a scalar accumulated value (the
+running sum of a reduction) and must not contribute dimension bits to the
+arithmetic operations that update it — that would misclassify the reduction
+update as ElementWise instead of Contraction.
+
+After Stage 2, every value in the plan carries an accurate DimSet. For
+example in a depth-5 ggml mul_mat kernel:
+  - IV at dim 4 (innermost):         DimSet = {4}
+  - GEP with base from dim 1,
+    offset from dim 3:               DimSet = {1,3}
+  - fmul of two loaded values both
+    varying over dim 4:              DimSet = {4}
+
+
+────────────────────────────────────────────────────────
+4.3  Stage 3 — TPRecipePatternMatcher_match(): Classification
+────────────────────────────────────────────────────────
+
+Stage 3 reads the DimSet annotations written by Stage 2 and classifies each
+recipe as one of six TensorOpKind values defined in TPlanTypes.h:
+
+  // llvm/include/llvm/Transforms/Vectorize/TPlanTypes.h
+
+  enum class TensorOpKind {
+    Scalar,           ///< DimSet empty — scalar op, no tensor parallelism
+    ElementWise,      ///< Binary op, both operand DimSets equal
+    BroadcastBinary,  ///< Binary op, one DimSet is strict subset of the other
+    OuterProduct,     ///< Binary op, operand DimSets are disjoint
+    Contraction,      ///< Reduction update of mul-like op sharing a reduction dim
+    PlainReduction,   ///< Reduction update with no fuseable mul-like producer
+  };
+
+The binary op classifier (non-reductions):
+
+  // llvm/lib/Transforms/Vectorize/TPRecipeMatcher.cpp : classifyBinaryOp()
+
+  const SmallBitVector &D0 = getDimSet(R.getOperand(0));
+  const SmallBitVector &D1 = getDimSet(R.getOperand(1));
+
+  if (D0.none() && D1.none())
+    return TensorOpKind::Scalar;
+
+  SmallBitVector A = D0, B = D1;
+  A.resize(N); B.resize(N);
+
+  if (A == B)
+    return TensorOpKind::ElementWise;
+
+  SmallBitVector Intersection = A;
+  Intersection &= B;
+  if (Intersection == A) return TensorOpKind::BroadcastBinary; // A ⊆ B
+  if (Intersection == B) return TensorOpKind::BroadcastBinary; // B ⊆ A
+
+  if (Intersection.none())
+    return TensorOpKind::OuterProduct;
+
+For contraction detection, the classifier checks whether a reduction update's
+non-PHI input is a mul-like recipe whose operands share a dimension that is
+also in ReductionDims:
+
+  // llvm/lib/Transforms/Vectorize/TPRecipeMatcher.cpp : classifyReduction()
+
+  SmallBitVector SharedFinal = D0;
+  SharedFinal.resize(N);
+  SmallBitVector D1r = D1; D1r.resize(N);
+  SharedFinal &= D1r;       // Shared = DimSet(lhs) & DimSet(rhs)
+
+  SmallBitVector RD = Plan.getReductionDims();
+  RD.resize(N);
+  SharedFinal &= RD;        // Shared & ReductionDims
+
+  if (SharedFinal.any()) {
+    int ContractDim = SharedFinal.find_first();
+    return {TensorOpKind::Contraction, ContractDim,
+            const_cast<TPRecipeBase *>(Producer)};
+  }
+
+The result of Stage 3 is a RecipeClassMap (DenseMap<recipe*, classification>)
+passed to the lowering stage. The classification carries the ContractDim index
+and a pointer to the fused mul recipe so that Stage 4 does not need to
+re-discover them.
+
+
+────────────────────────────────────────────────────────
+4.4  Stage 4 — execute(): Code Generation
+────────────────────────────────────────────────────────
+
+Stage 4 reads both the RecipeClassMap from Stage 3 and the DimPFMap populated
+by LoopTensorize, and emits LLVM IR.
+
+The bridge between DimSet and the matrix intrinsic is getTPValueShape():
+
+  // llvm/lib/Transforms/Vectorize/TPRecipeMatcher.cpp : getTPValueShape()
+
+  SmallVector<unsigned> llvm::getTPValueShape(const TPSingleDefRecipe &V,
+                                               const TPlan &Plan) {
+    SmallVector<unsigned> Shape;
+    for (int D = V.DimSet.find_first(); D >= 0; D = V.DimSet.find_next(D))
+      Shape.push_back(Plan.getPFForDim(static_cast<unsigned>(D)));
+    return Shape;
+  }
+
+For a value with DimSet={1,3} and PF[1]=4, PF[3]=8, this returns {4,8},
+meaning the value represents a 4×8 tile. This shape determines M, K, N for
+matrix.multiply.
+
+The contraction emitter:
+
+  // llvm/lib/Transforms/Vectorize/TPlanLowering.cpp : emitContraction()
+
+  SmallVector<unsigned> LHSShape = getTPValueShape(*LHSDR, State.Plan);
+  SmallVector<unsigned> RHSShape = getTPValueShape(*RHSDR, State.Plan);
+
+  int ContractDim = State.getContractDim(ReductionUpdate);
+
+  // Find position of ContractDim in each operand's sorted DimSet.
+  unsigned LHSPos = findPos(LHSDR->DimSet, ContractDim);
+  unsigned RHSPos = findPos(RHSDR->DimSet, ContractDim);
+  unsigned M = LHSShape[1 - LHSPos];
+  unsigned K = LHSShape[LHSPos];
+  unsigned N = RHSShape[1 - RHSPos];
+
+  // Emit @llvm.matrix.multiply(LHS, RHS, M, K, N)
+  Type *ResTy = FixedVectorType::get(ElemTy, M * N);
+  Function *MatMulFn = Intrinsic::getOrInsertDeclaration(
+      State.Builder.GetInsertBlock()->getModule(),
+      Intrinsic::matrix_multiply,
+      {ResTy, LHS->getType(), RHS->getType()});
+  return State.Builder.CreateCall(
+      MatMulFn,
+      {LHS, RHS,
+       State.Builder.getInt32(M),
+       State.Builder.getInt32(K),
+       State.Builder.getInt32(N)});
+
+ContractDim identifies the K dimension (the shared reduction axis). LHSPos
+and RHSPos locate where K sits in each operand's shape vector, allowing M and
+N (the non-contracted dimensions) to be extracted at the opposite positions.
+
+Non-contraction recipes fall back to scalar clones of the original instruction
+in the current implementation. BroadcastBinary, OuterProduct, and ElementWise
+are annotated as TODO for dedicated vector intrinsics.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DimSet and PF together solve the core problem of extracting tensor semantics
+from a plain scalar loop nest without any source-level annotations.
+
+DimSet is injected once — at IV recipes — and propagates automatically through
+the def-use graph. By the end of Stage 2, every value in the plan knows which
+loop dimensions it spans. Stage 3 converts that knowledge into a classification
+(Scalar, ElementWise, BroadcastBinary, OuterProduct, Contraction, or
+PlainReduction) by comparing operand DimSets and intersecting with
+ReductionDims. Stage 4 uses getTPValueShape() to convert each value's DimSet
+into a concrete shape vector by substituting PF[D] for each set bit, then
+passes those shapes directly to @llvm.matrix.multiply.
+
+The two IVs per dimension — the widen-induction IV (step=1, seeds DimSet) and
+the canonical IV (step=PF[D], drives the tile loop) — are distinct by design.
+The widen-induction IV is the dimensionality carrier. The canonical IV is the
+loop-control mechanism. Neither role can be collapsed into the other without
+breaking either the BFS propagation invariants or the tile-loop structure.
+
+The result is a compiler pass that can identify and emit a tiled matrix
+multiply from a deeply nested scalar loop with no changes to the source IR,
+driven entirely by the structure of loop induction variables and data-flow.
