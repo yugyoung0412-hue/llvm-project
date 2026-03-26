@@ -340,7 +340,91 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
     return;
   }
 
-  case TensorOpKind::ElementWise:
+  case TensorOpKind::ElementWise: {
+    auto tryVectorize = [&]() -> bool {
+      auto *ADR = dyn_cast<TPSingleDefRecipe>(getOperand(0));
+      auto *BDR = dyn_cast<TPSingleDefRecipe>(getOperand(1));
+      if (!ADR || !BDR) return false;
+
+      unsigned Rank = ADR->DimSet.count();
+      if (Rank < 1 || Rank > 3) return false; // TODO: support rank > 3
+
+      // Determine op name from the BinaryOperator opcode.
+      StringRef OpName;
+      if (auto *BO = dyn_cast<BinaryOperator>(Inst)) {
+        switch (BO->getOpcode()) {
+        case Instruction::FAdd: OpName = "fadd"; break;
+        case Instruction::FSub: OpName = "fsub"; break;
+        case Instruction::FMul: OpName = "fmul"; break;
+        default: return false;
+        }
+      } else {
+        return false;
+      }
+
+      // Get pointer operands from load recipes.
+      auto *ALoad = dyn_cast<TPWidenLoadRecipe>(ADR);
+      auto *BLoad = dyn_cast<TPWidenLoadRecipe>(BDR);
+      if (!ALoad || !BLoad) return false;
+      auto *APtrDR = dyn_cast<TPSingleDefRecipe>(ALoad->getOperand(0));
+      auto *BPtrDR = dyn_cast<TPSingleDefRecipe>(BLoad->getOperand(0));
+      if (!APtrDR || !BPtrDR) return false;
+      Value *APtr = State.getValue(APtrDR);
+      Value *BPtr = State.getValue(BPtrDR);
+      if (!APtr || !BPtr) return false;
+
+      // Find C pointer from the store recipe that uses this recipe's result.
+      // Store operand 0 is the pointer (PtrOp), operand 1 is the value (ValOp).
+      Value *CPtr = nullptr;
+      if (auto *DefVal = this->getDefinedValue()) {
+        for (TPUser *U : DefVal->users()) {
+          auto *RB = dyn_cast<TPRecipeBase>(U);
+          if (!RB) continue;
+          if (auto *SR = dyn_cast<TPWidenStoreRecipe>(RB)) {
+            auto *PtrDR = dyn_cast<TPSingleDefRecipe>(SR->getOperand(0));
+            if (PtrDR) CPtr = State.getValue(PtrDR);
+            break;
+          }
+        }
+      }
+      if (!CPtr) return false;
+
+      SmallVector<unsigned>  Shape    = getTPValueShape(*ADR, State.Plan);
+      SmallVector<uint64_t>  AStrides = getTPValueStrides(*ADR, State.Plan);
+      SmallVector<uint64_t>  BStrides = getTPValueStrides(*BDR, State.Plan);
+      SmallVector<uint64_t>  CStrides = AStrides; // same DimSet for elementwise
+
+      Type *ElemTy = ALoad->getInstruction()->getType()->getScalarType();
+      if (!ElemTy->isFloatTy() && !ElemTy->isDoubleTy()) return false;
+      Module *Mod  = State.Builder.GetInsertBlock()->getModule();
+      auto EltFn   = getTensorElementwiseFn(*Mod, OpName, Rank, ElemTy);
+      IRBuilder<> &B = State.Builder;
+      auto I64 = [&](uint64_t V) -> Value * { return B.getInt64(V); };
+
+      SmallVector<Value *> Args;
+      for (auto &[Ptr, Strides] : {std::pair{CPtr, &CStrides},
+                                    std::pair{APtr, &AStrides},
+                                    std::pair{BPtr, &BStrides}}) {
+        Args.push_back(Ptr);
+        for (uint64_t S : *Strides) Args.push_back(I64(S));
+      }
+      for (unsigned D : Shape) Args.push_back(I64(D));
+      B.CreateCall(EltFn, Args);
+      return true;
+    };
+
+    if (tryVectorize()) return;
+
+    // Scalar fallback.
+    auto *Clone = Inst->clone();
+    State.remapClone(Clone);
+    Value *Result = State.Builder.Insert(Clone);
+    applyFlags(*cast<Instruction>(Result));
+    State.EmittedMap[Inst] = Result;
+    State.setValue(this, Result);
+    return;
+  }
+
   case TensorOpKind::Scalar: {
     auto *Clone = Inst->clone();
     State.remapClone(Clone);
@@ -352,9 +436,18 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
   }
 
   case TensorOpKind::BroadcastBinary: {
-    // TODO: emit broadcast intrinsic. For now, clone scalar op.
-    LLVM_DEBUG(dbgs() << "TPlanLowering: BroadcastBinary not yet implemented, "
-                         "falling back to scalar clone\n");
+    LLVM_DEBUG({
+      auto *DR = dyn_cast<TPSingleDefRecipe>(getOperand(0));
+      if (DR) {
+        auto Shape   = getTPValueShape(*DR, State.Plan);
+        auto Strides = getTPValueStrides(*DR, State.Plan);
+        dbgs() << "BroadcastBinary shape=[";
+        for (unsigned D : Shape) dbgs() << D << " ";
+        dbgs() << "] strides=[";
+        for (uint64_t S : Strides) dbgs() << S << " ";
+        dbgs() << "] — scalar fallback (TODO: broadcast intrinsic)\n";
+      }
+    });
     auto *Clone = Inst->clone();
     State.remapClone(Clone);
     Value *Result = State.Builder.Insert(Clone);
@@ -365,8 +458,63 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
   }
 
   case TensorOpKind::OuterProduct: {
-    // TODO: emit outer product intrinsic. For now, clone scalar op.
-    LLVM_DEBUG(dbgs() << "TPlanLowering: OuterProduct not yet implemented, "
+    auto tryVectorize = [&]() -> bool {
+      auto *LHSDR = dyn_cast<TPSingleDefRecipe>(getOperand(0));
+      auto *RHSDR = dyn_cast<TPSingleDefRecipe>(getOperand(1));
+      if (!LHSDR || !RHSDR) return false;
+
+      auto *LHSLoad = dyn_cast<TPWidenLoadRecipe>(LHSDR);
+      auto *RHSLoad = dyn_cast<TPWidenLoadRecipe>(RHSDR);
+      if (!LHSLoad || !RHSLoad) return false;
+      auto *LHSPtrDR = dyn_cast<TPSingleDefRecipe>(LHSLoad->getOperand(0));
+      auto *RHSPtrDR = dyn_cast<TPSingleDefRecipe>(RHSLoad->getOperand(0));
+      if (!LHSPtrDR || !RHSPtrDR) return false;
+      Value *LHSPtr = State.getValue(LHSPtrDR);
+      Value *RHSPtr = State.getValue(RHSPtrDR);
+      if (!LHSPtr || !RHSPtr) return false;
+
+      SmallVector<unsigned> LHSShape = getTPValueShape(*LHSDR, State.Plan);
+      SmallVector<unsigned> RHSShape = getTPValueShape(*RHSDR, State.Plan);
+      if (LHSShape.empty() || RHSShape.empty()) return false;
+
+      uint64_t M = 1, N = 1;
+      for (unsigned D : LHSShape) M *= D;
+      for (unsigned D : RHSShape) N *= D;
+
+      // Store operand 0 is pointer, operand 1 is value.
+      Value *CPtr = nullptr;
+      if (auto *DefVal = this->getDefinedValue()) {
+        for (TPUser *U : DefVal->users()) {
+          auto *RB = dyn_cast<TPRecipeBase>(U);
+          if (!RB) continue;
+          if (auto *SR = dyn_cast<TPWidenStoreRecipe>(RB)) {
+            auto *PtrDR = dyn_cast<TPSingleDefRecipe>(SR->getOperand(0));
+            if (PtrDR) CPtr = State.getValue(PtrDR);
+            break;
+          }
+        }
+      }
+      if (!CPtr) return false;
+
+      Type *ElemTy = LHSLoad->getInstruction()->getType()->getScalarType();
+      if (!ElemTy->isFloatTy() && !ElemTy->isDoubleTy()) return false;
+      Module *Mod  = State.Builder.GetInsertBlock()->getModule();
+      auto MatmulFn = getTensorMatmulFn(*Mod, ElemTy);
+      IRBuilder<> &B = State.Builder;
+      auto I64 = [&](uint64_t V) -> Value * { return B.getInt64(V); };
+
+      // OuterProduct = matmul(col-vec[M×1], row-vec[1×N]) → C[M×N]
+      B.CreateCall(MatmulFn,
+          {CPtr,    I64(M), I64(N), I64(N),    // C, M, N, ldc=N (dense)
+           LHSPtr,  I64(M), I64(1), I64(1),    // A: M×1 col-vector, lda=1
+           RHSPtr,  I64(1), I64(N), I64(N)});  // B: 1×N row-vector, ldb=N
+      return true;
+    };
+
+    if (tryVectorize()) return;
+
+    // Scalar fallback.
+    LLVM_DEBUG(dbgs() << "TPlanLowering: OuterProduct vectorize failed, "
                          "falling back to scalar clone\n");
     auto *Clone = Inst->clone();
     State.remapClone(Clone);
@@ -379,6 +527,18 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
 
   case TensorOpKind::PlainReduction: {
     // Reduction update with no fuseable mul-like producer — clone as scalar.
+    LLVM_DEBUG({
+      auto *DR = dyn_cast<TPSingleDefRecipe>(getOperand(0));
+      if (DR) {
+        auto Shape   = getTPValueShape(*DR, State.Plan);
+        auto Strides = getTPValueStrides(*DR, State.Plan);
+        dbgs() << "PlainReduction shape=[";
+        for (unsigned D : Shape) dbgs() << D << " ";
+        dbgs() << "] strides=[";
+        for (uint64_t S : Strides) dbgs() << S << " ";
+        dbgs() << "] — scalar fallback\n";
+      }
+    });
     auto *Clone = Inst->clone();
     State.remapClone(Clone);
     Value *Result = State.Builder.Insert(Clone);
