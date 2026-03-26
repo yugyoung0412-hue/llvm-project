@@ -1286,6 +1286,16 @@ public:
   }
   /// \p Dim uses the DimIdx convention (innermost=0, outermost=Depth-1).
   void setDimPF(unsigned Dim, unsigned PF) { DimPFMap[Dim] = PF; }
+  /// Returns the dense (packed) stride for dimension \p Dim.
+  /// Dense stride(D) = product of getPFForDim(d) for all d < D.
+  /// Dim 0 (innermost) always returns 1.
+  /// \p Dim uses DimIdx convention (innermost=0, outermost=Depth-1).
+  uint64_t getDenseStrideForDim(unsigned Dim) const {
+    uint64_t Stride = 1;
+    for (unsigned D = 0; D < Dim; ++D)
+      Stride *= static_cast<uint64_t>(getPFForDim(D));
+    return Stride;
+  }
 
   /// Entry block (outermost preheader, a TPBasicBlock).
   TPBlockBase *getEntry() const { return Entry; }
