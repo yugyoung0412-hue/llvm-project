@@ -32,89 +32,113 @@ Row 0:  [a00 .. a0(N-1) | PAD .. PAD]   ← S elements total
 Row 1:  [a10 .. a1(N-1) | PAD .. PAD]
 ```
 
-A naive `load <M*N x float>` includes the padding — incorrect data. Stride-aware load intrinsics (`@llvm.matrix.column.major.load`) accept a runtime `i64` stride and handle this correctly.
+A naive `load <M*N x float>` includes the padding — incorrect data.
+`@llvm.matrix.row.major.load` (row-major convention, matching C arrays) accepts a runtime `i64` stride and handles this correctly.
 
-### 2.2 Two-level stride storage
+### 2.2 DimIdx convention
+
+TPlan uses **innermost-first** dim indexing (matching `DimPFMap` in `TPlan.h`):
+
+- **dim 0** = innermost loop (fastest-varying index, unit stride for packed data)
+- **dim D** = Dth loop from the innermost
+
+All stride and shape computations in this spec follow this convention.
+
+### 2.3 Two-level stride storage
 
 Stride information lives at two granularities:
 
 #### `TPlan` — dim-level dense stride (shared default)
 
-`TPlan` stores the **dense stride** for each loop dimension: the stride a tensor *would* have if its memory were packed (no padding). This is derived from the PF (tile size) of inner dimensions:
+`TPlan` stores the **dense stride** for each loop dimension: the stride a tensor *would* have if its memory were packed (no padding). Under the innermost-first convention this is:
 
 ```
-denseStride(dim D) = product of PFs of all dims with index > D
+denseStride(dim D) = product of PFs of all dims with index < D
 ```
 
-Example for dims `{0,1,2}` with PFs `[256, 512, 1024]`:
+Example for dims `{0,1,2}` with PFs `[1024, 512, 256]`
+(dim 0 = innermost/j, dim 1 = middle/k, dim 2 = outermost/i):
 
-| Dim | PF | Dense stride |
-|-----|----|-------------|
-| 0   | 256 | 512 × 1024 = 524288 |
-| 1   | 512 | 1024 |
-| 2   | 1024 | 1 |
+| Dim | Role | PF | Dense stride |
+|-----|------|----|-------------|
+| 0   | j (innermost) | 1024 | 1 |
+| 1   | k (middle)    | 512  | 1024 |
+| 2   | i (outermost) | 256  | 512 × 1024 = 524288 |
 
 New API:
 ```cpp
 // In TPlan:
 DenseMap<unsigned, TPValue *> DimDenseStride;
 TPValue *getDenseStrideForDim(unsigned D) const;
+// Returns compile-time constant when all inner-dim PFs are constant;
+// returns a symbolic TPValue* when any inner-dim PF is dynamic.
 ```
 
-#### `TPSingleDefRecipe` — per-tensor stride override
+**Population:** `TPlanWidener_widen()` computes and stores `DimDenseStride` after all DimSets are propagated, as a product of inner-dim PFs.
 
-Each tensor's actual memory layout may differ from the dense default (e.g., `lda > N` due to padding, or a runtime dynamic stride from a dynamic batch dimension). The recipe stores overrides only when the actual stride differs:
+#### `TPSingleDefRecipe` — per-tensor stride override (load/store recipes only)
+
+Each load or store recipe's actual memory layout may differ from the dense default (e.g., `lda > N` due to padding, or a runtime dynamic stride from a dynamic batch dimension). The recipe stores overrides only for dims where the actual stride differs from the dense default:
 
 ```cpp
 // In TPSingleDefRecipe:
-SmallDenseMap<unsigned, TPValue *> MemStrides;
-// nullptr entry → inherit TPlan dense default
-// TPValue* entry → override (static constant or dynamic SSA value)
+DenseMap<unsigned, TPValue *> MemStrides;
+// No entry for dim D → inherit Plan.getDenseStrideForDim(D)
+// TPValue* entry for dim D → override (static constant or dynamic SSA value)
 
+// Query: returns override if present, else TPlan dense default
 TPValue *getMemStride(unsigned Dim, const TPlan &Plan) const;
-// Returns MemStrides[Dim] if set, else Plan.getDenseStrideForDim(Dim)
 ```
+
+`MemStrides` is populated during `TPlanWidener_widen()` by inspecting the SCEV expression of each GEP's index coefficient for each loop dimension. If the coefficient differs from the corresponding `DimDenseStride`, it is stored as an override.
 
 #### Concrete GEMM example
 
 ```c
+// Outermost→innermost: i(dim2), k(dim1), j(dim0)
 // A[256][512] lda=640, B[512][1024] ldb=1024, C[256][1024] ldc=1280
-for (int i = 0; i < 256; i++)     // dim 0
-  for (int k = 0; k < 512; k++)   // dim 1 (reduction)
-    for (int j = 0; j < 1024; j++) // dim 2
+for (int i = 0; i < 256; i++)      // dim 2 (outermost)
+  for (int k = 0; k < 512; k++)    // dim 1
+    for (int j = 0; j < 1024; j++) // dim 0 (innermost)
       C[i*ldc + j] += A[i*lda + k] * B[k*ldb + j]
 ```
 
-| Recipe | Dim | TPlan dense default | Actual stride | Stored in recipe? |
-|--------|-----|--------------------|--------------:|:-----------------:|
-| A load | 0   | 512                | lda = 640     | yes               |
-| A load | 1   | 1                  | 1             | no                |
-| B load | 1   | 1                  | 1             | no                |
-| B load | 2   | 1                  | ldb = 1024    | no (matches)      |
-| C store| 0   | 512                | ldc = 1280    | yes               |
-| C store| 2   | 1                  | 1             | no                |
+PFs: dim0=1024, dim1=512, dim2=256.
+Dense strides: dim0=1, dim1=1024, dim2=512×1024=524288.
+
+| Recipe  | Dim | Dense default | Actual stride | Stored in recipe? |
+|---------|-----|--------------|:-------------:|:-----------------:|
+| A load  | 2   | 524288       | lda×1024=655360 | yes |
+| A load  | 0   | 1            | 1             | no |
+| B load  | 1   | 1024         | ldb=1024      | no (matches) |
+| B load  | 0   | 1            | 1             | no |
+| C store | 2   | 524288       | ldc×1024=1310720 | yes |
+| C store | 0   | 1            | 1             | no |
 
 ---
 
 ## 3. New Intrinsic Family
 
-Two new target-independent intrinsics replace the flat-vector `@llvm.matrix.multiply` as the canonical output of TPlan lowering.
+Two new target-independent intrinsics replace the flat-vector `@llvm.matrix.multiply` as the canonical output of TPlan lowering. All dimensions and strides are `i64` SSA values — fully dynamic.
 
 ### 3.1 `@llvm.tensor.matmul`
 
-All dimensions and strides are `i64` SSA values — fully dynamic:
-
 ```llvm
+; All dimensions and strides are i64 SSA values
 declare void @llvm.tensor.matmul.f32(
-    ptr %C, i64 %M, i64 %N, i64 %ldc,
-    ptr %A, i64 %M, i64 %K, i64 %lda,
-    ptr %B, i64 %K, i64 %N, i64 %ldb)
+    ptr %C, i64 %rows_C, i64 %cols_C, i64 %ldc,
+    ptr %A, i64 %rows_A, i64 %cols_A, i64 %lda,
+    ptr %B, i64 %rows_B, i64 %cols_B, i64 %ldb)
+; Semantics: C[rows_C x cols_C] += A[rows_A x cols_A] * B[rows_B x cols_B]
+; where cols_A == rows_B (the contraction dimension K).
+; All tensors are row-major with their respective leading dimensions.
 ```
 
 ### 3.2 `@llvm.tensor.elementwise.<op>.<rank>d`
 
-Rank is encoded in the intrinsic name so the number of stride/dim arguments is statically known to the backend. Example for 2D `fadd`:
+Rank is encoded in the intrinsic name so the number of stride/dim arguments is statically known to the backend. Strides precede dimensions in the argument list.
 
+2D `fadd`:
 ```llvm
 declare void @llvm.tensor.elementwise.fadd.2d.f32(
     ptr %C, i64 %strideC0, i64 %strideC1,
@@ -123,8 +147,7 @@ declare void @llvm.tensor.elementwise.fadd.2d.f32(
     i64 %D0, i64 %D1)
 ```
 
-For 3D:
-
+3D `fadd`:
 ```llvm
 declare void @llvm.tensor.elementwise.fadd.3d.f32(
     ptr %C, i64 %strideC0, i64 %strideC1, i64 %strideC2,
@@ -135,32 +158,54 @@ declare void @llvm.tensor.elementwise.fadd.3d.f32(
 
 ---
 
-## 4. Backend Lowering Decision Tree
+## 4. Backend Lowering Decision Trees
 
-`@llvm.tensor.matmul` is a **target-independent semantic anchor**. The backend selects an implementation based on what the target supports and whether dims/strides are constant at compile time:
+### 4.1 `@llvm.tensor.matmul`
+
+`@llvm.tensor.matmul` is a **target-independent semantic anchor**. The backend selects an implementation based on what the target supports and whether dims/strides are constant:
 
 ```
-@llvm.tensor.matmul(M, K, N, lda, ldb, ldc)
+@llvm.tensor.matmul(rows_C, cols_C, ldc, rows_A, cols_A, lda, rows_B, cols_B, ldb)
         │
         ├─ all dims + strides constant
-        │       └─→ @llvm.matrix.multiply  (existing path, unchanged)
+        │       └─→ @llvm.matrix.row.major.load (×2)
+        │           + @llvm.matrix.multiply (existing path)
+        │           + @llvm.matrix.row.major.store
         │
         ├─ dims constant, strides dynamic
-        │       └─→ @llvm.matrix.column.major.load
+        │       └─→ @llvm.matrix.row.major.load with runtime stride
         │           + @llvm.matrix.multiply
+        │           + @llvm.matrix.row.major.store with runtime stride
         │
         └─ any dim dynamic
-                ├─ ARM SME available    → @llvm.aarch64.sme.mopa
-                ├─ Custom NPU available → target-specific dynamic intrinsic
+                ├─ ARM SME available    → @llvm.aarch64.sme.mopa (scalable tiles)
+                ├─ Custom NPU available → target-specific dynamic matmul intrinsic
                 └─ generic fallback     → @cblas_sgemm or tiled scalar loop
 ```
 
-### 4.1 LLM workload classification
+### 4.2 `@llvm.tensor.elementwise.*`
+
+```
+@llvm.tensor.elementwise.fadd.<rank>d(...)
+        │
+        ├─ all dims + strides constant
+        │       └─→ flat <N x float> vector fadd (N = product of all dims)
+        │
+        ├─ dims constant, strides dynamic
+        │       └─→ strided gather + vector fadd + strided scatter
+        │
+        └─ any dim dynamic
+                ├─ target supports scalable vectors (SVE/RVV)
+                │       └─→ scalable vector fadd with vsetvli
+                └─ generic fallback → scalar loop
+```
+
+### 4.3 LLM workload classification
 
 | Scenario | Dims static? | Strides static? | Lowering path |
 |----------|:-----------:|:---------------:|---------------|
 | Weight matrices (fixed hidden dim) | yes | yes | `@llvm.matrix.multiply` |
-| Fixed hidden, padded alloc | yes | no | stride-aware load + `@llvm.matrix.multiply` |
+| Fixed hidden dim, padded alloc | yes | no | stride-aware load + `@llvm.matrix.multiply` |
 | Dynamic batch / seq_len | no | no | SME / NPU / BLAS / loop |
 | Attention head slicing | no | no | SME / NPU / BLAS / loop |
 
@@ -168,62 +213,87 @@ declare void @llvm.tensor.elementwise.fadd.3d.f32(
 
 ## 5. `getTPValueShape` and `getTPValueStrides` — Generalization
 
-### 5.1 Existing `getTPValueShape` (unchanged signature)
+### 5.1 Existing `getTPValueShape` (unchanged)
 
 ```cpp
 // TPRecipeMatcher.h — unchanged
 SmallVector<unsigned> getTPValueShape(const TPSingleDefRecipe &V,
                                       const TPlan &Plan);
-// Returns PFForDim for each set bit in V.DimSet, in dim order.
+// Returns PFForDim for each set bit in V.DimSet, in dim order (innermost first).
 // Already N-dimensional by implementation.
 ```
 
-### 5.2 New companion `getTPValueStrides`
+### 5.2 New `getTPValueStrides`
 
 ```cpp
 // TPRecipeMatcher.h — new
 SmallVector<TPValue *> getTPValueStrides(const TPSingleDefRecipe &V,
                                           const TPlan &Plan);
-// For each dim D in V.DimSet (in order):
+// For each dim D in V.DimSet (innermost first):
 //   returns V.getMemStride(D, Plan)
 //   → V.MemStrides[D] if set (recipe-level override)
 //   → Plan.getDenseStrideForDim(D) otherwise (dense default)
+//
+// Only meaningful for load/store recipes (TPWidenLoadSC, TPWidenStoreSC).
+// Calling on an arithmetic recipe returns dense defaults, which may be
+// incorrect; callers must use the LHS/RHS load recipes for contraction.
 ```
 
-### 5.3 Call sites expand to all TensorOpKinds
+### 5.3 Resolving `TPValue*` to IR `Value*` at call sites
 
-Currently only `emitContraction` calls `getTPValueShape`. After this change, every non-scalar `execute()` path calls both:
+`getTPValueStrides` returns `TPValue *` — the plan-level representation. At lowering time, the caller resolves each stride to an IR `Value *` via `State.getValue()`:
 
 ```cpp
-// In TPWidenRecipe::execute(), for every non-Scalar TensorOpKind:
-SmallVector<unsigned>  Shape   = getTPValueShape(*DR, State.Plan);
-SmallVector<TPValue *> Strides = getTPValueStrides(*DR, State.Plan);
-// Shape and Strides are passed to the appropriate new intrinsic.
+SmallVector<TPValue *> StrideVals = getTPValueStrides(*LoadDR, State.Plan);
+SmallVector<Value *>   Strides;
+for (TPValue *SV : StrideVals)
+  Strides.push_back(State.getValue(SV));  // TPValue* accepted directly
+```
+
+`State.getValue()` accepts any `TPValue *` — recipe values, constants, and symbolics alike. Constants (e.g., from `getDenseStrideForDim`) are registered in the `TPTransformState` value map during plan construction and resolve to `ConstantInt` IR values. No cast to `TPSingleDefRecipe` is needed or correct here.
+
+### 5.4 Call sites expand to all TensorOpKinds (load/store operands)
+
+For all non-scalar `TensorOpKind`s, strides are fetched from the **load/store operand recipes**, not from the arithmetic update recipe:
+
+```cpp
+// For ElementWise, BroadcastBinary, OuterProduct, PlainReduction:
+auto *LoadDR = dyn_cast<TPSingleDefRecipe>(getOperand(0)); // the load recipe
+SmallVector<unsigned>  Shape   = getTPValueShape(*LoadDR, State.Plan);
+SmallVector<TPValue *> Strides = getTPValueStrides(*LoadDR, State.Plan);
+
+// For Contraction: already uses LHSDR / RHSDR (the mul operands' load recipes)
+// — pattern unchanged from existing emitContraction().
 ```
 
 ---
 
 ## 6. IR Examples
 
-### 6.1 ElementWise 2D add — dynamic stride
+### 6.1 ElementWise 2D add — mixed static dims, dynamic stride on A
 
 ```c
-// C[i][j] = A[i][j] + B[i][j], shape [256][512], lda=640 (padded)
+// C[i][j] = A[i][j] + B[i][j]
+// dim0=j (innermost, PF=512), dim1=i (outermost, PF=256)
+// A: lda=640 (padded) → stride for dim1 = 640*elemSize; B, C: dense (stride=512)
 ```
 
 ```llvm
-; Emitted by TPlan lowering:
+; Emitted by TPlan lowering — strides are i64 SSA values
+; Argument order matches intrinsic signature: strideX0 (dim0/innermost) first.
 call void @llvm.tensor.elementwise.fadd.2d.f32(
-    ptr %C, i64 512,  i64 1,     ; C strides: dense default
-    ptr %A, i64 %lda, i64 1,     ; A stride dim0 = runtime lda (override)
-    ptr %B, i64 512,  i64 1,     ; B strides: dense default
-    i64 256, i64 512)
+    ptr %C, i64 1, i64 512,      ; C: strideC0=1 (dim0/j), strideC1=512 (dim1/i)
+    ptr %A, i64 1, i64 %lda,     ; A: strideA0=1 (dim0/j), strideA1=lda (dim1/i, override)
+    ptr %B, i64 1, i64 512,      ; B: strideB0=1 (dim0/j), strideB1=512 (dim1/i)
+    i64 512, i64 256)             ; D0=512 (j), D1=256 (i)
+; Backend: dims constant, stride of A dim1 is dynamic
+;   → strided gather on A + vector fadd + scatter to C
 ```
 
 ### 6.2 Contraction — dynamic batch dimension
 
 ```c
-// C[batch*seq][N] += A[batch*seq][K] * B[K][N], batch is runtime
+// C[M][N] += A[M][K] * B[K][N], where M = batch * seq_len (runtime)
 ```
 
 ```llvm
@@ -238,15 +308,18 @@ call void @llvm.tensor.matmul.f32(
 ### 6.3 Contraction — all static (existing path preserved)
 
 ```llvm
-; Backend recognizes all-constant dims → @llvm.matrix.multiply as before
-%A_flat = call <131072 x float> @llvm.matrix.column.major.load(
+; Backend recognizes all-constant dims + strides → @llvm.matrix.multiply
+%A_flat = call <131072 x float> @llvm.matrix.row.major.load(
               ptr %A, i64 512, i1 false, i32 256, i32 512)
-%B_flat = call <524288 x float> @llvm.matrix.column.major.load(
+%B_flat = call <524288 x float> @llvm.matrix.row.major.load(
               ptr %B, i64 1024, i1 false, i32 512, i32 1024)
 %result = call <262144 x float> @llvm.matrix.multiply(
               <131072 x float> %A_flat,
               <524288 x float> %B_flat,
               i32 256, i32 512, i32 1024)
+call void @llvm.matrix.row.major.store(
+              <262144 x float> %result, ptr %C, i64 1024,
+              i1 false, i32 256, i32 1024)
 ```
 
 ---
@@ -257,7 +330,7 @@ call void @llvm.tensor.matmul.f32(
 |------|--------|
 | `llvm/include/llvm/Transforms/Vectorize/TPlan.h` | Add `DimDenseStride` map and `getDenseStrideForDim()` to `TPlan`; add `MemStrides` map and `getMemStride()` to `TPSingleDefRecipe` |
 | `llvm/include/llvm/Transforms/Vectorize/TPRecipeMatcher.h` | Declare `getTPValueStrides()` |
-| `llvm/lib/Transforms/Vectorize/TPRecipeMatcher.cpp` | Implement `getTPValueStrides()`; populate `DimDenseStride` in `TPplan` during widening |
-| `llvm/lib/Transforms/Vectorize/TPlanLowering.cpp` | Expand `getTPValueShape` + `getTPValueStrides` call sites to all `TensorOpKind`s; emit new intrinsics |
-| `llvm/lib/Transforms/Vectorize/TPlanWidener.cpp` | Populate `TPSingleDefRecipe::MemStrides` from SCEV-derived strides during widening |
+| `llvm/lib/Transforms/Vectorize/TPlanWidener.cpp` | After DimSet propagation: compute and store `DimDenseStride` in `TPlan`; populate `TPSingleDefRecipe::MemStrides` from SCEV-derived GEP index coefficients |
+| `llvm/lib/Transforms/Vectorize/TPRecipeMatcher.cpp` | Implement `getTPValueStrides()` |
+| `llvm/lib/Transforms/Vectorize/TPlanLowering.cpp` | Expand `getTPValueShape` + `getTPValueStrides` call sites to all `TensorOpKind`s; emit new intrinsics; resolve `TPValue*` strides via `State.getValue()` |
 | `llvm/include/llvm/IR/Intrinsics.td` | Declare `@llvm.tensor.matmul` and `@llvm.tensor.elementwise.*` intrinsic families |
