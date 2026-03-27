@@ -1,0 +1,739 @@
+/Users/yun-yugyeong/Dev/llvm/build/bin/opt: WARNING: failed to create target machine for 'aarch64': unable to get target for 'aarch64', see --version and --triple.
+
+=== Stage 1: Initial TPlan ===
+TPlan '_ZL32ggml_compute_forward_mul_mat_f32PK11ggml_tensorS1_PS_' (depth=5) {
+Live-in tp<%0> = PF[0]
+Live-in tp<%1> = PF[1]
+Live-in tp<%2> = PF[2]
+Live-in tp<%3> = PF[3]
+Live-in tp<%4> = PF[4]
+Live-in ir<%17>
+Live-in ir<0>
+Live-in ir<1>
+Live-in ir<%15>
+Live-in ir<%5>
+Live-in ir<%23>
+Live-in ir<%59>
+Live-in ir<%31>
+Live-in ir<%61>
+Live-in ir<%39>
+Live-in ir<%63>
+Live-in ir<%13>
+Live-in ir<%11>
+Live-in ir<%35>
+Live-in ir<%83>
+Live-in ir<%96>
+Live-in ir<%9>
+Live-in ir<0>
+Live-in ir<%114>
+Live-in ir<%19>
+Live-in ir<%91>
+Live-in ir<%27>
+Live-in ir<%82>
+Live-in ir<%21>
+Live-in ir<%29>
+Live-in ir<%37>
+Live-in ir<%7>
+Live-in ir<%25>
+Live-in ir<%43>
+Live-in ir<%33>
+Live-in ir<%45>
+Live-in ir<%41>
+Live-in ir<%47>
+
+tensor.ph4:
+Successor(s): tensor loop4
+
+<x1> tensor loop4: {
+  ir-bb<>:
+    CANONICAL-INDUCTION tp<%5> = phi ir<0>, tp<%6>
+    WIDEN-INDUCTION tp<%7> = phi ir<0>, tp<%8>
+  Successor(s): tensor.latch4 tensor.ph3
+
+  tensor.latch4:
+    WIDEN tp<%8> = add tp<%7>, ir<1>
+    WIDEN tp<%9> = icmp tp<%8>, ir<%17>
+    CANONICAL-INDUCTION-INC tp<%6> = add tp<%5>, tp<%4>
+    CANONICAL-INDUCTION-CMP tp<%10> = icmp tp<%6>, ir<%17>
+  No successors
+
+  tensor.ph3:
+    WIDEN tp<%11> = srem tp<%7>, ir<%7>
+    WIDEN tp<%12> = mul tp<%11>, ir<%25>
+    WIDEN-GEP tp<%13> = getelementptr ir<%43>, tp<%12>
+    WIDEN tp<%14> = mul tp<%7>, ir<%33>
+    WIDEN-GEP tp<%15> = getelementptr ir<%45>, tp<%14>
+    WIDEN tp<%16> = mul tp<%7>, ir<%41>
+    WIDEN-GEP tp<%17> = getelementptr ir<%47>, tp<%16>
+  Successor(s): tensor loop3
+
+  <x1> tensor loop3: {
+    ir-bb<>:
+      CANONICAL-INDUCTION tp<%18> = phi ir<0>, tp<%19>
+      WIDEN-INDUCTION tp<%20> = phi ir<0>, tp<%21>
+      WIDEN tp<%22> = srem tp<%20>, ir<%5>
+      WIDEN tp<%23> = mul tp<%22>, ir<%23>
+      WIDEN-GEP tp<%24> = getelementptr ir<%59>, tp<%23>
+      WIDEN tp<%25> = mul tp<%20>, ir<%31>
+      WIDEN-GEP tp<%26> = getelementptr ir<%61>, tp<%25>
+      WIDEN tp<%27> = mul tp<%20>, ir<%39>
+      WIDEN-GEP tp<%28> = getelementptr ir<%63>, tp<%27>
+    Successor(s): tensor.latch3 tensor.ph2
+
+    tensor.latch3:
+      WIDEN tp<%21> = add tp<%20>, ir<1>
+      WIDEN tp<%29> = icmp tp<%21>, ir<%15>
+      CANONICAL-INDUCTION-INC tp<%19> = add tp<%18>, tp<%3>
+      CANONICAL-INDUCTION-CMP tp<%30> = icmp tp<%19>, ir<%15>
+    No successors
+
+    tensor.ph2:
+    Successor(s): tensor loop2
+
+    <x1> tensor loop2: {
+      ir-bb<>:
+        CANONICAL-INDUCTION tp<%31> = phi ir<0>, tp<%32>
+        WIDEN-INDUCTION tp<%33> = phi ir<0>, tp<%34>
+      Successor(s): tensor.latch2 tensor.ph1
+
+      tensor.latch2:
+        WIDEN tp<%34> = add tp<%33>, ir<1>
+        WIDEN tp<%35> = icmp tp<%34>, ir<%13>
+        CANONICAL-INDUCTION-INC tp<%32> = add tp<%31>, tp<%2>
+        CANONICAL-INDUCTION-CMP tp<%36> = icmp tp<%32>, ir<%13>
+      No successors
+
+      tensor.ph1:
+        WIDEN tp<%37> = mul tp<%33>, ir<%29>
+        WIDEN tp<%38> = mul tp<%33>, ir<%37>
+        WIDEN-GEP tp<%39> = getelementptr tp<%26>, tp<%37>
+        WIDEN-GEP tp<%40> = getelementptr tp<%28>, tp<%38>
+      Successor(s): tensor loop1
+
+      <x1> tensor loop1: {
+        ir-bb<>:
+          CANONICAL-INDUCTION tp<%41> = phi ir<0>, tp<%42>
+          WIDEN-INDUCTION tp<%43> = phi ir<0>, tp<%44>
+        Successor(s): tensor.latch1 tensor.ph0
+
+        tensor.latch1:
+          WIDEN tp<%45> = mul tp<%43>, ir<%35>
+          WIDEN-GEP tp<%46> = getelementptr ir<%83>, tp<%45>
+          WIDEN-CAST tp<%47> = bitcast tp<%46>
+          WIDEN store tp<%47>, ir<%96>
+          WIDEN tp<%44> = add tp<%43>, ir<1>
+          WIDEN tp<%48> = icmp tp<%44>, ir<%11>
+          CANONICAL-INDUCTION-INC tp<%42> = add tp<%41>, tp<%1>
+          CANONICAL-INDUCTION-CMP tp<%49> = icmp tp<%42>, ir<%11>
+        No successors
+
+        tensor.ph0:
+          WIDEN tp<%50> = mul tp<%43>, ir<%21>
+          WIDEN-GEP tp<%51> = getelementptr tp<%24>, tp<%50>
+        Successor(s): tensor loop0
+
+        <x1> tensor loop0: {
+          ir-bb<>:
+            CANONICAL-INDUCTION tp<%52> = phi ir<0>, tp<%53>
+            WIDEN-INDUCTION tp<%54> = phi ir<0>, tp<%55>
+            WIDEN-REDUCTION-PHI tp<%56> = phi ir<0>, ir<%114>
+            WIDEN tp<%57> = mul tp<%54>, ir<%19>
+            WIDEN-GEP tp<%58> = getelementptr ir<%91>, tp<%57>
+            WIDEN-CAST tp<%59> = bitcast tp<%58>
+            WIDEN tp<%60> = load tp<%59>
+            WIDEN tp<%61> = mul tp<%54>, ir<%27>
+            WIDEN-GEP tp<%62> = getelementptr ir<%82>, tp<%61>
+            WIDEN-CAST tp<%63> = bitcast tp<%62>
+            WIDEN tp<%64> = load tp<%63>
+            WIDEN tp<%65> = fmul tp<%60>, tp<%64>
+            WIDEN tp<%66> = fadd tp<%56>, tp<%65>
+            WIDEN tp<%67> = add tp<%54>, ir<1>
+            WIDEN tp<%68> = icmp tp<%67>, ir<%9>
+          Successor(s): tensor.latch0 tensor.body.0
+
+          tensor.latch0:
+            WIDEN tp<%69> = mul tp<%54>, ir<%19>
+            WIDEN-GEP tp<%70> = getelementptr ir<%91>, tp<%69>
+            WIDEN-CAST tp<%71> = bitcast tp<%70>
+            WIDEN tp<%72> = load tp<%71>
+            WIDEN tp<%73> = mul tp<%54>, ir<%27>
+            WIDEN-GEP tp<%74> = getelementptr ir<%82>, tp<%73>
+            WIDEN-CAST tp<%75> = bitcast tp<%74>
+            WIDEN tp<%76> = load tp<%75>
+            WIDEN tp<%77> = fmul tp<%72>, tp<%76>
+            WIDEN tp<%78> = fadd tp<%56>, tp<%77>
+            WIDEN tp<%55> = add tp<%54>, ir<1>
+            WIDEN tp<%79> = icmp tp<%55>, ir<%9>
+            CANONICAL-INDUCTION-INC tp<%53> = add tp<%52>, tp<%0>
+            CANONICAL-INDUCTION-CMP tp<%80> = icmp tp<%53>, ir<%9>
+          No successors
+
+          tensor.body.0:
+          No successors
+
+        }
+        Successor(s): middle.block0
+
+      }
+      Successor(s): middle.block1
+
+    }
+    Successor(s): middle.block2
+
+  }
+  Successor(s): middle.block3
+
+}
+Successor(s): middle.block4
+
+middle.block4:
+Successor(s): ir-bb<> scalar.ph4
+
+ir-bb<>:
+Successor(s): scalar.ph4
+
+scalar.ph4:
+No successors
+
+}
+
+=== Stage 2: After Widening (DimSets propagated) ===
+TPlan '_ZL32ggml_compute_forward_mul_mat_f32PK11ggml_tensorS1_PS_' (depth=5) {
+Live-in tp<%0> = PF[0]
+Live-in tp<%1> = PF[1]
+Live-in tp<%2> = PF[2]
+Live-in tp<%3> = PF[3]
+Live-in tp<%4> = PF[4]
+Live-in ir<%17>
+Live-in ir<0>
+Live-in ir<1>
+Live-in ir<%15>
+Live-in ir<%5>
+Live-in ir<%23>
+Live-in ir<%59>
+Live-in ir<%31>
+Live-in ir<%61>
+Live-in ir<%39>
+Live-in ir<%63>
+Live-in ir<%13>
+Live-in ir<%11>
+Live-in ir<%35>
+Live-in ir<%83>
+Live-in ir<%96>
+Live-in ir<%9>
+Live-in ir<0>
+Live-in ir<%114>
+Live-in ir<%19>
+Live-in ir<%91>
+Live-in ir<%27>
+Live-in ir<%82>
+Live-in ir<%21>
+Live-in ir<%29>
+Live-in ir<%37>
+Live-in ir<%7>
+Live-in ir<%25>
+Live-in ir<%43>
+Live-in ir<%33>
+Live-in ir<%45>
+Live-in ir<%41>
+Live-in ir<%47>
+
+tensor.ph4:
+Successor(s): tensor loop4
+
+<x1> tensor loop4: {
+  ir-bb<>:
+    CANONICAL-INDUCTION tp<%5> = phi ir<0>, tp<%6>
+    WIDEN-INDUCTION tp<%7> = phi ir<0>, tp<%8>
+      ; DimSet={4}
+  Successor(s): tensor.latch4 tensor.ph3
+
+  tensor.latch4:
+    WIDEN tp<%8> = add tp<%7>, ir<1>
+      ; DimSet={4}
+    WIDEN tp<%9> = icmp tp<%8>, ir<%17>
+      ; DimSet={4}
+    CANONICAL-INDUCTION-INC tp<%6> = add tp<%5>, tp<%4>
+    CANONICAL-INDUCTION-CMP tp<%10> = icmp tp<%6>, ir<%17>
+  No successors
+
+  tensor.ph3:
+    WIDEN tp<%11> = srem tp<%7>, ir<%7>
+      ; DimSet={4}
+    WIDEN tp<%12> = mul tp<%11>, ir<%25>
+      ; DimSet={4}
+    WIDEN-GEP tp<%13> = getelementptr ir<%43>, tp<%12>
+      ; DimSet={4}
+    WIDEN tp<%14> = mul tp<%7>, ir<%33>
+      ; DimSet={4}
+    WIDEN-GEP tp<%15> = getelementptr ir<%45>, tp<%14>
+      ; DimSet={4}
+    WIDEN tp<%16> = mul tp<%7>, ir<%41>
+      ; DimSet={4}
+    WIDEN-GEP tp<%17> = getelementptr ir<%47>, tp<%16>
+      ; DimSet={4}
+  Successor(s): tensor loop3
+
+  <x1> tensor loop3: {
+    ir-bb<>:
+      CANONICAL-INDUCTION tp<%18> = phi ir<0>, tp<%19>
+      WIDEN-INDUCTION tp<%20> = phi ir<0>, tp<%21>
+        ; DimSet={3}
+      WIDEN tp<%22> = srem tp<%20>, ir<%5>
+        ; DimSet={3}
+      WIDEN tp<%23> = mul tp<%22>, ir<%23>
+        ; DimSet={3}
+      WIDEN-GEP tp<%24> = getelementptr ir<%59>, tp<%23>
+        ; DimSet={3}
+      WIDEN tp<%25> = mul tp<%20>, ir<%31>
+        ; DimSet={3}
+      WIDEN-GEP tp<%26> = getelementptr ir<%61>, tp<%25>
+        ; DimSet={3}
+      WIDEN tp<%27> = mul tp<%20>, ir<%39>
+        ; DimSet={3}
+      WIDEN-GEP tp<%28> = getelementptr ir<%63>, tp<%27>
+        ; DimSet={3}
+    Successor(s): tensor.latch3 tensor.ph2
+
+    tensor.latch3:
+      WIDEN tp<%21> = add tp<%20>, ir<1>
+        ; DimSet={3}
+      WIDEN tp<%29> = icmp tp<%21>, ir<%15>
+        ; DimSet={3}
+      CANONICAL-INDUCTION-INC tp<%19> = add tp<%18>, tp<%3>
+      CANONICAL-INDUCTION-CMP tp<%30> = icmp tp<%19>, ir<%15>
+    No successors
+
+    tensor.ph2:
+    Successor(s): tensor loop2
+
+    <x1> tensor loop2: {
+      ir-bb<>:
+        CANONICAL-INDUCTION tp<%31> = phi ir<0>, tp<%32>
+        WIDEN-INDUCTION tp<%33> = phi ir<0>, tp<%34>
+          ; DimSet={2}
+      Successor(s): tensor.latch2 tensor.ph1
+
+      tensor.latch2:
+        WIDEN tp<%34> = add tp<%33>, ir<1>
+          ; DimSet={2}
+        WIDEN tp<%35> = icmp tp<%34>, ir<%13>
+          ; DimSet={2}
+        CANONICAL-INDUCTION-INC tp<%32> = add tp<%31>, tp<%2>
+        CANONICAL-INDUCTION-CMP tp<%36> = icmp tp<%32>, ir<%13>
+      No successors
+
+      tensor.ph1:
+        WIDEN tp<%37> = mul tp<%33>, ir<%29>
+          ; DimSet={2}
+        WIDEN tp<%38> = mul tp<%33>, ir<%37>
+          ; DimSet={2}
+        WIDEN-GEP tp<%39> = getelementptr tp<%26>, tp<%37>
+          ; DimSet={2,3}
+        WIDEN-GEP tp<%40> = getelementptr tp<%28>, tp<%38>
+          ; DimSet={2,3}
+      Successor(s): tensor loop1
+
+      <x1> tensor loop1: {
+        ir-bb<>:
+          CANONICAL-INDUCTION tp<%41> = phi ir<0>, tp<%42>
+          WIDEN-INDUCTION tp<%43> = phi ir<0>, tp<%44>
+            ; DimSet={1}
+        Successor(s): tensor.latch1 tensor.ph0
+
+        tensor.latch1:
+          WIDEN tp<%45> = mul tp<%43>, ir<%35>
+            ; DimSet={1}
+          WIDEN-GEP tp<%46> = getelementptr ir<%83>, tp<%45>
+            ; DimSet={1}
+          WIDEN-CAST tp<%47> = bitcast tp<%46>
+            ; DimSet={1}
+          WIDEN store tp<%47>, ir<%96>
+          WIDEN tp<%44> = add tp<%43>, ir<1>
+            ; DimSet={1}
+          WIDEN tp<%48> = icmp tp<%44>, ir<%11>
+            ; DimSet={1}
+          CANONICAL-INDUCTION-INC tp<%42> = add tp<%41>, tp<%1>
+          CANONICAL-INDUCTION-CMP tp<%49> = icmp tp<%42>, ir<%11>
+        No successors
+
+        tensor.ph0:
+          WIDEN tp<%50> = mul tp<%43>, ir<%21>
+            ; DimSet={1}
+          WIDEN-GEP tp<%51> = getelementptr tp<%24>, tp<%50>
+            ; DimSet={1,3}
+        Successor(s): tensor loop0
+
+        <x1> tensor loop0: {
+          ir-bb<>:
+            CANONICAL-INDUCTION tp<%52> = phi ir<0>, tp<%53>
+            WIDEN-INDUCTION tp<%54> = phi ir<0>, tp<%55>
+              ; DimSet={0}
+            WIDEN-REDUCTION-PHI tp<%56> = phi ir<0>, ir<%114>
+            WIDEN tp<%57> = mul tp<%54>, ir<%19>
+              ; DimSet={0}
+            WIDEN-GEP tp<%58> = getelementptr ir<%91>, tp<%57>
+              ; DimSet={0}
+            WIDEN-CAST tp<%59> = bitcast tp<%58>
+              ; DimSet={0}
+            WIDEN tp<%60> = load tp<%59>
+              ; DimSet={0}
+            WIDEN tp<%61> = mul tp<%54>, ir<%27>
+              ; DimSet={0}
+            WIDEN-GEP tp<%62> = getelementptr ir<%82>, tp<%61>
+              ; DimSet={0}
+            WIDEN-CAST tp<%63> = bitcast tp<%62>
+              ; DimSet={0}
+            WIDEN tp<%64> = load tp<%63>
+              ; DimSet={0}
+            WIDEN tp<%65> = fmul tp<%60>, tp<%64>
+              ; DimSet={0}
+            WIDEN tp<%66> = fadd tp<%56>, tp<%65>
+              ; DimSet={0}
+            WIDEN tp<%67> = add tp<%54>, ir<1>
+              ; DimSet={0}
+            WIDEN tp<%68> = icmp tp<%67>, ir<%9>
+              ; DimSet={0}
+          Successor(s): tensor.latch0 tensor.body.0
+
+          tensor.latch0:
+            WIDEN tp<%69> = mul tp<%54>, ir<%19>
+              ; DimSet={0}
+            WIDEN-GEP tp<%70> = getelementptr ir<%91>, tp<%69>
+              ; DimSet={0}
+            WIDEN-CAST tp<%71> = bitcast tp<%70>
+              ; DimSet={0}
+            WIDEN tp<%72> = load tp<%71>
+              ; DimSet={0}
+            WIDEN tp<%73> = mul tp<%54>, ir<%27>
+              ; DimSet={0}
+            WIDEN-GEP tp<%74> = getelementptr ir<%82>, tp<%73>
+              ; DimSet={0}
+            WIDEN-CAST tp<%75> = bitcast tp<%74>
+              ; DimSet={0}
+            WIDEN tp<%76> = load tp<%75>
+              ; DimSet={0}
+            WIDEN tp<%77> = fmul tp<%72>, tp<%76>
+              ; DimSet={0}
+            WIDEN tp<%78> = fadd tp<%56>, tp<%77>
+              ; DimSet={0}
+            WIDEN tp<%55> = add tp<%54>, ir<1>
+              ; DimSet={0}
+            WIDEN tp<%79> = icmp tp<%55>, ir<%9>
+              ; DimSet={0}
+            CANONICAL-INDUCTION-INC tp<%53> = add tp<%52>, tp<%0>
+            CANONICAL-INDUCTION-CMP tp<%80> = icmp tp<%53>, ir<%9>
+          No successors
+
+          tensor.body.0:
+          No successors
+
+        }
+        Successor(s): middle.block0
+
+      }
+      Successor(s): middle.block1
+
+    }
+    Successor(s): middle.block2
+
+  }
+  Successor(s): middle.block3
+
+}
+Successor(s): middle.block4
+
+middle.block4:
+Successor(s): ir-bb<> scalar.ph4
+
+ir-bb<>:
+Successor(s): scalar.ph4
+
+scalar.ph4:
+No successors
+
+}
+
+=== Stage 3: After Pattern Matching (recipe classifications) ===
+TPlan '_ZL32ggml_compute_forward_mul_mat_f32PK11ggml_tensorS1_PS_' (depth=5) {
+Live-in tp<%0> = PF[0]
+Live-in tp<%1> = PF[1]
+Live-in tp<%2> = PF[2]
+Live-in tp<%3> = PF[3]
+Live-in tp<%4> = PF[4]
+Live-in ir<%17>
+Live-in ir<0>
+Live-in ir<1>
+Live-in ir<%15>
+Live-in ir<%5>
+Live-in ir<%23>
+Live-in ir<%59>
+Live-in ir<%31>
+Live-in ir<%61>
+Live-in ir<%39>
+Live-in ir<%63>
+Live-in ir<%13>
+Live-in ir<%11>
+Live-in ir<%35>
+Live-in ir<%83>
+Live-in ir<%96>
+Live-in ir<%9>
+Live-in ir<0>
+Live-in ir<%114>
+Live-in ir<%19>
+Live-in ir<%91>
+Live-in ir<%27>
+Live-in ir<%82>
+Live-in ir<%21>
+Live-in ir<%29>
+Live-in ir<%37>
+Live-in ir<%7>
+Live-in ir<%25>
+Live-in ir<%43>
+Live-in ir<%33>
+Live-in ir<%45>
+Live-in ir<%41>
+Live-in ir<%47>
+
+tensor.ph4:
+Successor(s): tensor loop4
+
+<x1> tensor loop4: {
+  ir-bb<>:
+    CANONICAL-INDUCTION tp<%5> = phi ir<0>, tp<%6>
+    WIDEN-INDUCTION tp<%7> = phi ir<0>, tp<%8>
+      ; DimSet={4}
+  Successor(s): tensor.latch4 tensor.ph3
+
+  tensor.latch4:
+    WIDEN tp<%8> = add tp<%7>, ir<1>
+      ; DimSet={4}
+    WIDEN tp<%9> = icmp tp<%8>, ir<%17>
+      ; DimSet={4}
+    CANONICAL-INDUCTION-INC tp<%6> = add tp<%5>, tp<%4>
+    CANONICAL-INDUCTION-CMP tp<%10> = icmp tp<%6>, ir<%17>
+  No successors
+
+  tensor.ph3:
+    WIDEN tp<%11> = srem tp<%7>, ir<%7>
+      ; DimSet={4}
+    WIDEN tp<%12> = mul tp<%11>, ir<%25>
+      ; DimSet={4}
+    WIDEN-GEP tp<%13> = getelementptr ir<%43>, tp<%12>
+      ; DimSet={4}
+    WIDEN tp<%14> = mul tp<%7>, ir<%33>
+      ; DimSet={4}
+    WIDEN-GEP tp<%15> = getelementptr ir<%45>, tp<%14>
+      ; DimSet={4}
+    WIDEN tp<%16> = mul tp<%7>, ir<%41>
+      ; DimSet={4}
+    WIDEN-GEP tp<%17> = getelementptr ir<%47>, tp<%16>
+      ; DimSet={4}
+  Successor(s): tensor loop3
+
+  <x1> tensor loop3: {
+    ir-bb<>:
+      CANONICAL-INDUCTION tp<%18> = phi ir<0>, tp<%19>
+      WIDEN-INDUCTION tp<%20> = phi ir<0>, tp<%21>
+        ; DimSet={3}
+      WIDEN tp<%22> = srem tp<%20>, ir<%5>
+        ; DimSet={3}
+      WIDEN tp<%23> = mul tp<%22>, ir<%23>
+        ; DimSet={3}
+      WIDEN-GEP tp<%24> = getelementptr ir<%59>, tp<%23>
+        ; DimSet={3}
+      WIDEN tp<%25> = mul tp<%20>, ir<%31>
+        ; DimSet={3}
+      WIDEN-GEP tp<%26> = getelementptr ir<%61>, tp<%25>
+        ; DimSet={3}
+      WIDEN tp<%27> = mul tp<%20>, ir<%39>
+        ; DimSet={3}
+      WIDEN-GEP tp<%28> = getelementptr ir<%63>, tp<%27>
+        ; DimSet={3}
+    Successor(s): tensor.latch3 tensor.ph2
+
+    tensor.latch3:
+      WIDEN tp<%21> = add tp<%20>, ir<1>
+        ; DimSet={3}
+      WIDEN tp<%29> = icmp tp<%21>, ir<%15>
+        ; DimSet={3}
+      CANONICAL-INDUCTION-INC tp<%19> = add tp<%18>, tp<%3>
+      CANONICAL-INDUCTION-CMP tp<%30> = icmp tp<%19>, ir<%15>
+    No successors
+
+    tensor.ph2:
+    Successor(s): tensor loop2
+
+    <x1> tensor loop2: {
+      ir-bb<>:
+        CANONICAL-INDUCTION tp<%31> = phi ir<0>, tp<%32>
+        WIDEN-INDUCTION tp<%33> = phi ir<0>, tp<%34>
+          ; DimSet={2}
+      Successor(s): tensor.latch2 tensor.ph1
+
+      tensor.latch2:
+        WIDEN tp<%34> = add tp<%33>, ir<1>
+          ; DimSet={2}
+        WIDEN tp<%35> = icmp tp<%34>, ir<%13>
+          ; DimSet={2}
+        CANONICAL-INDUCTION-INC tp<%32> = add tp<%31>, tp<%2>
+        CANONICAL-INDUCTION-CMP tp<%36> = icmp tp<%32>, ir<%13>
+      No successors
+
+      tensor.ph1:
+        WIDEN tp<%37> = mul tp<%33>, ir<%29>
+          ; DimSet={2}
+        WIDEN tp<%38> = mul tp<%33>, ir<%37>
+          ; DimSet={2}
+        WIDEN-GEP tp<%39> = getelementptr tp<%26>, tp<%37>
+          ; DimSet={2,3}
+        WIDEN-GEP tp<%40> = getelementptr tp<%28>, tp<%38>
+          ; DimSet={2,3}
+      Successor(s): tensor loop1
+
+      <x1> tensor loop1: {
+        ir-bb<>:
+          CANONICAL-INDUCTION tp<%41> = phi ir<0>, tp<%42>
+          WIDEN-INDUCTION tp<%43> = phi ir<0>, tp<%44>
+            ; DimSet={1}
+        Successor(s): tensor.latch1 tensor.ph0
+
+        tensor.latch1:
+          WIDEN tp<%45> = mul tp<%43>, ir<%35>
+            ; DimSet={1}
+          WIDEN-GEP tp<%46> = getelementptr ir<%83>, tp<%45>
+            ; DimSet={1}
+          WIDEN-CAST tp<%47> = bitcast tp<%46>
+            ; DimSet={1}
+          WIDEN store tp<%47>, ir<%96>
+          WIDEN tp<%44> = add tp<%43>, ir<1>
+            ; DimSet={1}
+          WIDEN tp<%48> = icmp tp<%44>, ir<%11>
+            ; DimSet={1}
+          CANONICAL-INDUCTION-INC tp<%42> = add tp<%41>, tp<%1>
+          CANONICAL-INDUCTION-CMP tp<%49> = icmp tp<%42>, ir<%11>
+        No successors
+
+        tensor.ph0:
+          WIDEN tp<%50> = mul tp<%43>, ir<%21>
+            ; DimSet={1}
+          WIDEN-GEP tp<%51> = getelementptr tp<%24>, tp<%50>
+            ; DimSet={1,3}
+        Successor(s): tensor loop0
+
+        <x1> tensor loop0: {
+          ir-bb<>:
+            CANONICAL-INDUCTION tp<%52> = phi ir<0>, tp<%53>
+            WIDEN-INDUCTION tp<%54> = phi ir<0>, tp<%55>
+              ; DimSet={0}
+            WIDEN-REDUCTION-PHI tp<%56> = phi ir<0>, ir<%114>
+            WIDEN tp<%57> = mul tp<%54>, ir<%19>
+              ; DimSet={0}
+            WIDEN-GEP tp<%58> = getelementptr ir<%91>, tp<%57>
+              ; DimSet={0}
+            WIDEN-CAST tp<%59> = bitcast tp<%58>
+              ; DimSet={0}
+            WIDEN tp<%60> = load tp<%59>
+              ; DimSet={0}
+            WIDEN tp<%61> = mul tp<%54>, ir<%27>
+              ; DimSet={0}
+            WIDEN-GEP tp<%62> = getelementptr ir<%82>, tp<%61>
+              ; DimSet={0}
+            WIDEN-CAST tp<%63> = bitcast tp<%62>
+              ; DimSet={0}
+            WIDEN tp<%64> = load tp<%63>
+              ; DimSet={0}
+            WIDEN tp<%65> = fmul tp<%60>, tp<%64>
+              ; DimSet={0}
+            WIDEN tp<%66> = fadd tp<%56>, tp<%65>
+              ; DimSet={0}
+            WIDEN tp<%67> = add tp<%54>, ir<1>
+              ; DimSet={0}
+            WIDEN tp<%68> = icmp tp<%67>, ir<%9>
+              ; DimSet={0}
+          Successor(s): tensor.latch0 tensor.body.0
+
+          tensor.latch0:
+            WIDEN tp<%69> = mul tp<%54>, ir<%19>
+              ; DimSet={0}
+            WIDEN-GEP tp<%70> = getelementptr ir<%91>, tp<%69>
+              ; DimSet={0}
+            WIDEN-CAST tp<%71> = bitcast tp<%70>
+              ; DimSet={0}
+            WIDEN tp<%72> = load tp<%71>
+              ; DimSet={0}
+            WIDEN tp<%73> = mul tp<%54>, ir<%27>
+              ; DimSet={0}
+            WIDEN-GEP tp<%74> = getelementptr ir<%82>, tp<%73>
+              ; DimSet={0}
+            WIDEN-CAST tp<%75> = bitcast tp<%74>
+              ; DimSet={0}
+            WIDEN tp<%76> = load tp<%75>
+              ; DimSet={0}
+            WIDEN tp<%77> = fmul tp<%72>, tp<%76>
+              ; DimSet={0}
+            WIDEN tp<%78> = fadd tp<%56>, tp<%77>
+              ; DimSet={0}
+            WIDEN tp<%55> = add tp<%54>, ir<1>
+              ; DimSet={0}
+            WIDEN tp<%79> = icmp tp<%55>, ir<%9>
+              ; DimSet={0}
+            CANONICAL-INDUCTION-INC tp<%53> = add tp<%52>, tp<%0>
+            CANONICAL-INDUCTION-CMP tp<%80> = icmp tp<%53>, ir<%9>
+          No successors
+
+          tensor.body.0:
+          No successors
+
+        }
+        Successor(s): middle.block0
+
+      }
+      Successor(s): middle.block1
+
+    }
+    Successor(s): middle.block2
+
+  }
+  Successor(s): middle.block3
+
+}
+Successor(s): middle.block4
+
+middle.block4:
+Successor(s): ir-bb<> scalar.ph4
+
+ir-bb<>:
+Successor(s): scalar.ph4
+
+scalar.ph4:
+No successors
+
+}
+Recipe classifications (non-Scalar):
+  [tensor.latch4] BroadcastBinary
+  [tensor.ph3] BroadcastBinary
+  [tensor.ph3] BroadcastBinary
+  [tensor.ph3] BroadcastBinary
+  [tensor.ph3] BroadcastBinary
+  [ir-bb<>] BroadcastBinary
+  [ir-bb<>] BroadcastBinary
+  [ir-bb<>] BroadcastBinary
+  [ir-bb<>] BroadcastBinary
+  [tensor.latch3] BroadcastBinary
+  [tensor.latch2] BroadcastBinary
+  [tensor.ph1] BroadcastBinary
+  [tensor.ph1] BroadcastBinary
+  [tensor.latch1] BroadcastBinary
+  [tensor.latch1] BroadcastBinary
+  [tensor.ph0] BroadcastBinary
+  [ir-bb<>] BroadcastBinary
+  [ir-bb<>] BroadcastBinary
+  [ir-bb<>] Contraction (contractDim=0)
+  [ir-bb<>] Contraction (contractDim=0)
+  [ir-bb<>] BroadcastBinary
+  [tensor.latch0] BroadcastBinary
+  [tensor.latch0] BroadcastBinary
+  [tensor.latch0] Contraction (contractDim=0)
+  [tensor.latch0] Contraction (contractDim=0)
+  [tensor.latch0] BroadcastBinary

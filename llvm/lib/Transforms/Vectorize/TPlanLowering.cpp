@@ -605,6 +605,8 @@ bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
     dbgs() << "\n=== Stage 2: After Widening (DimSets propagated) ===\n";
     Plan.print(dbgs());
   });
+  errs() << "\n=== Stage 2: After Widening (DimSets propagated) ===\n";
+  Plan.print(errs());
 
   // 2. Classify every recipe by DimSet patterns.
   RecipeClassMap CM;
@@ -614,6 +616,9 @@ bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
     Plan.print(dbgs());
     printClassificationSummary(Plan, CM, dbgs());
   });
+  errs() << "\n=== Stage 3: After Pattern Matching (recipe classifications) ===\n";
+  Plan.print(errs());
+  printClassificationSummary(Plan, CM, errs());
 
   // 3. Lower: walk block CFG in construction order.
   IRBuilder<> Builder(F.getContext());
