@@ -265,7 +265,7 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   unsigned LHSLastDim = static_cast<unsigned>(LHSDR->DimSet.find_last());
   unsigned RHSLastDim = static_cast<unsigned>(RHSDR->DimSet.find_last());
   Value *VDA = expandStride(LHSStrides.back(), LHSLastDim);
-  Value *VDB = expandStride(RHSStrides.back(), RHSLastDim);
+  Value *VDB = expandStride(RHSStrides[RHSPos], static_cast<unsigned>(ContractDim));
   Value *VDC;
   if (CStoreRecipe && State.SE) {
     int CLastDim = CStoreRecipe->DimSet.find_last();

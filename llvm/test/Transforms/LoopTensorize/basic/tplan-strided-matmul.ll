@@ -9,9 +9,13 @@ target triple = "aarch64"
 
 ; CHECK-LABEL: @gemm_strided
 ; CHECK: call void @llvm.tensor.matmul.f32(
+; CHECK-SAME: i64 %lda
+; CHECK-SAME: i64 %ldb
 
 ; CHECK-LABEL: @gemm_dense
 ; CHECK: call void @llvm.tensor.matmul.f32(
+; CHECK-SAME: i64 %K
+; CHECK-SAME: i64 %N
 
 ; Strided GEMM: A[i][k] with leading dim lda, B[k][j] with leading dim ldb.
 ; PHI-based k-reduction: accumulator initialized to 0.0, stored after k-loop.
