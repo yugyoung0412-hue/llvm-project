@@ -20,6 +20,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -181,8 +182,10 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
 
   SmallVector<unsigned>  LHSShape   = getTPValueShape(*LHSDR, State.Plan);
   SmallVector<unsigned>  RHSShape   = getTPValueShape(*RHSDR, State.Plan);
-  SmallVector<uint64_t>  LHSStrides = getTPValueStrides(*LHSDR, State.Plan);
-  SmallVector<uint64_t>  RHSStrides = getTPValueStrides(*RHSDR, State.Plan);
+  SmallVector<const SCEV *> LHSStrides =
+      getTPValueStrides(*LHSDR, State.Plan, *State.SE);
+  SmallVector<const SCEV *> RHSStrides =
+      getTPValueStrides(*RHSDR, State.Plan, *State.SE);
 
   int ContractDim = State.getContractDim(ReductionUpdate);
   if (ContractDim < 0 ||
@@ -205,24 +208,19 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   uint64_t M = LHSShape[1 - LHSPos];
   uint64_t K = LHSShape[LHSPos];
   uint64_t N = RHSShape[1 - RHSPos];
-  // lda/ldb: leading dimension = stride of the outermost dim (last in
-  // innermost-first DimSet order), regardless of where K sits.
-  uint64_t LDA = LHSStrides.back();
-  uint64_t LDB = RHSStrides.back();
-  uint64_t LDC = State.Plan.getDenseStrideForDim(
-      static_cast<unsigned>(LHSDR->DimSet.find_last()) + 1u);
-
   // Locate the C accumulator pointer from the store recipe that consumes
   // the reduction result.
   //
   // Primary: walk recipe-level users of the ReductionUpdate defined value.
   // This works when the store is in the same TPBasicBlock.
   Value *CPtr = nullptr;
+  TPWidenStoreRecipe *CStoreRecipe = nullptr;
   if (auto *DefVal = ReductionUpdate->getDefinedValue()) {
     for (TPUser *U : DefVal->users()) {
       auto *RB = dyn_cast<TPRecipeBase>(U);
       if (!RB) continue;
       if (auto *SR = dyn_cast<TPWidenStoreRecipe>(RB)) {
+        CStoreRecipe = SR;
         auto *PtrDR = dyn_cast<TPSingleDefRecipe>(SR->getOperand(0));
         if (PtrDR)
           CPtr = State.getValue(PtrDR);
@@ -258,11 +256,32 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   auto MatmulFn = getTensorMatmulFn(*Mod, ElemTy);
   IRBuilder<> &B = State.Builder;
   auto I64 = [&](uint64_t V) -> Value * { return B.getInt64(V); };
+  auto expandStride = [&](const SCEV *S, unsigned Dim) -> Value * {
+    if (State.Expander && State.Expander->isSafeToExpand(S))
+      return State.Expander->expandCodeFor(S, B.getInt64Ty(),
+                                            &*B.GetInsertPoint());
+    return B.getInt64(State.Plan.getDenseStrideForDim(Dim));
+  };
+  unsigned LHSLastDim = static_cast<unsigned>(LHSDR->DimSet.find_last());
+  unsigned RHSLastDim = static_cast<unsigned>(RHSDR->DimSet.find_last());
+  Value *VDA = expandStride(LHSStrides.back(), LHSLastDim);
+  Value *VDB = expandStride(RHSStrides.back(), RHSLastDim);
+  Value *VDC;
+  if (CStoreRecipe && State.SE) {
+    int CLastDim = CStoreRecipe->DimSet.find_last();
+    const SCEV *LDC_SCEV = CLastDim >= 0
+        ? CStoreRecipe->getMemStride(static_cast<unsigned>(CLastDim),
+                                      State.Plan, *State.SE)
+        : State.SE->getConstant(APInt(64, 1));
+    VDC = expandStride(LDC_SCEV, CLastDim >= 0 ? static_cast<unsigned>(CLastDim) : 0);
+  } else {
+    VDC = I64(State.Plan.getDenseStrideForDim(LHSLastDim + 1));
+  }
 
   return B.CreateCall(MatmulFn,
-      {CPtr,    I64(M), I64(N), I64(LDC),
-       LHSPtr,  I64(M), I64(K), I64(LDA),
-       RHSPtr,  I64(K), I64(N), I64(LDB)});
+      {CPtr,   I64(M), I64(N), VDC,
+       LHSPtr, I64(M), I64(K), VDA,
+       RHSPtr, I64(K), I64(N), VDB});
 }
 
 //===----------------------------------------------------------------------===//
@@ -416,12 +435,29 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
       if (!CPtr) return false;
 
       SmallVector<unsigned>  Shape    = getTPValueShape(*ADR, State.Plan);
-      SmallVector<uint64_t>  AStrides = getTPValueStrides(*ADR, State.Plan);
-      SmallVector<uint64_t>  BStrides = getTPValueStrides(*BDR, State.Plan);
-      // C shares the same DimSet as A/B in an elementwise op, so its dense
-      // strides match AStrides. Phase 1 does not yet populate MemStrides for C
-      // independently; when strided-C support is added, query the store recipe.
-      SmallVector<uint64_t>  CStrides = AStrides;
+      SmallVector<const SCEV *> AStrides =
+          getTPValueStrides(*ADR, State.Plan, *State.SE);
+      SmallVector<const SCEV *> BStrides =
+          getTPValueStrides(*BDR, State.Plan, *State.SE);
+      // Derive C strides from the store recipe's MemStrides.
+      SmallVector<const SCEV *> CStrides;
+      TPWidenStoreRecipe *CStoreRecipe = nullptr;
+      if (auto *DefVal = this->getDefinedValue()) {
+        for (TPUser *U : DefVal->users()) {
+          auto *RB = dyn_cast<TPRecipeBase>(U);
+          if (!RB) continue;
+          if (auto *SR = dyn_cast<TPWidenStoreRecipe>(RB)) {
+            CStoreRecipe = SR;
+            for (int D = SR->DimSet.find_first(); D >= 0;
+                 D = SR->DimSet.find_next(D))
+              CStrides.push_back(
+                  SR->getMemStride(static_cast<unsigned>(D), State.Plan, *State.SE));
+            break;
+          }
+        }
+      }
+      if (CStrides.empty())
+        CStrides = AStrides; // fallback: use A's strides
 
       Type *ElemTy = ALoad->getInstruction()->getType()->getScalarType();
       if (!ElemTy->isFloatTy() && !ElemTy->isDoubleTy()) return false;
@@ -429,14 +465,28 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
       auto EltFn   = getTensorElementwiseFn(*Mod, OpName, Rank, ElemTy);
       IRBuilder<> &B = State.Builder;
       auto I64 = [&](uint64_t V) -> Value * { return B.getInt64(V); };
+      auto expandStride = [&](const SCEV *S, unsigned Dim) -> Value * {
+        if (State.Expander && State.Expander->isSafeToExpand(S))
+          return State.Expander->expandCodeFor(S, B.getInt64Ty(),
+                                               &*B.GetInsertPoint());
+        return B.getInt64(State.Plan.getDenseStrideForDim(Dim));
+      };
 
       SmallVector<Value *> Args;
-      for (auto &[Ptr, Strides] : {std::pair{CPtr, &CStrides},
-                                    std::pair{APtr, &AStrides},
-                                    std::pair{BPtr, &BStrides}}) {
-        Args.push_back(Ptr);
-        for (uint64_t S : *Strides) Args.push_back(I64(S));
-      }
+      auto appendStrideArgs = [&](SmallVector<const SCEV *> &Strides,
+                                   const SmallBitVector &DimBV) {
+        int D = DimBV.find_first();
+        for (const SCEV *S : Strides) {
+          Args.push_back(expandStride(S, D >= 0 ? static_cast<unsigned>(D) : 0));
+          if (D >= 0) D = DimBV.find_next(D);
+        }
+      };
+      Args.push_back(CPtr);
+      appendStrideArgs(CStrides, CStoreRecipe ? CStoreRecipe->DimSet : ADR->DimSet);
+      Args.push_back(APtr);
+      appendStrideArgs(AStrides, ADR->DimSet);
+      Args.push_back(BPtr);
+      appendStrideArgs(BStrides, BDR->DimSet);
       for (unsigned D : Shape) Args.push_back(I64(D));
       B.CreateCall(EltFn, Args);
       return true;
@@ -469,11 +519,16 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
       auto *DR = dyn_cast<TPSingleDefRecipe>(getOperand(0));
       if (DR) {
         auto Shape   = getTPValueShape(*DR, State.Plan);
-        auto Strides = getTPValueStrides(*DR, State.Plan);
+        auto Strides = State.SE
+            ? getTPValueStrides(*DR, State.Plan, *State.SE)
+            : SmallVector<const SCEV *>{};
         dbgs() << "BroadcastBinary shape=[";
         for (unsigned D : Shape) dbgs() << D << " ";
         dbgs() << "] strides=[";
-        for (uint64_t S : Strides) dbgs() << S << " ";
+        for (const SCEV *S : Strides) {
+          if (S) S->print(dbgs()); else dbgs() << "?";
+          dbgs() << " ";
+        }
         dbgs() << "] — scalar fallback (TODO: broadcast intrinsic)\n";
       }
     });
@@ -574,11 +629,16 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
       auto *DR = dyn_cast<TPSingleDefRecipe>(getOperand(0));
       if (DR) {
         auto Shape   = getTPValueShape(*DR, State.Plan);
-        auto Strides = getTPValueStrides(*DR, State.Plan);
+        auto Strides = State.SE
+            ? getTPValueStrides(*DR, State.Plan, *State.SE)
+            : SmallVector<const SCEV *>{};
         dbgs() << "PlainReduction shape=[";
         for (unsigned D : Shape) dbgs() << D << " ";
         dbgs() << "] strides=[";
-        for (uint64_t S : Strides) dbgs() << S << " ";
+        for (const SCEV *S : Strides) {
+          if (S) S->print(dbgs()); else dbgs() << "?";
+          dbgs() << " ";
+        }
         dbgs() << "] — scalar fallback\n";
       }
     });
@@ -610,7 +670,7 @@ bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
 
   // 2. Classify every recipe by DimSet patterns.
   RecipeClassMap CM;
-  TPRecipePatternMatcher_match(Plan, CM);
+  TPRecipePatternMatcher_match(Plan, CM, SE, LI);
   LLVM_DEBUG({
     dbgs() << "\n=== Stage 3: After Pattern Matching (recipe classifications) ===\n";
     Plan.print(dbgs());
@@ -627,6 +687,9 @@ bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
 
   TPTransformState State(Builder, Plan);
   State.ClassMap = &CM;
+  SCEVExpander Expander(SE, "tplan.stride");
+  State.SE = &SE;
+  State.Expander = &Expander;
 
   if (Plan.getEntry()) {
     // Collect and execute all blocks in top-level construction order.
