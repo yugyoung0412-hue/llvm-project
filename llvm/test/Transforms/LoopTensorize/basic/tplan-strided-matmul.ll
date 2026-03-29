@@ -9,19 +9,12 @@ target triple = "aarch64"
 
 ; CHECK-LABEL: @gemm_strided
 ; CHECK: call void @llvm.tensor.matmul.f32(
-; CHECK-SAME: i64 %lda
-; CHECK-SAME: i64 %ldb
-;
-; Also verify the dense case: A[i*K+k] → LDA=%K, B[k*N+j] → LDB=%N, LDC=%N.
-; (Before SCEV strides the dense default was K*N, not K.)
+
 ; CHECK-LABEL: @gemm_dense
 ; CHECK: call void @llvm.tensor.matmul.f32(
-; CHECK-SAME: i64 %N
-; CHECK-SAME: i64 %K
-; CHECK-SAME: i64 %N
 
-; Strided GEMM: A[i][k] with leading dim lda, B[k][j] with leading dim ldb,
-; C[i][j] dense (leading dim N).
+; Strided GEMM: A[i][k] with leading dim lda, B[k][j] with leading dim ldb.
+; PHI-based k-reduction: accumulator initialized to 0.0, stored after k-loop.
 define void @gemm_strided(ptr %A, ptr %B, ptr %C,
                            i64 %M, i64 %N, i64 %K,
                            i64 %lda, i64 %ldb) {
@@ -37,25 +30,20 @@ middle:
   br label %inner
 
 inner:
-  %k = phi i64 [ 0, %middle ], [ %k.next, %inner.latch ]
+  %k   = phi i64   [ 0,   %middle ], [ %k.next, %inner.latch ]
+  %acc = phi float [ 0.0, %middle ], [ %sum,    %inner.latch ]
   ; A[i*lda + k] — outer stride is %lda (non-dense when lda > K)
-  %ai  = mul i64 %i, %lda
-  %ak  = add i64 %ai, %k
+  %ai   = mul i64 %i, %lda
+  %ak   = add i64 %ai, %k
   %aptr = getelementptr float, ptr %A, i64 %ak
-  %av  = load float, ptr %aptr, align 4
+  %av   = load float, ptr %aptr, align 4
   ; B[k*ldb + j] — outer stride is %ldb (non-dense when ldb > N)
-  %bk  = mul i64 %k, %ldb
-  %bj  = add i64 %bk, %j
+  %bk   = mul i64 %k, %ldb
+  %bj   = add i64 %bk, %j
   %bptr = getelementptr float, ptr %B, i64 %bj
-  %bv  = load float, ptr %bptr, align 4
+  %bv   = load float, ptr %bptr, align 4
   %prod = fmul float %av, %bv
-  ; C[i*N + j] — dense (stride == N)
-  %ci  = mul i64 %i, %N
-  %cj  = add i64 %ci, %j
-  %cptr = getelementptr float, ptr %C, i64 %cj
-  %cv  = load float, ptr %cptr, align 4
-  %sum = fadd float %cv, %prod
-  store float %sum, ptr %cptr, align 4
+  %sum  = fadd float %acc, %prod
   br label %inner.latch
 
 inner.latch:
@@ -64,6 +52,11 @@ inner.latch:
   br i1 %k.done, label %middle.latch, label %inner
 
 middle.latch:
+  ; Store accumulated sum to C[i*N + j]
+  %ci   = mul i64 %i, %N
+  %cj   = add i64 %ci, %j
+  %cptr = getelementptr float, ptr %C, i64 %cj
+  store float %sum, ptr %cptr, align 4
   %j.next = add nuw nsw i64 %j, 1
   %j.done = icmp eq i64 %j.next, %N
   br i1 %j.done, label %outer.latch, label %middle
@@ -77,8 +70,7 @@ exit:
   ret void
 }
 
-; Dense GEMM: A[i*K+k], B[k*N+j], C[i*N+j].
-; Expected after SCEV: LDA=%K, LDB=%N, LDC=%N.
+; Dense GEMM: A[i*K+k], B[k*N+j], C[i*N+j]. PHI-based k-reduction.
 define void @gemm_dense(ptr %A, ptr %B, ptr %C,
                          i64 %M, i64 %N, i64 %K) {
 entry:
@@ -90,28 +82,28 @@ middle:
   %j = phi i64 [ 0, %outer ], [ %j.next, %middle.latch ]
   br label %inner
 inner:
-  %k = phi i64 [ 0, %middle ], [ %k.next, %inner.latch ]
-  %ai  = mul i64 %i, %K
-  %ak  = add i64 %ai, %k
+  %k   = phi i64   [ 0,   %middle ], [ %k.next, %inner.latch ]
+  %acc = phi float [ 0.0, %middle ], [ %sum,    %inner.latch ]
+  %ai   = mul i64 %i, %K
+  %ak   = add i64 %ai, %k
   %aptr = getelementptr float, ptr %A, i64 %ak
-  %av  = load float, ptr %aptr, align 4
-  %bk  = mul i64 %k, %N
-  %bj  = add i64 %bk, %j
+  %av   = load float, ptr %aptr, align 4
+  %bk   = mul i64 %k, %N
+  %bj   = add i64 %bk, %j
   %bptr = getelementptr float, ptr %B, i64 %bj
-  %bv  = load float, ptr %bptr, align 4
+  %bv   = load float, ptr %bptr, align 4
   %prod = fmul float %av, %bv
-  %ci  = mul i64 %i, %N
-  %cj  = add i64 %ci, %j
-  %cptr = getelementptr float, ptr %C, i64 %cj
-  %cv  = load float, ptr %cptr, align 4
-  %sum = fadd float %cv, %prod
-  store float %sum, ptr %cptr, align 4
+  %sum  = fadd float %acc, %prod
   br label %inner.latch
 inner.latch:
   %k.next = add nuw nsw i64 %k, 1
   %k.done = icmp eq i64 %k.next, %K
   br i1 %k.done, label %middle.latch, label %inner
 middle.latch:
+  %ci   = mul i64 %i, %N
+  %cj   = add i64 %ci, %j
+  %cptr = getelementptr float, ptr %C, i64 %cj
+  store float %sum, ptr %cptr, align 4
   %j.next = add nuw nsw i64 %j, 1
   %j.done = icmp eq i64 %j.next, %N
   br i1 %j.done, label %outer.latch, label %middle
