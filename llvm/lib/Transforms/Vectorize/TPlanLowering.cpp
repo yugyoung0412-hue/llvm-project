@@ -263,7 +263,6 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     return B.getInt64(State.Plan.getDenseStrideForDim(Dim));
   };
   unsigned LHSLastDim = static_cast<unsigned>(LHSDR->DimSet.find_last());
-  unsigned RHSLastDim = static_cast<unsigned>(RHSDR->DimSet.find_last());
   Value *VDA = expandStride(LHSStrides.back(), LHSLastDim);
   Value *VDB = expandStride(RHSStrides[RHSPos], static_cast<unsigned>(ContractDim));
   Value *VDC;
