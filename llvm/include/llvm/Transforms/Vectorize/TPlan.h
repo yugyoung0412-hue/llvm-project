@@ -37,6 +37,7 @@ class Instruction;
 class Loop;
 class LoopInfo;
 class ScalarEvolution;
+class SCEVExpander;
 class SCEV;
 class TPBasicBlock;
 class TPBlockBase;
@@ -558,6 +559,20 @@ SmallVector<TPBlockBase *, 8> constructionOrder(TPBlockBase *Start);
 //===----------------------------------------------------------------------===//
 class TPDef {
   friend class TPRecipeValue;
+  // Most recipes define exactly one value, so TinyPtrVector stores the pointer
+  // inline with no heap allocation for the common case.  A vector is only
+  // needed when a single recipe must produce multiple outputs — for example,
+  // an interleaved-load group (factor N) that issues one wide load + shuffles
+  // but exposes N independent results to the rest of the IR:
+  //
+  //   for (int i = 0; i < N; i++) {
+  //     float r = data[i].r;  // \
+  //     float g = data[i].g;  //  > one interleave recipe, 3 defined values
+  //     float b = data[i].b;  // /
+  //   }
+  //
+  // TPlan does not currently generate such recipes, but the infrastructure
+  // is kept general (matching VPlan's VPDef design) to allow it in the future.
   TinyPtrVector<TPRecipeValue *> DefinedValues;
 
   void addDefinedValue(TPRecipeValue *V) { DefinedValues.push_back(V); }
@@ -712,16 +727,15 @@ public:
   SmallBitVector DimSet;
 
   /// Per-dim memory stride overrides (load/store recipes only).
-  /// Key: dim index (innermost=0). Value: stride in elements.
-  /// Absent entry → use Plan.getDenseStrideForDim(D).
-  /// Phase 1: always empty; SCEV-based population is future work.
-  /// Note: spec uses TPValue* for dynamic strides; uint64_t is a deliberate
-  /// Phase 1 scope reduction.
-  DenseMap<unsigned, uint64_t> MemStrides;
+  /// Key: dim index (innermost=0). Value: SCEV stride expression in elements.
+  /// Absent entry → dense default expressed as a SCEV constant.
+  /// Populated by TPRecipePatternMatcher_match() via SCEV GEP-index analysis.
+  DenseMap<unsigned, const SCEV *> MemStrides;
 
-  /// Returns the effective memory stride for \p Dim.
-  /// Returns MemStrides[Dim] if set, else Plan.getDenseStrideForDim(Dim).
-  uint64_t getMemStride(unsigned Dim, const TPlan &Plan) const;
+  /// Returns the effective memory stride for \p Dim as a SCEV expression.
+  /// Returns MemStrides[Dim] if set, else SE.getConstant(getDenseStrideForDim(Dim)).
+  const SCEV *getMemStride(unsigned Dim, const TPlan &Plan,
+                            ScalarEvolution &SE) const;
 
   void printAsOperand(raw_ostream &OS, TPSlotTracker &Tracker) const override;
 
@@ -1171,6 +1185,18 @@ public:
 
   Instruction *getInstruction() const { return StoreInst; }
 
+  /// Dimensions this store participates in. Copied from the stored-value
+  /// operand's DimSet by TPRecipePatternMatcher_match().
+  SmallBitVector DimSet;
+
+  /// Per-dim memory stride overrides in elements.
+  /// Populated by TPRecipePatternMatcher_match() via SCEV GEP-index analysis.
+  DenseMap<unsigned, const SCEV *> MemStrides;
+
+  /// Returns the effective memory stride for \p Dim as a SCEV expression.
+  const SCEV *getMemStride(unsigned Dim, const TPlan &Plan,
+                            ScalarEvolution &SE) const;
+
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
   void execute(TPTransformState &State) const override;
@@ -1377,6 +1403,10 @@ struct TPTransformState {
   /// clones an instruction whose operands were defined later in the same BB,
   /// remapClone() replaces those operands with the already-emitted clones.
   DenseMap<Value *, Value *> EmittedMap;
+  /// Set by TPlanLowering_lower() before execute() loop.
+  ScalarEvolution *SE = nullptr;
+  /// Set by TPlanLowering_lower() before execute() loop. Owned by the caller.
+  SCEVExpander *Expander = nullptr;
 
   TPTransformState(IRBuilder<> &B, const TPlan &P) : Builder(B), Plan(P) {}
 
@@ -1415,12 +1445,6 @@ struct TPTransformState {
 //===----------------------------------------------------------------------===//
 // Inline definitions requiring complete TPlan
 //===----------------------------------------------------------------------===//
-inline uint64_t TPSingleDefRecipe::getMemStride(unsigned Dim,
-                                               const TPlan &Plan) const {
-  auto It = MemStrides.find(Dim);
-  return It != MemStrides.end() ? It->second : Plan.getDenseStrideForDim(Dim);
-}
-
 /// Propagates DimSets from induction variables through the def-use graph
 /// using BFS with union rule. Must be called before TPRecipePatternMatcher_match().
 void TPlanWidener_widen(TPlan &Plan);

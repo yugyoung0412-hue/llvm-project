@@ -20,6 +20,22 @@
 
 using namespace llvm;
 
+const SCEV *TPSingleDefRecipe::getMemStride(unsigned Dim, const TPlan &Plan,
+                                             ScalarEvolution &SE) const {
+  auto It = MemStrides.find(Dim);
+  if (It != MemStrides.end())
+    return It->second;
+  return SE.getConstant(APInt(64, Plan.getDenseStrideForDim(Dim)));
+}
+
+const SCEV *TPWidenStoreRecipe::getMemStride(unsigned Dim, const TPlan &Plan,
+                                              ScalarEvolution &SE) const {
+  auto It = MemStrides.find(Dim);
+  if (It != MemStrides.end())
+    return It->second;
+  return SE.getConstant(APInt(64, Plan.getDenseStrideForDim(Dim)));
+}
+
 //===----------------------------------------------------------------------===//
 // TPSlotTracker
 //===----------------------------------------------------------------------===//
