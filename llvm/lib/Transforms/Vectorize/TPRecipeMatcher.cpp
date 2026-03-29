@@ -9,6 +9,9 @@
 #include "llvm/Transforms/Vectorize/TPRecipeMatcher.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/Vectorize/TPlan.h"
@@ -171,12 +174,100 @@ SmallVector<unsigned> llvm::getTPValueShape(const TPSingleDefRecipe &V,
   return Shape;
 }
 
-SmallVector<uint64_t> llvm::getTPValueStrides(const TPSingleDefRecipe &V,
-                                               const TPlan &Plan) {
-  SmallVector<uint64_t> Strides;
+SmallVector<const SCEV *> llvm::getTPValueStrides(const TPSingleDefRecipe &V,
+                                                   const TPlan &Plan,
+                                                   ScalarEvolution &SE) {
+  SmallVector<const SCEV *> Strides;
   for (int D = V.DimSet.find_first(); D >= 0; D = V.DimSet.find_next(D))
-    Strides.push_back(V.getMemStride(static_cast<unsigned>(D), Plan));
+    Strides.push_back(V.getMemStride(static_cast<unsigned>(D), Plan, SE));
   return Strides;
+}
+
+/// Build a map from TPlan dimension index → Loop* by scanning IV recipes
+/// in the plan's block structure.
+static DenseMap<unsigned, Loop *>
+buildDimToLoop(TPlan &Plan, LoopInfo &LI) {
+  DenseMap<unsigned, Loop *> DimToLoop;
+  if (!Plan.getEntry())
+    return DimToLoop;
+  SmallVector<TPBlockBase *, 8> Worklist;
+  SmallPtrSet<TPBlockBase *, 8> Seen;
+  Worklist.push_back(const_cast<TPBlockBase *>(Plan.getEntry()));
+  while (!Worklist.empty()) {
+    TPBlockBase *Blk = Worklist.pop_back_val();
+    if (!Seen.insert(Blk).second)
+      continue;
+    if (auto *BB = dyn_cast<TPBasicBlock>(Blk)) {
+      for (TPRecipeBase &R : *BB) {
+        if (auto *IV = dyn_cast<TPWidenInductionRecipe>(&R)) {
+          auto *Phi = IV->getIVPhi();
+          if (Loop *L = LI.getLoopFor(Phi->getParent()))
+            DimToLoop[IV->getDimIndex()] = L;
+        }
+      }
+    }
+    if (auto *Reg = dyn_cast<TPRegionBlock>(Blk))
+      if (Reg->getEntry())
+        Worklist.push_back(Reg->getEntry());
+    for (TPBlockBase *Succ : Blk->getSuccessors())
+      Worklist.push_back(Succ);
+  }
+  return DimToLoop;
+}
+
+/// Extract per-dimension element-count strides from \p GEPIdx (the flat index
+/// expression of a single-index GEP) and store them in \p MemStrides.
+static void populateSCEVStridesFromIndex(
+    DenseMap<unsigned, const SCEV *> &MemStrides,
+    const SmallBitVector &DimSet,
+    Value *GEPIdx,
+    const DenseMap<unsigned, Loop *> &DimToLoop,
+    ScalarEvolution &SE) {
+  const SCEV *IdxSCEV = SE.getSCEV(GEPIdx);
+  DenseMap<const Loop *, const SCEV *> LoopStep;
+  const SCEV *S = IdxSCEV;
+  while (const auto *AR = dyn_cast<SCEVAddRecExpr>(S)) {
+    LoopStep[AR->getLoop()] = AR->getStepRecurrence(SE);
+    S = AR->getStart();
+  }
+  for (int D = DimSet.find_first(); D >= 0; D = DimSet.find_next(D)) {
+    auto DIt = DimToLoop.find(static_cast<unsigned>(D));
+    if (DIt == DimToLoop.end())
+      continue;
+    auto SIt = LoopStep.find(DIt->second);
+    if (SIt != LoopStep.end())
+      MemStrides[static_cast<unsigned>(D)] = SIt->second;
+  }
+}
+
+/// Populate MemStrides on a load recipe by analysing the GEP index of
+/// its load instruction's pointer operand.
+static void populateSCEVStrides(TPWidenLoadRecipe &LR,
+                                 const DenseMap<unsigned, Loop *> &DimToLoop,
+                                 ScalarEvolution &SE) {
+  auto *Load = cast<LoadInst>(LR.getInstruction());
+  auto *GEP = dyn_cast<GetElementPtrInst>(Load->getPointerOperand());
+  if (!GEP || GEP->getNumIndices() != 1)
+    return;
+  populateSCEVStridesFromIndex(LR.MemStrides, LR.DimSet,
+                                GEP->getOperand(1), DimToLoop, SE);
+}
+
+/// Populate DimSet + MemStrides on a store recipe. DimSet is copied from
+/// the stored-value operand's DimSet; strides come from the store's GEP index.
+static void populateSCEVStrides(TPWidenStoreRecipe &SR,
+                                 const DenseMap<unsigned, Loop *> &DimToLoop,
+                                 ScalarEvolution &SE) {
+  if (auto *ValDR = dyn_cast<TPSingleDefRecipe>(SR.getOperand(1)))
+    SR.DimSet = ValDR->DimSet;
+  if (SR.DimSet.none())
+    return;
+  auto *SI = cast<StoreInst>(SR.getInstruction());
+  auto *GEP = dyn_cast<GetElementPtrInst>(SI->getPointerOperand());
+  if (!GEP || GEP->getNumIndices() != 1)
+    return;
+  populateSCEVStridesFromIndex(SR.MemStrides, SR.DimSet,
+                                GEP->getOperand(1), DimToLoop, SE);
 }
 
 /// Collect all TPBasicBlock instances by recursively walking block successors
@@ -195,8 +286,11 @@ static void collectBBs(TPBlockBase *Start,
     collectBBs(Succ, Out, Visited);
 }
 
-void llvm::TPRecipePatternMatcher_match(const TPlan &Plan,
-                                         RecipeClassMap &Out) {
+void llvm::TPRecipePatternMatcher_match(TPlan &Plan, RecipeClassMap &Out,
+                                         ScalarEvolution &SE, LoopInfo &LI) {
+  // Build dim→Loop mapping from IV recipes before classifying.
+  DenseMap<unsigned, Loop *> DimToLoop = buildDimToLoop(Plan, LI);
+
   SmallVector<const TPBasicBlock *, 32> AllBBs;
   SmallPtrSet<TPBlockBase *, 32> Visited;
   if (Plan.getEntry())
@@ -204,6 +298,12 @@ void llvm::TPRecipePatternMatcher_match(const TPlan &Plan,
 
   for (const TPBasicBlock *BB : AllBBs) {
     for (const TPRecipeBase &R : *BB) {
+      // Populate SCEV strides on load/store recipes before classification.
+      if (auto *LR = dyn_cast<TPWidenLoadRecipe>(&R))
+        populateSCEVStrides(*const_cast<TPWidenLoadRecipe *>(LR), DimToLoop, SE);
+      else if (auto *SR = dyn_cast<TPWidenStoreRecipe>(&R))
+        populateSCEVStrides(*const_cast<TPWidenStoreRecipe *>(SR), DimToLoop, SE);
+
       RecipeClassification C;
       if (isReductionUpdate(&R)) {
         C = classifyReduction(R, Plan);
@@ -219,7 +319,6 @@ void llvm::TPRecipePatternMatcher_match(const TPlan &Plan,
   }
 
   // Second pass: mark each FusedMulRecipe of a Contraction as Contraction too.
-  // This ensures the fmul's execute() is a no-op (deferred to its consumer).
   SmallVector<std::pair<TPRecipeBase *, int>> FusedMuls;
   for (auto &[R, C] : Out) {
     if (C.Kind == TensorOpKind::Contraction && C.FusedMulRecipe)
