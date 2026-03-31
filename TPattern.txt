@@ -1,0 +1,319 @@
+TPlanPtr
+LoopTensorizePlanner::tryToBuildTPlanWithTPRecipes(TFRange &Range,
+                                                   bool UseTensorType) {
+  SmallPtrSet<const InterleaveGroup<Instruction> *, 1> InterleaveGroups;
+
+  auto &Ctx = Loop2PSE.begin()->second->getSE()->getContext();
+
+  auto *I64Ty = Type::getInt64Ty(Ctx);
+
+  TPlanPtr Plan = TPlan::createInitialTPlan(
+      createTripCountSCEV(I64Ty, *Loop2PSE.begin()->second->getSE(), Loops),
+      *Loop2PSE.begin()->second->getSE(),
+      /*RequiresScalarEpilogueCheck=*/false,
+      /*CM.foldTailByMasking()=*/false, TPlanDL.pattern);
+  
+  //YYG:REMOVE
+  LLVM_DEBUG(dbgs() << "Initial Plan\n");
+  Plan->dump();
+  LLVM_DEBUG(dbgs() << "============\n"); 
+
+  DebugLoc DL = DebugLoc();
+
+  addCanonicalIVRecipes(*Plan, I64Ty, /*HasNUW=*/true, DL);
+  
+  // YYG::REMOVE
+  LLVM_DEBUG(dbgs() << "After addCanonicalIVRecipes! \n");
+  Plan->dump();
+
+  /// Loops.front() is inner-most loop
+  TPRecipeBuilder RecipeBuilder(*Plan, Loops, TLI, Legal, CM,
+                                *Loop2PSE[Loops.front()], Builder);
+
+  // TPBasicBlock *HeaderTPBB =
+  // Plan->getTensorLoopRegion()->getEntryBasicBlock(); TPBasicBlock *TPBB =
+  // HeaderTPBB; BasicBlock *HeaderBB = OrigLoop->getHeader();
+
+  DenseMap<BasicBlock *, Loop *> BB2Loop;
+  for (Loop *L : TPlanDL.pattern->Info.Loops) {
+    BB2Loop.insert({L->getLoopPreheader(), L});
+    BB2Loop.insert({L->getHeader(), L});
+    BB2Loop.insert({L->getLoopLatch(), L});
+  }
+
+  TPBasicBlock *TPBB = nullptr;
+  SmallVector<BasicBlock *> HeaderBBs;
+
+  for (auto *L : TPlanDL.pattern->Info.LoopsR)
+    HeaderBBs.push_back(L->getHeader());
+
+  DenseMap<Loop *, TPValue *> Loop2Induction;
+
+  /// Represents the loop-induction variables
+  DenseMap<PHINode *, TPValue *> Induction2TPRecipe;
+
+  // 이미 순회한 BB를 기록할 집합
+  SmallPtrSet<BasicBlock *, 8> VisitedBBs;   // 8 은 예상 최대 개수, 필요하면 늘리세요
+
+  const auto &LoopsInfo = TPlanDL.pattern->Info.Loops;
+  
+  // Below if block will define what's the pre-header for each nested-loops.
+  // For building inital PreHeaderTPBB, re-named it when it detected.
+  // In case of inner-most loop, loop body is header/latch/exiting basic block at the same time.
+  // Thus, we skipt to inner-most loop case.
+  for (size_t Idx = 0; Idx < LoopsInfo.size(); ++Idx) {
+    Loop *CurL = LoopsInfo[Idx];
+    CurL->dump();
+
+    LoopBlocksDFS DFS(CurL);
+    DFS.perform(LI);
+    
+    BasicBlock *HeaderBB = CurL->getHeader();
+    for (BasicBlock *BB : make_range(DFS.beginRPO(), DFS.endRPO())) {
+      //YYG:REMOVE
+      errs() << "[tryTOBuild] BB: " << *BB << "\n";
+
+      if (BB == HeaderBB && BB != CurL->getLoopLatch()) {
+        /// If there's no tensor-preheader case,
+        /// ex. after loop-unrolling, there's no pre-header per header
+        /// Just collapsed to inner-most loop in this case.
+        if (succ_size(HeaderBB) == 1)
+          continue;
+        
+        /// Otherwise, there must be tensor-preheader case.
+        assert(succ_size(HeaderBB) == 2 && "Header must have two successors for outer-loop of nested-loop.");
+        
+        /// If the headerBB has branch instruction for multiple successors,
+        /// the loop is nested-loop and one of them is inner-loop's pre-header.
+        /// In that case, we should set TPBB to point tensorPreHeaderTPBB.
+        Instruction *Term = BB->getTerminator();
+        assert(isa<BranchInst>(Term) && cast<BranchInst>(Term)->isConditional() && "Header of nested-loop must have multiple successors with its conditional branch instruction.");
+
+        for (auto *succs : successors(HeaderBB)) {
+          // skip for latch block
+          if (succs == CurL->getLoopLatch()) continue;
+          if (VisitedBBs.contains(succs))
+            continue;          
+          
+          if (Idx==0) {
+            Instruction *SuccsTerm = succs->getTerminator();
+            // if it satisfies below conditions, it must jumps to latch/exiting block
+            // inside of inner-most loop,
+            // then it might be masking by vector predication.
+            if (isa<BranchInst>(SuccsTerm) &&
+                 cast<BranchInst>(SuccsTerm)->isUnconditional() &&
+                 cast<BranchInst>(SuccsTerm)->getSuccessor(0) == CurL->getLoopLatch() )
+              succs->setName("tensor.body." + Twine(Idx));
+          }
+          else {
+            
+            //YYG:REMOVE
+            errs() << "[creating tensor.ph] succs: " << *succs << "\n";
+            // To point its inner-loop, we set its level as Idx-1
+            succs->setName("tensor.ph" + Twine(Idx-1));
+            // YYG:REMOVE
+            errs() << "Twine(Idx-1): " << succs->getName() << "\n";
+          }
+          VisitedBBs.insert(succs);
+        }
+      }
+    }
+  }
+
+  VisitedBBs.clear();
+  // Info.Loops: inner-most loop
+  // for (size_t Idx = 0; Idx < LoopsInfo.size(); ++Idx) {
+  for (size_t Idx = LoopsInfo.size()-1; Idx >= 0; --Idx) {
+    Loop *CurL = LoopsInfo[Idx];
+    // YYG::REMOVE
+    for (auto *BB : CurL->getBlocks())
+      errs() << "[CurL==] *BB: " << *BB << "\n";
+
+    LoopBlocksDFS DFS(CurL);
+    DFS.perform(LI);
+
+    // HeaderTPBB represents scalar.body
+    TPIRBasicBlock *HeaderTPBB = Plan->LoopIdx2HeaderTPBB[Idx];
+    TPBasicBlock *preHeaderTPBB, *ExitingTPBB;
+    if (Idx != 0) {
+      preHeaderTPBB = Plan->LoopIdx2PreHeaderTPBB[Idx-1];
+      ExitingTPBB = Plan->LoopIdx2ExitingTPBB[Idx-1];
+    }
+    TPBasicBlock *LatchTPBB = Plan->LoopIdx2LatchTPBB[Idx];
+    BasicBlock *HeaderBB = CurL->getHeader();
+    // YYG::REMOVE
+    errs() << "HeaderBB: \n";
+    HeaderBB->dump();
+
+    // YYG:REmove
+    CurL->dump();
+    errs() << "CurL========\n";
+    BranchInst *InnerGuard = CurL->getLoopGuardBranch();
+    // YYG:REmove
+    if (InnerGuard)
+      errs() << "InnerGuard: " << *InnerGuard << "\n";
+    
+    CmpInst *InnerLoopGuardCmp =
+      (InnerGuard) ? dyn_cast<CmpInst>(InnerGuard->getCondition()) : nullptr;
+
+    LLVM_DEBUG(
+      if (InnerLoopGuardCmp) {
+        dbgs() << "Inner loop guard compare instruction: " << *InnerLoopGuardCmp
+               << "\n";
+    });
+
+    CurL->dump();
+    bool NeedsMasks =
+      CM.foldTailByMasking() ||
+      any_of(CurL->blocks(), [this, HeaderBB, CurL](BasicBlock *BB) {
+        bool NeedsBlends = BB != HeaderBB && !BB->phis().empty();
+        return Legal->blockNeedsPredication(BB, CurL) || NeedsBlends;
+      });
+
+    for (BasicBlock *BB : make_range(DFS.beginRPO(), DFS.endRPO())) {
+      // YYG:REMOVE
+      errs() << "[DFS] *BB: " << *BB << "\n";
+      Loop *InnerL = LI->getLoopFor(BB);
+      errs() << "InnerL: \n";
+      InnerL->dump();
+
+      if (InnerL->getLoopDepth() != CurL->getLoopDepth()) {
+        continue;
+      }
+      if (VisitedBBs.contains(BB))
+        continue;
+      // YYG:REMOVE
+      errs() << "NeedsMasks: " << NeedsMasks << "\n";
+
+      // Detect the insertion point of each BB. 
+      if (BB == HeaderBB)
+        TPBB = HeaderTPBB;
+      else if (BB->getName() == ("tensor.ph" + Twine(Idx-1)).str())
+        TPBB = preHeaderTPBB;
+      else if (BB->getName() == ("tensor.body." + Twine(Idx)).str()) {
+        TPBasicBlock *BodyBlock = new TPBasicBlock("tensor.body." + Twine(Idx));
+
+        // We assume TPBB is pointing to HeaderTPBB
+        TPBlockUtils::connectBlocks(TPBB, BodyBlock);
+        TPBB = BodyBlock;
+      }
+      else if (BB == CurL->getLoopLatch())
+        TPBB = LatchTPBB;
+      else
+        TPBB = ExitingTPBB;
+      // If inner-most loop is only one block which is header, latch, 
+      // and exiting at the same time. Then, categorize it as LatchBB.
+      if (BB == HeaderBB && BB == CurL->getLoopLatch())
+        TPBB = LatchTPBB;
+      if (TPBB != LatchTPBB)
+        Builder.setInsertPoint(TPBB);
+      else {
+        TPRecipeBase *BranchOnCount = TPBB->getTerminator();
+        Builder.setInsertPoint(TPBB, BranchOnCount->getIterator());
+      }
+
+      // Even the TPBB is mapped to LatchTPBB, it can be categorized 
+      // as header, too. Thus, checking BB whether than mapped TPBB.
+      if (BB == HeaderBB) { //TPBB == HeaderTPBB) {
+        errs() << "[OOOOO] RecipeBuilder.createHeaderMask(CurL)\n";
+        RecipeBuilder.createHeaderMask(CurL);
+      }
+      else if (NeedsMasks) { 
+        // TODO(yg0412.yun). Check NeedsMasks correctness.
+        errs() << "[XXXXX] RecipeBuilder.createBlockInMask(BB, CurL)\n";
+        RecipeBuilder.createBlockInMask(BB, CurL);
+      }
+      VisitedBBs.insert(BB);
+
+      // Introduce each ingredient into TPlan.
+      for (Instruction &I : BB->instructionsWithoutDebug(false)) {
+        Instruction *Instr = &I;
+        SmallVector<TPValue *, 4> Operands;
+        auto *Phi = dyn_cast<PHINode>(Instr);
+
+        // YYG:REMOVE
+        errs() << "[BUILD TPBB] *BB: " << *BB << "\n";
+        errs() << "instr:=== " << *Instr << "\n";
+        // FIXME(yg0412.yun) yuxin's work
+        // if (Instr->getOpcode() == Instruction::FAdd)
+        //   continue;
+
+        // Here, we build the operands of PHI recipes,
+        // and add founded phi on TPlanDL.pattern.
+        if (Phi) {
+          // yyg::remove
+          errs() << "Phi: " << *Phi << "\n";
+
+          unsigned NumIncoming = Phi->getNumIncomingValues();
+          for (unsigned int i=0; i<NumIncoming; i++) {
+            Operands.push_back(Plan->getOrAddLiveIn(
+                  Phi->getIncomingValueForBlock(Phi->getIncomingBlock(i))));
+          }
+          TPlanDL.pattern->Info.Loop2PHI[CurL].insert(Phi);
+        } else {
+          // Non-phi instruction case.
+          auto OpRange = RecipeBuilder.mapToTPValues(Instr->operands());
+          Operands = {OpRange.begin(), OpRange.end()};
+        }
+        
+        // Invariant stores inside loop will be deleted and a single store
+        // with the final reduction value will be added to the exit block
+        StoreInst *SI;
+        if ((SI = dyn_cast<StoreInst>(&I)) &&
+          Legal->isInvariantAddressOfReduction(SI->getPointerOperand(), CurL))
+          continue;
+        
+        
+        TPRecipeBase *Recipe;
+        // In here, if we meet the branch instruction, we firstly wrap it as replicate VPInstruction.
+        // But later, it could be changed into VPBranchOnMaskRecipe as it should be or not.
+        // Otherwise, other instructions are widening at first and then if it fails, 
+        // it is changed to Replicate VPInstruction. 
+        if (isa<BranchInst>(Instr)) {
+          // We don't need to specify unconditial branch 
+          // because inital TPlan has default successor.
+          if (cast<BranchInst>(Instr)->isUnconditional())
+            continue;
+          Recipe = RecipeBuilder.handleReplication(Instr, Range, CurL);
+        }
+        else {
+          errs() << "[Before] Size of Operands: " << Operands.size() << "\n";
+          Recipe = RecipeBuilder.tryToCreateWidenRecipe(Instr, Operands, Range, TPBB, CurL->getLoopDepth());
+          if (!Recipe)
+            Recipe = RecipeBuilder.handleReplication(Instr, Range, CurL);
+        }
+        
+        unsigned Dim = Idx;
+        // Set the LoopDepth on each Recipe (same with PHIRecipe)
+        // DimIndex will point to its loop depth.
+        Recipe->setDimIndex(Dim);
+        RecipeBuilder.setRecipe(Instr, Recipe);
+
+        //if (Instr->getOpcode() == Instruction::PHI) {
+        if (Phi) {
+          // non-loop-induction variable is also linked 
+          // Loop2Induction[CurL] = Recipe->getTPSingleValue();
+          TPValue *SingleValue = Recipe->getTPSingleValue();
+          if (SingleValue) {
+            // yyg;remove
+            errs() << "[Phi: " << *Phi << "\n";
+            SingleValue->dump();
+            TPlanDL.pattern->Info.insertInduction2TPRecipe(Phi, Recipe);
+          } else {
+            LLVM_DEBUG(dbgs() << "[Warning] Skipping null TPValue insertion for Phi: " << *Phi << "\n");
+          }
+        }
+        
+        if (isa<TPHeaderPHIRecipe>(Recipe))
+          Recipe->insertBefore(*HeaderTPBB, HeaderTPBB->getFirstNonPhi());
+        else if (TPBB == LatchTPBB)
+          TPBB->insert(Recipe, TPBB->getTerminator()->getIterator());
+        else
+          TPBB->appendRecipe(Recipe);
+        
+        Plan->dump();
+      }
+      // TPBlockUtils::insertBlockAfter(new TPBasicBlock(), TPBB);
+      // TPBB = cast<TPBasicBlock>(TPBB->getSingleSuccessor());
+    }
+  }
