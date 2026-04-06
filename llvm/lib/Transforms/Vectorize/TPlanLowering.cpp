@@ -137,6 +137,42 @@ static FunctionCallee getTensorMatmulFn(Module &M, Type *ElemTy) {
   return M.getOrInsertFunction(Name, FT);
 }
 
+/// Returns (creating if needed) @llvm.tensor.contract.<Ra>d.<Rb>d.<type>.
+/// RankC = |(A.DimSet | B.DimSet) - {ContractDim}| (number of output dims).
+/// Signature:
+///   void(ptr C, i64×RankC C_strides,
+///        ptr A, i64×RankC A_strides, i64 A_contract_stride,
+///        ptr B, i64×RankC B_strides, i64 B_contract_stride,
+///        i64 K,
+///        i64×RankC output_dims)
+/// A/B strides are in output-dim order (OutputDimSet iteration order).
+/// stride=0 means the operand does not span that output dim (broadcast).
+static FunctionCallee getTensorContractFn(Module &M, unsigned RankA,
+                                           unsigned RankB, unsigned RankC,
+                                           Type *ElemTy) {
+  LLVMContext &Ctx = M.getContext();
+  StringRef TypeSuffix = getTypeSuffix(ElemTy);
+  assert(!TypeSuffix.empty() && "unsupported element type for contract");
+  std::string Name = (Twine("llvm.tensor.contract.") + Twine(RankA) + "d." +
+                      Twine(RankB) + "d." + TypeSuffix).str();
+  Type *PtrTy = PointerType::getUnqual(Ctx);
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+  SmallVector<Type *> Params;
+  Params.push_back(PtrTy);                                          // C
+  for (unsigned i = 0; i < RankC; ++i) Params.push_back(I64Ty);   // C strides
+  Params.push_back(PtrTy);                                          // A
+  for (unsigned i = 0; i < RankC; ++i) Params.push_back(I64Ty);   // A strides
+  Params.push_back(I64Ty);                                          // A contract stride
+  Params.push_back(PtrTy);                                          // B
+  for (unsigned i = 0; i < RankC; ++i) Params.push_back(I64Ty);   // B strides
+  Params.push_back(I64Ty);                                          // B contract stride
+  Params.push_back(I64Ty);                                          // K
+  for (unsigned i = 0; i < RankC; ++i) Params.push_back(I64Ty);   // output dims
+  FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), Params,
+                                        /*isVarArg=*/false);
+  return M.getOrInsertFunction(Name, FT);
+}
+
 /// Returns (creating if needed) @llvm.tensor.elementwise.<op>.<rank>d.<type>.
 /// Signature: void( (ptr, i64×Rank) × 3 tensors,  i64×Rank dims )
 static FunctionCallee getTensorElementwiseFn(Module &M, StringRef OpName,
@@ -276,7 +312,7 @@ static void printClassificationSummary(const TPlan &Plan,
 }
 
 //===----------------------------------------------------------------------===//
-// Helper: emit @llvm.tensor.matmul for a Contraction reduction
+// Helper: emit @llvm.tensor.contract for a Contraction reduction
 //===----------------------------------------------------------------------===//
 
 static Value *emitContraction(const TPRecipeBase *FusedMul,
@@ -289,13 +325,14 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   auto *RHSDR = dyn_cast<TPSingleDefRecipe>(FusedMul->getOperand(1));
   if (!LHSDR || !RHSDR)
     return nullptr;
-  if (LHSDR->DimSet.count() != 2 || RHSDR->DimSet.count() != 2) {
-    LLVM_DEBUG(dbgs() << "TPlanLowering: Contraction requires 2D operands\n");
+
+  unsigned RankA = LHSDR->DimSet.count();
+  unsigned RankB = RHSDR->DimSet.count();
+  if (RankA < 1 || RankA > 4 || RankB < 1 || RankB > 4) {
+    LLVM_DEBUG(dbgs() << "TPlanLowering: Contraction rank out of [1,4]\n");
     return nullptr;
   }
 
-  // The LHS/RHS recipes are load recipes; we need their pointer operands for
-  // the @llvm.tensor.matmul intrinsic (ptr-based API).
   auto *LHSLoad = dyn_cast<TPWidenLoadRecipe>(LHSDR);
   auto *RHSLoad = dyn_cast<TPWidenLoadRecipe>(RHSDR);
   if (!LHSLoad || !RHSLoad)
@@ -311,74 +348,60 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   if (!LHSPtr || !RHSPtr)
     return nullptr;
 
-  // Determine element type from the load instruction. Use getScalarType() to
-  // handle both scalar (load float) and vector (load <N x float>) loads.
   Type *ElemTy = LHSLoad->getInstruction()->getType()->getScalarType();
-  if (!ElemTy->isFloatTy() && !ElemTy->isDoubleTy())
+  StringRef TypeSuffix = getTypeSuffix(ElemTy);
+  if (TypeSuffix.empty())
     return nullptr;
-
-  SmallVector<unsigned>  LHSShape   = getTPValueShape(*LHSDR, State.Plan);
-  SmallVector<unsigned>  RHSShape   = getTPValueShape(*RHSDR, State.Plan);
-  SmallVector<const SCEV *> LHSStrides =
-      getTPValueStrides(*LHSDR, State.Plan, *State.SE);
-  SmallVector<const SCEV *> RHSStrides =
-      getTPValueStrides(*RHSDR, State.Plan, *State.SE);
 
   int ContractDim = State.getContractDim(ReductionUpdate);
   if (ContractDim < 0 ||
       !LHSDR->DimSet.test(static_cast<unsigned>(ContractDim)) ||
       !RHSDR->DimSet.test(static_cast<unsigned>(ContractDim))) {
-    LLVM_DEBUG(dbgs() << "TPlanLowering: Contraction dim not in operand DimSets\n");
+    LLVM_DEBUG(dbgs() << "TPlanLowering: Contraction dim not in DimSets\n");
     return nullptr;
   }
-  // findPos: returns position of Dim in DimSet iteration order (innermost-first).
-  // The guards above guarantee Dim is present, so the fallback 0 is never reached.
-  auto findPos = [](const SmallBitVector &DS, int Dim) -> unsigned {
-    unsigned Pos = 0;
-    for (int D = DS.find_first(); D >= 0; D = DS.find_next(D), ++Pos)
-      if (D == Dim) return Pos;
-    return 0; // unreachable given caller's DimSet membership guard
-  };
-  unsigned LHSPos = findPos(LHSDR->DimSet, ContractDim);
-  unsigned RHSPos = findPos(RHSDR->DimSet, ContractDim);
 
-  uint64_t M = LHSShape[1 - LHSPos];
-  uint64_t K = LHSShape[LHSPos];
-  uint64_t N = RHSShape[1 - RHSPos];
-  // Locate the C accumulator pointer from the store recipe that consumes
-  // the reduction result.
-  //
-  // Primary: walk recipe-level users of the ReductionUpdate defined value.
-  // This works when the store is in the same TPBasicBlock.
+  // Build OutputDimSet = (A.DimSet | B.DimSet) - {ContractDim}.
+  unsigned NBits = std::max({static_cast<unsigned>(LHSDR->DimSet.size()),
+                              static_cast<unsigned>(RHSDR->DimSet.size()),
+                              static_cast<unsigned>(ContractDim + 1)});
+  SmallBitVector LHSBits = LHSDR->DimSet, RHSBits = RHSDR->DimSet;
+  LHSBits.resize(NBits);
+  RHSBits.resize(NBits);
+  SmallBitVector OutputDimSet = LHSBits;
+  OutputDimSet |= RHSBits;
+  OutputDimSet.reset(static_cast<unsigned>(ContractDim));
+
+  unsigned RankC = OutputDimSet.count();
+  if (RankC < 1 || RankC > 4) {
+    LLVM_DEBUG(dbgs() << "TPlanLowering: Contraction output rank out of [1,4]\n");
+    return nullptr;
+  }
+
+  // Locate C accumulator pointer (primary: recipe users; fallback: IR users).
   Value *CPtr = nullptr;
   TPWidenStoreRecipe *CStoreRecipe = nullptr;
   if (auto *DefVal = ReductionUpdate->getDefinedValue()) {
     for (TPUser *U : DefVal->users()) {
       auto *RB = dyn_cast<TPRecipeBase>(U);
-      if (!RB) continue;
+      if (!RB)
+        continue;
       if (auto *SR = dyn_cast<TPWidenStoreRecipe>(RB)) {
         CStoreRecipe = SR;
-        auto *PtrDR = dyn_cast<TPSingleDefRecipe>(SR->getOperand(0));
-        if (PtrDR)
-          CPtr = State.getValue(PtrDR);
+        if (auto *PD = dyn_cast<TPSingleDefRecipe>(SR->getOperand(0)))
+          CPtr = State.getValue(PD);
         break;
       }
     }
   }
-  // Fallback: walk IR-level uses of the reduction result instruction.
-  // The store to C may be in a different block (e.g., the outer loop latch)
-  // and reference %sum as an IR live-in rather than a recipe TPUser.
-  // We trace through any GEP to the base pointer so the result always
-  // dominates the current insertion point.
   if (!CPtr) {
     if (auto *WR = dyn_cast<TPWidenRecipe>(ReductionUpdate)) {
       for (User *U : WR->getInstruction()->users()) {
         if (auto *SI = dyn_cast<StoreInst>(U)) {
-          Value *Ptr = SI->getPointerOperand();
-          if (auto *GEP = dyn_cast<GetElementPtrInst>(Ptr))
-            CPtr = GEP->getPointerOperand(); // base ptr (e.g. %C arg)
-          else
-            CPtr = Ptr;
+          Value *P = SI->getPointerOperand();
+          CPtr = isa<GetElementPtrInst>(P)
+                     ? cast<GetElementPtrInst>(P)->getPointerOperand()
+                     : P;
           break;
         }
       }
@@ -389,35 +412,62 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     return nullptr;
   }
 
-  Module *Mod = State.Builder.GetInsertBlock()->getModule();
-  auto MatmulFn = getTensorMatmulFn(*Mod, ElemTy);
   IRBuilder<> &B = State.Builder;
   auto I64 = [&](uint64_t V) -> Value * { return B.getInt64(V); };
   auto expandStride = [&](const SCEV *S, unsigned Dim) -> Value * {
     if (State.Expander && State.Expander->isSafeToExpand(S))
       return State.Expander->expandCodeFor(S, B.getInt64Ty(),
                                             &*B.GetInsertPoint());
-    return B.getInt64(State.Plan.getDenseStrideForDim(Dim));
+    return I64(State.Plan.getDenseStrideForDim(Dim));
   };
-  unsigned LHSLastDim = static_cast<unsigned>(LHSDR->DimSet.find_last());
-  Value *VDA = expandStride(LHSStrides.back(), LHSLastDim);
-  Value *VDB = expandStride(RHSStrides[RHSPos], static_cast<unsigned>(ContractDim));
-  Value *VDC;
-  if (CStoreRecipe && State.SE) {
-    int CLastDim = CStoreRecipe->DimSet.find_last();
-    const SCEV *LDC_SCEV = CLastDim >= 0
-        ? CStoreRecipe->getMemStride(static_cast<unsigned>(CLastDim),
-                                      State.Plan, *State.SE)
-        : State.SE->getConstant(APInt(64, 1));
-    VDC = expandStride(LDC_SCEV, CLastDim >= 0 ? static_cast<unsigned>(CLastDim) : 0);
-  } else {
-    VDC = I64(State.Plan.getDenseStrideForDim(LHSLastDim + 1));
+  // Returns stride for output dim Dim in operand DR; 0 if DR doesn't span it.
+  auto getOperandStride = [&](const TPSingleDefRecipe *DR,
+                               unsigned Dim) -> Value * {
+    if (Dim >= DR->DimSet.size() || !DR->DimSet.test(Dim))
+      return I64(0);
+    return expandStride(DR->getMemStride(Dim, State.Plan, *State.SE), Dim);
+  };
+
+  // Build stride/dim vectors in output-dim order (OutputDimSet iteration order).
+  SmallVector<Value *> CStrides, AStrides, BStrides, OutDims;
+  for (int D = OutputDimSet.find_first(); D >= 0;
+       D = OutputDimSet.find_next(D)) {
+    unsigned UD = static_cast<unsigned>(D);
+    if (CStoreRecipe && State.SE)
+      CStrides.push_back(expandStride(
+          CStoreRecipe->getMemStride(UD, State.Plan, *State.SE), UD));
+    else
+      CStrides.push_back(I64(State.Plan.getDenseStrideForDim(UD)));
+    AStrides.push_back(getOperandStride(LHSDR, UD));
+    BStrides.push_back(getOperandStride(RHSDR, UD));
+    OutDims.push_back(I64(State.Plan.getPFForDim(UD)));
   }
 
-  return B.CreateCall(MatmulFn,
-      {CPtr,   I64(M), I64(N), VDC,
-       LHSPtr, I64(M), I64(K), VDA,
-       RHSPtr, I64(K), I64(N), VDB});
+  // Contraction dim strides and K size.
+  unsigned ContUD = static_cast<unsigned>(ContractDim);
+  Value *AContractStride =
+      expandStride(LHSDR->getMemStride(ContUD, State.Plan, *State.SE), ContUD);
+  Value *BContractStride =
+      expandStride(RHSDR->getMemStride(ContUD, State.Plan, *State.SE), ContUD);
+  Value *K = I64(State.Plan.getPFForDim(ContUD));
+
+  Module *Mod = B.GetInsertBlock()->getModule();
+  FunctionCallee ContractFn =
+      getTensorContractFn(*Mod, RankA, RankB, RankC, ElemTy);
+
+  SmallVector<Value *> Args;
+  Args.push_back(CPtr);
+  Args.append(CStrides.begin(), CStrides.end());
+  Args.push_back(LHSPtr);
+  Args.append(AStrides.begin(), AStrides.end());
+  Args.push_back(AContractStride);
+  Args.push_back(RHSPtr);
+  Args.append(BStrides.begin(), BStrides.end());
+  Args.push_back(BContractStride);
+  Args.push_back(K);
+  Args.append(OutDims.begin(), OutDims.end());
+
+  return B.CreateCall(ContractFn, Args);
 }
 
 //===----------------------------------------------------------------------===//
