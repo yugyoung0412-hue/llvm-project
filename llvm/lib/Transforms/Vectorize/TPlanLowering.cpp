@@ -188,6 +188,35 @@ static FunctionCallee getTensorBroadcastFn(Module &M, StringRef OpName,
   return M.getOrInsertFunction(Name, FT);
 }
 
+/// Returns (creating if needed) @llvm.tensor.reduce.<op>.<rank_in>d.<type>.
+/// Signature: void(ptr Acc, i64×rank_in Acc_strides,
+///                 ptr A,   i64×rank_in A_strides,
+///                 i64×rank_in dims)
+/// Reduction dims are encoded as Acc_stride=0.
+static FunctionCallee getTensorReduceFn(Module &M, StringRef OpName,
+                                        unsigned RankIn, Type *ElemTy) {
+  StringRef TypeSuffix = getTypeSuffix(ElemTy);
+  assert(!TypeSuffix.empty() && "unsupported element type");
+  std::string Name = "llvm.tensor.reduce.";
+  Name += OpName.str();
+  Name += "." + std::to_string(RankIn) + "d.";
+  Name += TypeSuffix;
+  LLVMContext &Ctx = M.getContext();
+  Type *PtrTy = PointerType::getUnqual(Ctx);
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+  SmallVector<Type *> Params;
+  // Acc: ptr + rank_in strides
+  Params.push_back(PtrTy);
+  for (unsigned R = 0; R < RankIn; ++R) Params.push_back(I64Ty);
+  // A: ptr + rank_in strides
+  Params.push_back(PtrTy);
+  for (unsigned R = 0; R < RankIn; ++R) Params.push_back(I64Ty);
+  // dims
+  for (unsigned R = 0; R < RankIn; ++R) Params.push_back(I64Ty);
+  FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), Params, false);
+  return M.getOrInsertFunction(Name, FT);
+}
+
 //===----------------------------------------------------------------------===//
 // Stage-print helpers (unconditional; not gated by LLVM_DEBUG)
 //===----------------------------------------------------------------------===//
@@ -810,24 +839,122 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
   }
 
   case TensorOpKind::PlainReduction: {
-    // Reduction update with no fuseable mul-like producer — clone as scalar.
-    LLVM_DEBUG({
-      auto *DR = dyn_cast<TPSingleDefRecipe>(getOperand(0));
-      if (DR) {
-        auto Shape   = getTPValueShape(*DR, State.Plan);
-        auto Strides = State.SE
-            ? getTPValueStrides(*DR, State.Plan, *State.SE)
-            : SmallVector<const SCEV *>{};
-        dbgs() << "PlainReduction shape=[";
-        for (unsigned D : Shape) dbgs() << D << " ";
-        dbgs() << "] strides=[";
-        for (const SCEV *S : Strides) {
-          if (S) S->print(dbgs()); else dbgs() << "?";
-          dbgs() << " ";
-        }
-        dbgs() << "] — scalar fallback\n";
+    auto tryReduce = [&]() -> bool {
+      std::string OpName = getOpcodeStr(Inst);
+      if (OpName.empty()) return false;
+
+      Type *ElemTy = Inst->getType()->getScalarType();
+      if (getTypeSuffix(ElemTy).empty()) return false;
+
+      // Get the non-PHI input operand (the loaded tensor value).
+      TPValue *Input = nullptr;
+      for (TPValue *Op : operands()) {
+        auto *RV = dyn_cast<TPRecipeValue>(Op);
+        if (!RV || !isa<TPReductionPHIRecipe>(RV->getDefiningRecipe()))
+          Input = Op;
       }
-    });
+      if (!Input) return false;
+
+      auto *InputDR = dyn_cast<TPSingleDefRecipe>(Input);
+      if (!InputDR) return false;
+
+      unsigned RankIn = InputDR->DimSet.count();
+      if (RankIn < 1 || RankIn > 3) return false;
+
+      auto *InputLoad = dyn_cast<TPWidenLoadRecipe>(InputDR);
+      if (!InputLoad) return false;
+      auto *APtrDR = dyn_cast<TPSingleDefRecipe>(InputLoad->getOperand(0));
+      if (!APtrDR) return false;
+      Value *APtr = State.getValue(APtrDR);
+      if (!APtr) return false;
+
+      // Get Acc pointer: allocate stack slot, initialise with PHI's preheader value.
+      Value *AccPtr = nullptr;
+      for (TPValue *Op : operands()) {
+        auto *RV = dyn_cast<TPRecipeValue>(Op);
+        if (!RV) continue;
+        auto *RedPHI = dyn_cast<TPReductionPHIRecipe>(RV->getDefiningRecipe());
+        if (!RedPHI) continue;
+        PHINode *Phi = RedPHI->getReductionPhi();
+        if (!Phi) return false;
+        // Alloca in entry block.
+        IRBuilder<> AllocaB(
+            &Phi->getParent()->getParent()->getEntryBlock().front());
+        AccPtr = AllocaB.CreateAlloca(ElemTy, nullptr, "reduce.acc");
+        // Store initial value (preheader incoming).
+        // A loop-header PHI has exactly two incoming edges: the preheader and
+        // the backedge.  getSinglePredecessor() is always null for a loop
+        // header (>=2 predecessors), so the old ternary always fell through to
+        // getIncomingBlock(0) — which is not guaranteed to be the preheader.
+        // Instead, identify the preheader as the incoming block that does NOT
+        // branch back to the header (i.e. the header is not one of its
+        // successors).
+        BasicBlock *HeaderBB = Phi->getParent();
+        Value *InitVal = nullptr;
+        for (unsigned Idx = 0; Idx < Phi->getNumIncomingValues(); ++Idx) {
+          BasicBlock *InBB = Phi->getIncomingBlock(Idx);
+          // The backedge block has HeaderBB as a successor; the preheader does
+          // not.
+          if (!llvm::is_contained(successors(InBB), HeaderBB)) {
+            InitVal = Phi->getIncomingValue(Idx);
+            break;
+          }
+        }
+        if (!InitVal) return false;
+        State.Builder.CreateStore(InitVal, AccPtr);
+        break;
+      }
+      if (!AccPtr) return false;
+
+      IRBuilder<> &B = State.Builder;
+      Module *Mod = B.GetInsertBlock()->getModule();
+      auto ReduceFn = getTensorReduceFn(*Mod, StringRef(OpName), RankIn, ElemTy);
+
+      SmallBitVector ReductionDims = State.Plan.getReductionDims();
+      ReductionDims.resize(RankIn);
+
+      auto I64 = [&](uint64_t V) -> Value * { return B.getInt64(V); };
+      auto expandStride = [&](const SCEV *S, unsigned Dim) -> Value * {
+        if (State.Expander && State.Expander->isSafeToExpand(S))
+          return State.Expander->expandCodeFor(S, B.getInt64Ty(),
+                                               &*B.GetInsertPoint());
+        return B.getInt64(State.Plan.getDenseStrideForDim(Dim));
+      };
+
+      SmallVector<Value *> Args;
+      // Acc strides: reduction dims → 0, others → dense stride.
+      Args.push_back(AccPtr);
+      for (unsigned D = 0; D < RankIn; ++D) {
+        if (D < ReductionDims.size() && ReductionDims.test(D))
+          Args.push_back(I64(0));
+        else
+          Args.push_back(I64(State.Plan.getDenseStrideForDim(D)));
+      }
+      // A strides.
+      Args.push_back(APtr);
+      SmallVector<const SCEV *> AStrides =
+          getTPValueStrides(*InputDR, State.Plan, *State.SE);
+      int Didx = InputDR->DimSet.find_first();
+      for (const SCEV *S : AStrides) {
+        Args.push_back(expandStride(S, Didx >= 0 ? (unsigned)Didx : 0));
+        if (Didx >= 0) Didx = InputDR->DimSet.find_next(Didx);
+      }
+      // Shape dims.
+      SmallVector<unsigned> Shape = getTPValueShape(*InputDR, State.Plan);
+      for (unsigned D : Shape) Args.push_back(I64(D));
+
+      B.CreateCall(ReduceFn, Args);
+
+      // Load result from Acc and register as this recipe's value.
+      Value *Result = B.CreateLoad(ElemTy, AccPtr, "reduce.result");
+      State.setValue(this, Result);
+      return true;
+    };
+
+    if (tryReduce()) return;
+
+    LLVM_DEBUG(dbgs() << "TPlanLowering: PlainReduction tryReduce failed, "
+                         "scalar fallback\n");
     auto *Clone = Inst->clone();
     State.remapClone(Clone);
     Value *Result = State.Builder.Insert(Clone);

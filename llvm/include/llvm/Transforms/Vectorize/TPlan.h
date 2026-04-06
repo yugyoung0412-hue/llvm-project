@@ -1002,6 +1002,7 @@ public:
         RedPhi(Phi) {}
 
   PHINode *getPhi() const { return RedPhi; }
+  PHINode *getReductionPhi() const { return RedPhi; }
 
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
