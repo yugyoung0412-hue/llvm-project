@@ -1,9 +1,9 @@
 ; RUN: opt -passes=loop-tensorize -S < %s | FileCheck %s
 ;
 ; 3-level GEMM (16x16x16, static trip counts) using reduction-PHI form.
-; Contraction must emit @llvm.tensor.contract.2d.2d.f32.
+; Contraction must emit @llvm.tensor.contract.2d.2d.2d.f32.
 ;
-; CHECK: call void @llvm.tensor.contract.2d.2d.f32(
+; CHECK: call void @llvm.tensor.contract.2d.2d.2d.f32(
 ; CHECK-SAME: i64 0
 ; CHECK-SAME: i64 256, i64 256
 

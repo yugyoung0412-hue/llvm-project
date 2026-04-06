@@ -137,7 +137,7 @@ static FunctionCallee getTensorMatmulFn(Module &M, Type *ElemTy) {
   return M.getOrInsertFunction(Name, FT);
 }
 
-/// Returns (creating if needed) @llvm.tensor.contract.<Ra>d.<Rb>d.<type>.
+/// Returns (creating if needed) @llvm.tensor.contract.<Ra>d.<Rb>d.<Rc>d.<type>.
 /// RankC = |(A.DimSet | B.DimSet) - {ContractDim}| (number of output dims).
 /// Signature:
 ///   void(ptr C, i64×RankC C_strides,

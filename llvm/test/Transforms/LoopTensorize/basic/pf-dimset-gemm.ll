@@ -1,12 +1,12 @@
 ; RUN: opt -passes=loop-tensorize -S --disable-verify < %s | FileCheck %s
 ; REQUIRES: asserts
 ;
-; Verify that a 3-level GEMM loop nest emits @llvm.tensor.contract.2d.2d.f32
+; Verify that a 3-level GEMM loop nest emits @llvm.tensor.contract.2d.2d.2d.f32
 ; via the PF DimSet system (Contraction classification).
 ; Uses reduction-PHI form: acc = sum_k(A[i][k] * B[k][j])
 ; Loop order: i (dim0) -> j (dim1) -> k (dim2, reduction)
 ;
-; CHECK: call void @llvm.tensor.contract.2d.2d.f32
+; CHECK: call void @llvm.tensor.contract.2d.2d.2d.f32
 ; CHECK-NOT: llvm.matrix.multiply
 
 target datalayout = "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128"

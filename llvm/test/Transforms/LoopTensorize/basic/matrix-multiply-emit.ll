@@ -1,8 +1,8 @@
 ; RUN: opt -passes=loop-tensorize -S < %s | FileCheck %s
 ;
 ; A constant-trip-count GEMM (16x16x16) using reduction-PHI form.
-; Contraction must emit @llvm.tensor.contract.2d.2d.f32.
-; CHECK: call void @llvm.tensor.contract.2d.2d.f32
+; Contraction must emit @llvm.tensor.contract.2d.2d.2d.f32.
+; CHECK: call void @llvm.tensor.contract.2d.2d.2d.f32
 ; CHECK-NOT: @llvm.matrix.multiply
 
 define void @gemm_16x16x16(ptr %A, ptr %B, ptr %C, i64 %K, i64 %N) {
