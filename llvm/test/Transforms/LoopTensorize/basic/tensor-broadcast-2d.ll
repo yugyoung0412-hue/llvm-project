@@ -2,7 +2,7 @@
 ;
 ; 2D broadcast fadd: C[i][j] = A[j] + B[i][j]   (A is 1D, B is 2D)
 ; A's i-dim is missing → stride_A for i-dim = 0 (broadcast).
-; CHECK: call void @llvm.tensor.broadcast.fadd.2d.f32
+; CHECK: call void @llvm.tensor.binary.fadd.1d.2d.2d.f32
 ; CHECK-SAME: i64 0
 
 target datalayout = "e-m:e-i64:64-n32:64"

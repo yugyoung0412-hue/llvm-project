@@ -2,7 +2,7 @@
 ;
 ; 2D elementwise integer add: C[i][j] = A[i][j] + B[i][j]
 ; Strides are currently i64 1, i64 1 (SCEV analysis limitation — pre-existing stride issue).
-; CHECK: call void @llvm.tensor.elementwise.add.2d.i32
+; CHECK: call void @llvm.tensor.binary.add.2d.2d.2d.i32
 ; CHECK-SAME: i64 256, i64 256
 
 target datalayout = "e-m:e-i64:64-n32:64"

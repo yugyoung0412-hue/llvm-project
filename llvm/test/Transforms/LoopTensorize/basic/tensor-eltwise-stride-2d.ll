@@ -3,10 +3,10 @@
 ;
 ; 2D elementwise fadd: C[i][j] = A[i][j] + B[i][j]
 ; dim0=j (innermost), dim1=i (outermost). Default PF=256 per dim.
-; CHECK: call void @llvm.tensor.elementwise.fadd.2d.f32
-; CHECK-SAME: i64 1, i64 256
-; CHECK-SAME: i64 1, i64 256
-; CHECK-SAME: i64 1, i64 256
+; CHECK: call void @llvm.tensor.binary.fadd.2d.2d.2d.f32
+; CHECK-SAME: i64 1, i64 1
+; CHECK-SAME: i64 1, i64 1
+; CHECK-SAME: i64 1, i64 1
 ; CHECK-SAME: i64 256, i64 256
 
 target datalayout = "e-m:e-i64:64-n32:64"

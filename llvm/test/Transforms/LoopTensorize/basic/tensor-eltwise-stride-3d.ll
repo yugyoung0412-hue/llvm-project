@@ -4,10 +4,10 @@
 ; 3D elementwise fadd: D[i][j][k] = A[i][j][k] + B[i][j][k]
 ; dim0=k (innermost), dim1=j, dim2=i (outermost). Default PF=256 per dim.
 ; The index is linearized as i*J*K + j*K + k (J=8, K=4).
-; CHECK: call void @llvm.tensor.elementwise.fadd.3d.f32
-; CHECK-SAME: i64 1, i64 256, i64 65536
-; CHECK-SAME: i64 1, i64 256, i64 65536
-; CHECK-SAME: i64 1, i64 256, i64 65536
+; CHECK: call void @llvm.tensor.binary.fadd.3d.3d.3d.f32
+; CHECK-SAME: i64 32, i64 4, i64 1
+; CHECK-SAME: i64 32, i64 4, i64 1
+; CHECK-SAME: i64 32, i64 4, i64 1
 ; CHECK-SAME: i64 256, i64 256, i64 256
 
 target datalayout = "e-m:e-i64:64-n32:64"

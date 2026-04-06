@@ -1143,13 +1143,30 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
         // successors).
         BasicBlock *HeaderBB = Phi->getParent();
         Value *InitVal = nullptr;
+        // Identify the preheader as the unique predecessor that branches
+        // unconditionally to the header (exactly one successor).  The latch
+        // (backedge) block always has a conditional branch (≥2 successors).
+        // The old "header not in successors" heuristic fails for inner-loop
+        // PHIs whose preheader (outer loop body) also unconditionally jumps to
+        // the header — making it look like a backedge.
         for (unsigned Idx = 0; Idx < Phi->getNumIncomingValues(); ++Idx) {
           BasicBlock *InBB = Phi->getIncomingBlock(Idx);
-          // The backedge block has HeaderBB as a successor; the preheader does
-          // not.
-          if (!llvm::is_contained(successors(InBB), HeaderBB)) {
+          // The preheader has exactly one successor (unconditional br to header).
+          if (succ_size(InBB) == 1) {
             InitVal = Phi->getIncomingValue(Idx);
             break;
+          }
+        }
+        // Fallback: if no single-successor predecessor found (e.g. switch),
+        // use the first predecessor that is not the latch (header not reachable
+        // from that block via a single back-edge).
+        if (!InitVal) {
+          for (unsigned Idx = 0; Idx < Phi->getNumIncomingValues(); ++Idx) {
+            BasicBlock *InBB = Phi->getIncomingBlock(Idx);
+            if (!llvm::is_contained(successors(InBB), HeaderBB)) {
+              InitVal = Phi->getIncomingValue(Idx);
+              break;
+            }
           }
         }
         if (!InitVal) return false;
