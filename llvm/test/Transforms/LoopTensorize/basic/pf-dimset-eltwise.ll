@@ -1,7 +1,7 @@
 ; RUN: opt -passes=loop-tensorize -S --disable-verify < %s | FileCheck %s
 ; REQUIRES: asserts
 ;
-; Verify that a 2-level element-wise fdiv loop is classified ElementWise
+; Verify that a 2-level element-wise fdiv loop is classified BinaryOp
 ; and the fdiv instruction is present in the output (no reshape).
 ; D[i][j] = A[i][j] / B[i][j]
 ;

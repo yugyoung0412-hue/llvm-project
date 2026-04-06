@@ -575,6 +575,21 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
     return;
   }
 
+  case TensorOpKind::BinaryOp: {
+    // Temporary scalar fallback — full tensor emission added in Task 5.
+    LLVM_DEBUG(dbgs() << "TPlanLowering: BinaryOp not yet implemented, "
+                         "falling back to scalar clone\n");
+    auto *Clone = Inst->clone();
+    State.remapClone(Clone);
+    Value *Result = State.Builder.Insert(Clone);
+    applyFlags(*cast<Instruction>(Result));
+    State.EmittedMap[Inst] = Result;
+    State.setValue(this, Result);
+    return;
+  }
+
+  // LEGACY — unreachable after classifyBinaryOp() now returns BinaryOp.
+  // Will be replaced in Task 5 when emitBinaryOp() is wired.
   case TensorOpKind::ElementWise: {
     auto tryVectorize = [&]() -> bool {
       auto *ADR = dyn_cast<TPSingleDefRecipe>(getOperand(0));
@@ -700,6 +715,8 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
     return;
   }
 
+  // LEGACY — unreachable after classifyBinaryOp() now returns BinaryOp.
+  // Will be replaced in Task 5 when emitBinaryOp() is wired.
   case TensorOpKind::BroadcastBinary: {
     auto tryVectorize = [&]() -> bool {
       auto *ADR = dyn_cast<TPSingleDefRecipe>(getOperand(0));
