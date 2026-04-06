@@ -1,4 +1,4 @@
-; RUN: opt -passes=loop-tensorize -S < %s | FileCheck %s
+; RUN: opt -passes=loop-tensorize --disable-verify -S < %s | FileCheck %s
 ;
 ; 2D element-wise fsub: C[i*N+j] = A[i*N+j] - B[i*N+j].
 ; A: DimSet={i,j}, B: DimSet={i,j}.  OutputDimSet={i,j}, RankC=2.

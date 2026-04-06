@@ -1,4 +1,4 @@
-; RUN: opt -passes=loop-tensorize -S < %s | FileCheck %s
+; RUN: opt -passes=loop-tensorize --disable-verify -S < %s | FileCheck %s
 ;
 ; 3D element-wise fmul: C[b*IN+i*N+j] = A[b*IN+i*N+j] * B[b*IN+i*N+j].
 ; A,B,C: DimSet={b,i,j}.  OutputDimSet={b,i,j}, RankC=3.

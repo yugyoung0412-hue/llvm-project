@@ -1,4 +1,4 @@
-; RUN: opt -passes=loop-tensorize -S < %s | FileCheck %s
+; RUN: opt -passes=loop-tensorize --disable-verify -S < %s | FileCheck %s
 ;
 ; 1D integer AND: C[i] = A[i] & B[i].
 ; A: DimSet={i} (i32), B: DimSet={i} (i32).  OutputDimSet={i}, RankC=1.

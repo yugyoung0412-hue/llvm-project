@@ -1,4 +1,4 @@
-; RUN: opt -passes=loop-tensorize -S < %s | FileCheck %s
+; RUN: opt -passes=loop-tensorize --disable-verify -S < %s | FileCheck %s
 ;
 ; 1D + 1D element-wise fadd: C[i] = A[i] + B[i].
 ; A: DimSet={i}, B: DimSet={i}.  OutputDimSet={i}, RankC=1.

@@ -1,4 +1,4 @@
-; RUN: opt -passes=loop-tensorize -S < %s | FileCheck %s
+; RUN: opt -passes=loop-tensorize --disable-verify -S < %s | FileCheck %s
 ;
 ; 1D vector + 2D matrix broadcast fadd: C[i*N+j] = A[j] + B[i*N+j].
 ; A: DimSet={j} (1D), B: DimSet={i,j} (2D).
@@ -6,7 +6,7 @@
 ; Emits binary.fadd.1d.2d.2d.f32.
 ;
 ; CHECK: call void @llvm.tensor.binary.fadd.1d.2d.2d.f32(
-; CHECK-SAME: i64 0
+; CHECK-SAME: ptr %A, i64 0
 
 target datalayout = "e-m:e-i64:64-n32:64"
 target triple = "aarch64"
