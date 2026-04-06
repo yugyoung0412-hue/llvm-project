@@ -1,9 +1,9 @@
 ; RUN: opt -passes=loop-tensorize -S < %s | FileCheck %s
 ;
 ; GEMV: y[j] += A[k*N+j] * x[k].  x is 1D (DimSet={k}), A is 2D (DimSet={k,j}).
-; OutputDimSet={j}, RankC=1.  Emits contract.1d.2d.f32.
+; OutputDimSet={j}, RankC=1.  Emits contract.1d.2d.1d.f32.
 ;
-; CHECK: call void @llvm.tensor.contract.1d.2d.f32(
+; CHECK: call void @llvm.tensor.contract.1d.2d.1d.f32(
 ; CHECK-SAME: i64 0
 ; CHECK-SAME: i64 %N
 

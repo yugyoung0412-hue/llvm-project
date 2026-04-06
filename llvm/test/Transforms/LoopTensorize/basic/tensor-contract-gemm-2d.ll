@@ -2,7 +2,7 @@
 ;
 ; 2D GEMM using the new contract intrinsic (replaces tensor.matmul).
 ; A[i*%K+k], B[k*%N+j], C[i*%N+j]. Runtime strides %K and %N.
-; CHECK: call void @llvm.tensor.contract.2d.2d.f32(
+; CHECK: call void @llvm.tensor.contract.2d.2d.2d.f32(
 ; CHECK-SAME: i64 0
 ; CHECK-SAME: i64 %K
 ; CHECK-SAME: i64 %N

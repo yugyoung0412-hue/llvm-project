@@ -2,10 +2,10 @@
 ;
 ; Batched GEMM: C[b,i,j] += A[b,i,k] * B[b,k,j].
 ; A: DimSet={k,i,b} (3D), B: DimSet={k,j,b} (3D).
-; OutputDimSet={j,i,b}, RankC=3.  Emits contract.3d.3d.f32.
+; OutputDimSet={j,i,b}, RankC=3.  Emits contract.3d.3d.3d.f32.
 ; A_strides[j]=0 (A∌j), B_strides[i]=0 (B∌i) — stride-0 broadcast convention.
 ;
-; CHECK: call void @llvm.tensor.contract.3d.3d.f32(
+; CHECK: call void @llvm.tensor.contract.3d.3d.3d.f32(
 ; CHECK-SAME: i64 0
 ; CHECK-SAME: i64 %IK
 ; CHECK-SAME: i64 %KN

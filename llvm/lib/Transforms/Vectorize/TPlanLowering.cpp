@@ -154,7 +154,8 @@ static FunctionCallee getTensorContractFn(Module &M, unsigned RankA,
   StringRef TypeSuffix = getTypeSuffix(ElemTy);
   assert(!TypeSuffix.empty() && "unsupported element type for contract");
   std::string Name = (Twine("llvm.tensor.contract.") + Twine(RankA) + "d." +
-                      Twine(RankB) + "d." + TypeSuffix).str();
+                      Twine(RankB) + "d." + Twine(RankC) + "d." +
+                      TypeSuffix).str();
   Type *PtrTy = PointerType::getUnqual(Ctx);
   Type *I64Ty = Type::getInt64Ty(Ctx);
   SmallVector<Type *> Params;
