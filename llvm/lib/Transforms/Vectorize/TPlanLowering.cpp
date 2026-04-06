@@ -770,121 +770,10 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
   }
 
   // LEGACY — unreachable after classifyBinaryOp() now returns BinaryOp.
-  // Will be replaced in Task 5 when emitBinaryOp() is wired.
-  case TensorOpKind::ElementWise: {
-    auto tryVectorize = [&]() -> bool {
-      auto *ADR = dyn_cast<TPSingleDefRecipe>(getOperand(0));
-      auto *BDR = dyn_cast<TPSingleDefRecipe>(getOperand(1));
-      if (!ADR || !BDR) return false;
-
-      unsigned Rank = ADR->DimSet.count();
-      if (Rank < 1 || Rank > 3) return false; // TODO: support rank > 3
-
-      // Determine op name and element type from the instruction.
-      std::string OpName = getOpcodeStr(Inst);
-      if (OpName.empty()) return false;
-
-      // For CmpInst the result type is i1 — use operand type for the suffix.
-      Type *ElemTyForSuffix = Inst->getType()->getScalarType();
-      if (isa<CmpInst>(Inst) && Inst->getNumOperands() >= 1)
-        ElemTyForSuffix = Inst->getOperand(0)->getType()->getScalarType();
-      if (getTypeSuffix(ElemTyForSuffix).empty()) return false;
-
-      // Get pointer operands from load recipes.
-      auto *ALoad = dyn_cast<TPWidenLoadRecipe>(ADR);
-      auto *BLoad = dyn_cast<TPWidenLoadRecipe>(BDR);
-      if (!ALoad || !BLoad) return false;
-      auto *APtrDR = dyn_cast<TPSingleDefRecipe>(ALoad->getOperand(0));
-      auto *BPtrDR = dyn_cast<TPSingleDefRecipe>(BLoad->getOperand(0));
-      if (!APtrDR || !BPtrDR) return false;
-      Value *APtr = State.getValue(APtrDR);
-      Value *BPtr = State.getValue(BPtrDR);
-      if (!APtr || !BPtr) return false;
-
-      // Find C pointer from the store recipe that uses this recipe's result.
-      // Store operand 0 is the pointer (PtrOp), operand 1 is the value (ValOp).
-      Value *CPtr = nullptr;
-      if (auto *DefVal = this->getDefinedValue()) {
-        for (TPUser *U : DefVal->users()) {
-          auto *RB = dyn_cast<TPRecipeBase>(U);
-          if (!RB) continue;
-          if (auto *SR = dyn_cast<TPWidenStoreRecipe>(RB)) {
-            auto *PtrDR = dyn_cast<TPSingleDefRecipe>(SR->getOperand(0));
-            if (PtrDR) CPtr = State.getValue(PtrDR);
-            break;
-          }
-        }
-      }
-      if (!CPtr) return false;
-
-      SmallVector<unsigned>  Shape    = getTPValueShape(*ADR, State.Plan);
-      SmallVector<const SCEV *> AStrides =
-          getTPValueStrides(*ADR, State.Plan, *State.SE);
-      SmallVector<const SCEV *> BStrides =
-          getTPValueStrides(*BDR, State.Plan, *State.SE);
-      // Derive C strides from the store recipe's MemStrides.
-      SmallVector<const SCEV *> CStrides;
-      TPWidenStoreRecipe *CStoreRecipe = nullptr;
-      if (auto *DefVal = this->getDefinedValue()) {
-        for (TPUser *U : DefVal->users()) {
-          auto *RB = dyn_cast<TPRecipeBase>(U);
-          if (!RB) continue;
-          if (auto *SR = dyn_cast<TPWidenStoreRecipe>(RB)) {
-            CStoreRecipe = SR;
-            for (int D = SR->DimSet.find_first(); D >= 0;
-                 D = SR->DimSet.find_next(D))
-              CStrides.push_back(
-                  SR->getMemStride(static_cast<unsigned>(D), State.Plan, *State.SE));
-            break;
-          }
-        }
-      }
-      if (CStrides.empty())
-        CStrides = AStrides; // fallback: use A's strides
-
-      Type *ElemTy = ElemTyForSuffix;
-      Module *Mod  = State.Builder.GetInsertBlock()->getModule();
-      auto EltFn   = getTensorElementwiseFn(*Mod, StringRef(OpName), Rank, ElemTy);
-      IRBuilder<> &B = State.Builder;
-      auto I64 = [&](uint64_t V) -> Value * { return B.getInt64(V); };
-      auto expandStride = [&](const SCEV *S, unsigned Dim) -> Value * {
-        if (State.Expander && State.Expander->isSafeToExpand(S))
-          return State.Expander->expandCodeFor(S, B.getInt64Ty(),
-                                               &*B.GetInsertPoint());
-        return B.getInt64(State.Plan.getDenseStrideForDim(Dim));
-      };
-
-      SmallVector<Value *> Args;
-      auto appendStrideArgs = [&](SmallVector<const SCEV *> &Strides,
-                                   const SmallBitVector &DimBV) {
-        int D = DimBV.find_first();
-        for (const SCEV *S : Strides) {
-          Args.push_back(expandStride(S, D >= 0 ? static_cast<unsigned>(D) : 0));
-          if (D >= 0) D = DimBV.find_next(D);
-        }
-      };
-      Args.push_back(CPtr);
-      appendStrideArgs(CStrides, CStoreRecipe ? CStoreRecipe->DimSet : ADR->DimSet);
-      Args.push_back(APtr);
-      appendStrideArgs(AStrides, ADR->DimSet);
-      Args.push_back(BPtr);
-      appendStrideArgs(BStrides, BDR->DimSet);
-      for (unsigned D : Shape) Args.push_back(I64(D));
-      B.CreateCall(EltFn, Args);
-      return true;
-    };
-
-    if (tryVectorize()) return;
-
-    // Scalar fallback.
-    auto *Clone = Inst->clone();
-    State.remapClone(Clone);
-    Value *Result = State.Builder.Insert(Clone);
-    applyFlags(*cast<Instruction>(Result));
-    State.EmittedMap[Inst] = Result;
-    State.setValue(this, Result);
+  case TensorOpKind::ElementWise:
+    llvm_unreachable("ElementWise/BroadcastBinary are unreachable — "
+                     "classifyBinaryOp() returns BinaryOp");
     return;
-  }
 
   case TensorOpKind::Scalar: {
     auto *Clone = Inst->clone();
@@ -897,116 +786,10 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
   }
 
   // LEGACY — unreachable after classifyBinaryOp() now returns BinaryOp.
-  // Will be replaced in Task 5 when emitBinaryOp() is wired.
-  case TensorOpKind::BroadcastBinary: {
-    auto tryVectorize = [&]() -> bool {
-      auto *ADR = dyn_cast<TPSingleDefRecipe>(getOperand(0));
-      auto *BDR = dyn_cast<TPSingleDefRecipe>(getOperand(1));
-      if (!ADR || !BDR) return false;
-
-      std::string OpName = getOpcodeStr(Inst);
-      if (OpName.empty()) return false;
-
-      Type *ElemTyForSuffix = Inst->getType()->getScalarType();
-      if (isa<CmpInst>(Inst) && Inst->getNumOperands() >= 1)
-        ElemTyForSuffix = Inst->getOperand(0)->getType()->getScalarType();
-      if (getTypeSuffix(ElemTyForSuffix).empty()) return false;
-
-      // rank_out = rank of the larger DimSet operand.
-      unsigned RankOut = std::max(ADR->DimSet.count(), BDR->DimSet.count());
-      if (RankOut < 1 || RankOut > 3) return false;
-
-      auto *ALoad = dyn_cast<TPWidenLoadRecipe>(ADR);
-      auto *BLoad = dyn_cast<TPWidenLoadRecipe>(BDR);
-      if (!ALoad || !BLoad) return false;
-
-      auto *APtrDR = dyn_cast<TPSingleDefRecipe>(ALoad->getOperand(0));
-      auto *BPtrDR = dyn_cast<TPSingleDefRecipe>(BLoad->getOperand(0));
-      if (!APtrDR || !BPtrDR) return false;
-      Value *APtr = State.getValue(APtrDR);
-      Value *BPtr = State.getValue(BPtrDR);
-      if (!APtr || !BPtr) return false;
-
-      // Find C pointer and store recipe from users of this recipe's result.
-      Value *CPtr = nullptr;
-      TPWidenStoreRecipe *CStoreRecipe = nullptr;
-      if (auto *DefVal = this->getDefinedValue()) {
-        for (TPUser *U : DefVal->users()) {
-          auto *RB = dyn_cast<TPRecipeBase>(U);
-          if (!RB) continue;
-          if (auto *SR = dyn_cast<TPWidenStoreRecipe>(RB)) {
-            CStoreRecipe = SR;
-            auto *PtrDR = dyn_cast<TPSingleDefRecipe>(SR->getOperand(0));
-            if (PtrDR) CPtr = State.getValue(PtrDR);
-            break;
-          }
-        }
-      }
-      if (!CPtr) return false;
-
-      IRBuilder<> &B = State.Builder;
-      Type *ElemTy = ElemTyForSuffix;
-      Module *Mod = B.GetInsertBlock()->getModule();
-      auto BcastFn = getTensorBroadcastFn(*Mod, StringRef(OpName), RankOut, ElemTy);
-
-      auto I64 = [&](uint64_t V) -> Value * { return B.getInt64(V); };
-      auto expandStride = [&](const SCEV *S, unsigned Dim) -> Value * {
-        if (State.Expander && State.Expander->isSafeToExpand(S))
-          return State.Expander->expandCodeFor(S, B.getInt64Ty(),
-                                               &*B.GetInsertPoint());
-        return B.getInt64(State.Plan.getDenseStrideForDim(Dim));
-      };
-
-      SmallVector<Value *> Args;
-      // C strides (rank_out dims from store recipe).
-      Args.push_back(CPtr);
-      for (unsigned D = 0; D < RankOut; ++D) {
-        if (CStoreRecipe && (D < CStoreRecipe->DimSet.size()) &&
-            CStoreRecipe->DimSet.test(D))
-          Args.push_back(expandStride(
-              CStoreRecipe->getMemStride(D, State.Plan, *State.SE), D));
-        else
-          Args.push_back(I64(State.Plan.getDenseStrideForDim(D)));
-      }
-      // A strides: missing dims → 0 (broadcast).
-      Args.push_back(APtr);
-      for (unsigned D = 0; D < RankOut; ++D) {
-        if (D < ADR->DimSet.size() && ADR->DimSet.test(D))
-          Args.push_back(expandStride(ADR->getMemStride(D, State.Plan, *State.SE), D));
-        else
-          Args.push_back(I64(0));
-      }
-      // B strides: missing dims → 0 (broadcast).
-      Args.push_back(BPtr);
-      for (unsigned D = 0; D < RankOut; ++D) {
-        if (D < BDR->DimSet.size() && BDR->DimSet.test(D))
-          Args.push_back(expandStride(BDR->getMemStride(D, State.Plan, *State.SE), D));
-        else
-          Args.push_back(I64(0));
-      }
-      // Shape: use the larger operand's dims.
-      const TPSingleDefRecipe *LargerDR =
-          ADR->DimSet.count() >= BDR->DimSet.count() ? ADR : BDR;
-      SmallVector<unsigned> Shape = getTPValueShape(*LargerDR, State.Plan);
-      for (unsigned D : Shape) Args.push_back(I64(D));
-
-      B.CreateCall(BcastFn, Args);
-      return true;
-    };
-
-    if (tryVectorize()) return;
-
-    LLVM_DEBUG(dbgs() << "TPlanLowering: BroadcastBinary vectorize failed, "
-                         "falling back to scalar clone\n");
-    // Scalar fallback.
-    auto *Clone = Inst->clone();
-    State.remapClone(Clone);
-    Value *Result = State.Builder.Insert(Clone);
-    applyFlags(*cast<Instruction>(Result));
-    State.EmittedMap[Inst] = Result;
-    State.setValue(this, Result);
+  case TensorOpKind::BroadcastBinary:
+    llvm_unreachable("ElementWise/BroadcastBinary are unreachable — "
+                     "classifyBinaryOp() returns BinaryOp");
     return;
-  }
 
   case TensorOpKind::OuterProduct: {
     auto tryVectorize = [&]() -> bool {
@@ -1135,38 +918,23 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
         AccPtr = AllocaB.CreateAlloca(ElemTy, nullptr, "reduce.acc");
         // Store initial value (preheader incoming).
         // A loop-header PHI has exactly two incoming edges: the preheader and
-        // the backedge.  getSinglePredecessor() is always null for a loop
-        // header (>=2 predecessors), so the old ternary always fell through to
-        // getIncomingBlock(0) — which is not guaranteed to be the preheader.
-        // Instead, identify the preheader as the incoming block that does NOT
-        // branch back to the header (i.e. the header is not one of its
-        // successors).
+        // the backedge.  Identify the preheader as the predecessor that does
+        // NOT branch back to the header — i.e., the header is not among its
+        // successors.  This is the correct invariant for loop-simplify form:
+        // the latch always has HeaderBB as a successor (the backedge), while
+        // the preheader enters from outside the loop and only reaches the
+        // header through the forward entry edge.
+        // Note: succ_size(InBB)==1 was the old heuristic but it fails when an
+        // outer-loop latch branches to both the inner-loop header AND the
+        // outer-loop exit (succ_size==2), causing false negatives.
         BasicBlock *HeaderBB = Phi->getParent();
         Value *InitVal = nullptr;
-        // Identify the preheader as the unique predecessor that branches
-        // unconditionally to the header (exactly one successor).  The latch
-        // (backedge) block always has a conditional branch (≥2 successors).
-        // The old "header not in successors" heuristic fails for inner-loop
-        // PHIs whose preheader (outer loop body) also unconditionally jumps to
-        // the header — making it look like a backedge.
         for (unsigned Idx = 0; Idx < Phi->getNumIncomingValues(); ++Idx) {
           BasicBlock *InBB = Phi->getIncomingBlock(Idx);
-          // The preheader has exactly one successor (unconditional br to header).
-          if (succ_size(InBB) == 1) {
+          // Preheader: does NOT have HeaderBB as a successor (not the latch).
+          if (!llvm::is_contained(successors(InBB), HeaderBB)) {
             InitVal = Phi->getIncomingValue(Idx);
             break;
-          }
-        }
-        // Fallback: if no single-successor predecessor found (e.g. switch),
-        // use the first predecessor that is not the latch (header not reachable
-        // from that block via a single back-edge).
-        if (!InitVal) {
-          for (unsigned Idx = 0; Idx < Phi->getNumIncomingValues(); ++Idx) {
-            BasicBlock *InBB = Phi->getIncomingBlock(Idx);
-            if (!llvm::is_contained(successors(InBB), HeaderBB)) {
-              InitVal = Phi->getIncomingValue(Idx);
-              break;
-            }
           }
         }
         if (!InitVal) return false;
