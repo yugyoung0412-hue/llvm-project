@@ -162,6 +162,32 @@ static FunctionCallee getTensorElementwiseFn(Module &M, StringRef OpName,
   return M.getOrInsertFunction(Name, FT);
 }
 
+/// Returns (creating if needed) @llvm.tensor.broadcast.<op>.<rank_out>d.<type>.
+/// Signature identical to getTensorElementwiseFn — stride=0 on broadcast dims
+/// is conveyed through the stride arguments, not the function type.
+static FunctionCallee getTensorBroadcastFn(Module &M, StringRef OpName,
+                                            unsigned RankOut, Type *ElemTy) {
+  StringRef TypeSuffix = getTypeSuffix(ElemTy);
+  assert(!TypeSuffix.empty() && "unsupported element type");
+  std::string Name = "llvm.tensor.broadcast.";
+  Name += OpName.str();
+  Name += "." + std::to_string(RankOut) + "d.";
+  Name += TypeSuffix;
+  LLVMContext &Ctx = M.getContext();
+  Type *PtrTy = PointerType::getUnqual(Ctx);
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+  SmallVector<Type *> Params;
+  for (unsigned T = 0; T < 3; ++T) {
+    Params.push_back(PtrTy);
+    for (unsigned R = 0; R < RankOut; ++R)
+      Params.push_back(I64Ty);
+  }
+  for (unsigned R = 0; R < RankOut; ++R)
+    Params.push_back(I64Ty);
+  FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), Params, false);
+  return M.getOrInsertFunction(Name, FT);
+}
+
 //===----------------------------------------------------------------------===//
 // Stage-print helpers (unconditional; not gated by LLVM_DEBUG)
 //===----------------------------------------------------------------------===//
@@ -592,23 +618,106 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
   }
 
   case TensorOpKind::BroadcastBinary: {
-    LLVM_DEBUG({
-      auto *DR = dyn_cast<TPSingleDefRecipe>(getOperand(0));
-      if (DR) {
-        auto Shape   = getTPValueShape(*DR, State.Plan);
-        auto Strides = State.SE
-            ? getTPValueStrides(*DR, State.Plan, *State.SE)
-            : SmallVector<const SCEV *>{};
-        dbgs() << "BroadcastBinary shape=[";
-        for (unsigned D : Shape) dbgs() << D << " ";
-        dbgs() << "] strides=[";
-        for (const SCEV *S : Strides) {
-          if (S) S->print(dbgs()); else dbgs() << "?";
-          dbgs() << " ";
+    auto tryVectorize = [&]() -> bool {
+      auto *ADR = dyn_cast<TPSingleDefRecipe>(getOperand(0));
+      auto *BDR = dyn_cast<TPSingleDefRecipe>(getOperand(1));
+      if (!ADR || !BDR) return false;
+
+      std::string OpName = getOpcodeStr(Inst);
+      if (OpName.empty()) return false;
+
+      Type *ElemTyForSuffix = Inst->getType()->getScalarType();
+      if (isa<CmpInst>(Inst) && Inst->getNumOperands() >= 1)
+        ElemTyForSuffix = Inst->getOperand(0)->getType()->getScalarType();
+      if (getTypeSuffix(ElemTyForSuffix).empty()) return false;
+
+      // rank_out = rank of the larger DimSet operand.
+      unsigned RankOut = std::max(ADR->DimSet.count(), BDR->DimSet.count());
+      if (RankOut < 1 || RankOut > 3) return false;
+
+      auto *ALoad = dyn_cast<TPWidenLoadRecipe>(ADR);
+      auto *BLoad = dyn_cast<TPWidenLoadRecipe>(BDR);
+      if (!ALoad || !BLoad) return false;
+
+      auto *APtrDR = dyn_cast<TPSingleDefRecipe>(ALoad->getOperand(0));
+      auto *BPtrDR = dyn_cast<TPSingleDefRecipe>(BLoad->getOperand(0));
+      if (!APtrDR || !BPtrDR) return false;
+      Value *APtr = State.getValue(APtrDR);
+      Value *BPtr = State.getValue(BPtrDR);
+      if (!APtr || !BPtr) return false;
+
+      // Find C pointer and store recipe from users of this recipe's result.
+      Value *CPtr = nullptr;
+      TPWidenStoreRecipe *CStoreRecipe = nullptr;
+      if (auto *DefVal = this->getDefinedValue()) {
+        for (TPUser *U : DefVal->users()) {
+          auto *RB = dyn_cast<TPRecipeBase>(U);
+          if (!RB) continue;
+          if (auto *SR = dyn_cast<TPWidenStoreRecipe>(RB)) {
+            CStoreRecipe = SR;
+            auto *PtrDR = dyn_cast<TPSingleDefRecipe>(SR->getOperand(0));
+            if (PtrDR) CPtr = State.getValue(PtrDR);
+            break;
+          }
         }
-        dbgs() << "] — scalar fallback (TODO: broadcast intrinsic)\n";
       }
-    });
+      if (!CPtr) return false;
+
+      IRBuilder<> &B = State.Builder;
+      Type *ElemTy = ElemTyForSuffix;
+      Module *Mod = B.GetInsertBlock()->getModule();
+      auto BcastFn = getTensorBroadcastFn(*Mod, StringRef(OpName), RankOut, ElemTy);
+
+      auto I64 = [&](uint64_t V) -> Value * { return B.getInt64(V); };
+      auto expandStride = [&](const SCEV *S, unsigned Dim) -> Value * {
+        if (State.Expander && State.Expander->isSafeToExpand(S))
+          return State.Expander->expandCodeFor(S, B.getInt64Ty(),
+                                               &*B.GetInsertPoint());
+        return B.getInt64(State.Plan.getDenseStrideForDim(Dim));
+      };
+
+      SmallVector<Value *> Args;
+      // C strides (rank_out dims from store recipe).
+      Args.push_back(CPtr);
+      for (unsigned D = 0; D < RankOut; ++D) {
+        if (CStoreRecipe && (D < CStoreRecipe->DimSet.size()) &&
+            CStoreRecipe->DimSet.test(D))
+          Args.push_back(expandStride(
+              CStoreRecipe->getMemStride(D, State.Plan, *State.SE), D));
+        else
+          Args.push_back(I64(State.Plan.getDenseStrideForDim(D)));
+      }
+      // A strides: missing dims → 0 (broadcast).
+      Args.push_back(APtr);
+      for (unsigned D = 0; D < RankOut; ++D) {
+        if (D < ADR->DimSet.size() && ADR->DimSet.test(D))
+          Args.push_back(expandStride(ADR->getMemStride(D, State.Plan, *State.SE), D));
+        else
+          Args.push_back(I64(0));
+      }
+      // B strides: missing dims → 0 (broadcast).
+      Args.push_back(BPtr);
+      for (unsigned D = 0; D < RankOut; ++D) {
+        if (D < BDR->DimSet.size() && BDR->DimSet.test(D))
+          Args.push_back(expandStride(BDR->getMemStride(D, State.Plan, *State.SE), D));
+        else
+          Args.push_back(I64(0));
+      }
+      // Shape: use the larger operand's dims.
+      const TPSingleDefRecipe *LargerDR =
+          ADR->DimSet.count() >= BDR->DimSet.count() ? ADR : BDR;
+      SmallVector<unsigned> Shape = getTPValueShape(*LargerDR, State.Plan);
+      for (unsigned D : Shape) Args.push_back(I64(D));
+
+      B.CreateCall(BcastFn, Args);
+      return true;
+    };
+
+    if (tryVectorize()) return;
+
+    LLVM_DEBUG(dbgs() << "TPlanLowering: BroadcastBinary vectorize failed, "
+                         "falling back to scalar clone\n");
+    // Scalar fallback.
     auto *Clone = Inst->clone();
     State.remapClone(Clone);
     Value *Result = State.Builder.Insert(Clone);
@@ -742,8 +851,6 @@ bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
     dbgs() << "\n=== Stage 2: After Widening (DimSets propagated) ===\n";
     Plan.print(dbgs());
   });
-  errs() << "\n=== Stage 2: After Widening (DimSets propagated) ===\n";
-  Plan.print(errs());
 
   // 2. Classify every recipe by DimSet patterns.
   RecipeClassMap CM;
@@ -753,9 +860,6 @@ bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
     Plan.print(dbgs());
     printClassificationSummary(Plan, CM, dbgs());
   });
-  errs() << "\n=== Stage 3: After Pattern Matching (recipe classifications) ===\n";
-  Plan.print(errs());
-  printClassificationSummary(Plan, CM, errs());
 
   // 3. Lower: walk block CFG in construction order.
   IRBuilder<> Builder(F.getContext());
