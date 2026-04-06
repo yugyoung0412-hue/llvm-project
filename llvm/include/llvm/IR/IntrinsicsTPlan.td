@@ -14,6 +14,16 @@
 /// Ra, Rb in {1,2,3,4}   Rc in {0,1,2,3,4} (contract) or {1,2,3,4} (binary)
 /// type  in {f16, f32, f64, i8, i16, i32, i64}
 ///
+/// NOTE: TPlanLowering.cpp currently declares these via getOrInsertFunction()
+/// rather than Intrinsic::getDeclaration().  The TableGen records here are
+/// forward-looking infrastructure: they enable correct intrinsic-ID encoding
+/// in bitcode and allow future optimization passes to query memory attributes,
+/// but the lowering pass works without them today.
+///
+/// TODO: llvm.tensor.reduce.<op>.<rank>d.<type> (PlainReduction path) is not
+/// yet registered here — it is out of scope for the initial binary-ops feature
+/// and can be added as a follow-up.
+///
 //===----------------------------------------------------------------------===//
 
 //===----------------------------------------------------------------------===//
