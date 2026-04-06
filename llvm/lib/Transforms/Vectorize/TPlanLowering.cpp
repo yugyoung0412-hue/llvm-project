@@ -38,14 +38,94 @@ using namespace llvm;
 // Intrinsic declaration helpers
 //===----------------------------------------------------------------------===//
 
+/// Maps an LLVM element type to the suffix used in tensor intrinsic names.
+/// Returns "" for unsupported types — callers must fall back to scalar.
+static StringRef getTypeSuffix(Type *Ty) {
+  if (Ty->isHalfTy())         return "f16";
+  if (Ty->isFloatTy())        return "f32";
+  if (Ty->isDoubleTy())       return "f64";
+  if (Ty->isIntegerTy(1))     return "i1";
+  if (Ty->isIntegerTy(8))     return "i8";
+  if (Ty->isIntegerTy(16))    return "i16";
+  if (Ty->isIntegerTy(32))    return "i32";
+  if (Ty->isIntegerTy(64))    return "i64";
+  return "";
+}
+
+/// Maps a BinaryOperator or CmpInst to the opcode string used in tensor
+/// intrinsic names. Returns "" for unsupported instructions.
+static std::string getOpcodeStr(const Instruction *I) {
+  if (const auto *BO = dyn_cast<BinaryOperator>(I)) {
+    switch (BO->getOpcode()) {
+    case Instruction::FAdd: return "fadd";
+    case Instruction::FSub: return "fsub";
+    case Instruction::FMul: return "fmul";
+    case Instruction::FDiv: return "fdiv";
+    case Instruction::FRem: return "frem";
+    case Instruction::Add:  return "add";
+    case Instruction::Sub:  return "sub";
+    case Instruction::Mul:  return "mul";
+    case Instruction::SDiv: return "sdiv";
+    case Instruction::UDiv: return "udiv";
+    case Instruction::SRem: return "srem";
+    case Instruction::URem: return "urem";
+    case Instruction::And:  return "and";
+    case Instruction::Or:   return "or";
+    case Instruction::Xor:  return "xor";
+    case Instruction::Shl:  return "shl";
+    case Instruction::LShr: return "lshr";
+    case Instruction::AShr: return "ashr";
+    default: return "";
+    }
+  }
+  if (const auto *CI = dyn_cast<FCmpInst>(I)) {
+    switch (CI->getPredicate()) {
+    case CmpInst::FCMP_OEQ: return "fcmp_oeq";
+    case CmpInst::FCMP_OLT: return "fcmp_olt";
+    case CmpInst::FCMP_OLE: return "fcmp_ole";
+    case CmpInst::FCMP_OGT: return "fcmp_ogt";
+    case CmpInst::FCMP_OGE: return "fcmp_oge";
+    case CmpInst::FCMP_ONE: return "fcmp_one";
+    case CmpInst::FCMP_ORD: return "fcmp_ord";
+    case CmpInst::FCMP_UEQ: return "fcmp_ueq";
+    case CmpInst::FCMP_ULT: return "fcmp_ult";
+    case CmpInst::FCMP_ULE: return "fcmp_ule";
+    case CmpInst::FCMP_UGT: return "fcmp_ugt";
+    case CmpInst::FCMP_UGE: return "fcmp_uge";
+    case CmpInst::FCMP_UNE: return "fcmp_une";
+    case CmpInst::FCMP_UNO: return "fcmp_uno";
+    // FCMP_TRUE / FCMP_FALSE are tautologies — no tensor intrinsic defined.
+    default: return "";
+    }
+  }
+  if (const auto *CI = dyn_cast<ICmpInst>(I)) {
+    switch (CI->getPredicate()) {
+    case CmpInst::ICMP_EQ:  return "icmp_eq";
+    case CmpInst::ICMP_NE:  return "icmp_ne";
+    case CmpInst::ICMP_SLT: return "icmp_slt";
+    case CmpInst::ICMP_SLE: return "icmp_sle";
+    case CmpInst::ICMP_SGT: return "icmp_sgt";
+    case CmpInst::ICMP_SGE: return "icmp_sge";
+    case CmpInst::ICMP_ULT: return "icmp_ult";
+    case CmpInst::ICMP_ULE: return "icmp_ule";
+    case CmpInst::ICMP_UGT: return "icmp_ugt";
+    case CmpInst::ICMP_UGE: return "icmp_uge";
+    default: return "";
+    }
+  }
+  return "";
+}
+
 /// Returns (creating if needed) @llvm.tensor.matmul.<type>.
 /// Signature: void(ptr C, i64 M, i64 N, i64 ldc,
 ///                 ptr A, i64 M, i64 K, i64 lda,
 ///                 ptr B, i64 K, i64 N, i64 ldb)
 static FunctionCallee getTensorMatmulFn(Module &M, Type *ElemTy) {
   LLVMContext &Ctx = M.getContext();
+  StringRef TypeSuffix = getTypeSuffix(ElemTy);
+  assert(!TypeSuffix.empty() && "unsupported element type for matmul");
   std::string Name = "llvm.tensor.matmul.";
-  Name += ElemTy->isFloatTy() ? "f32" : "f64";
+  Name += TypeSuffix;
   Type *PtrTy = PointerType::getUnqual(Ctx);
   Type *I64Ty = Type::getInt64Ty(Ctx);
   FunctionType *FT = FunctionType::get(
@@ -62,10 +142,12 @@ static FunctionCallee getTensorMatmulFn(Module &M, Type *ElemTy) {
 static FunctionCallee getTensorElementwiseFn(Module &M, StringRef OpName,
                                               unsigned Rank, Type *ElemTy) {
   LLVMContext &Ctx = M.getContext();
+  StringRef TypeSuffix = getTypeSuffix(ElemTy);
+  assert(!TypeSuffix.empty() && "unsupported element type");
   std::string Name = "llvm.tensor.elementwise.";
   Name += OpName.str();
   Name += "." + std::to_string(Rank) + "d.";
-  Name += ElemTy->isFloatTy() ? "f32" : "f64";
+  Name += TypeSuffix;
   Type *PtrTy = PointerType::getUnqual(Ctx);
   Type *I64Ty = Type::getInt64Ty(Ctx);
   SmallVector<Type *> Params;
