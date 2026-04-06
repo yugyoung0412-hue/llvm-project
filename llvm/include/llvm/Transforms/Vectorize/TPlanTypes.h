@@ -19,8 +19,9 @@ class TPRecipeBase;
 /// Classification of a recipe's tensor operation semantics.
 enum class TensorOpKind {
   Scalar,           ///< DimSet empty — scalar op, no tensor parallelism
-  ElementWise,      ///< Binary op, both operand DimSets equal
-  BroadcastBinary,  ///< Binary op, one DimSet is strict subset of the other
+  ElementWise,      ///< Binary op, both operand DimSets equal (kept for legacy)
+  BroadcastBinary,  ///< Binary op, one DimSet is strict subset (kept for legacy)
+  BinaryOp,         ///< Binary op — unified element-wise + broadcast path
   OuterProduct,     ///< Binary op, operand DimSets are disjoint
   Contraction,      ///< Reduction update of mul-like op sharing a reduction dim
   PlainReduction,   ///< Reduction update with no fuseable mul-like producer

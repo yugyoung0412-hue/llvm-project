@@ -141,13 +141,13 @@ static TensorOpKind classifyBinaryOp(const TPRecipeBase &R) {
   A.resize(N); B.resize(N);
 
   if (A == B)
-    return TensorOpKind::ElementWise;
+    return TensorOpKind::BinaryOp;
 
   // Subset check.
   SmallBitVector Intersection = A;
   Intersection &= B;
-  if (Intersection == A) return TensorOpKind::BroadcastBinary; // A ⊆ B
-  if (Intersection == B) return TensorOpKind::BroadcastBinary; // B ⊆ A
+  if (Intersection == A) return TensorOpKind::BinaryOp; // A ⊆ B (broadcast)
+  if (Intersection == B) return TensorOpKind::BinaryOp; // B ⊆ A (broadcast)
 
   // Disjoint check.
   if (Intersection.none())

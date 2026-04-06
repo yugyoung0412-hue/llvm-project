@@ -263,6 +263,7 @@ static StringRef kindToStr(TensorOpKind K) {
   case TensorOpKind::Scalar:          return "Scalar";
   case TensorOpKind::ElementWise:     return "ElementWise";
   case TensorOpKind::BroadcastBinary: return "BroadcastBinary";
+  case TensorOpKind::BinaryOp:        return "BinaryOp";
   case TensorOpKind::OuterProduct:    return "OuterProduct";
   case TensorOpKind::Contraction:     return "Contraction";
   case TensorOpKind::PlainReduction:  return "PlainReduction";
