@@ -76,7 +76,11 @@ static bool isConv2D(const LoopNestInfo &Info) {
 }
 
 // GEMM detection: depth >= 3, exactly 3 distinct base pointers,
-// exactly 2 reads and 1 write.
+// exactly 2 reads and 1 write, and at least one reduction dimension
+// (a loop dimension not appearing in the store's index expression).
+// The reduction-dim check distinguishes true GEMM (C[i][j] += A[i][k]*B[k][j])
+// from 3D elementwise ops (C[b][i][j] = A[b][i][j] * B[b][i][j]) where every
+// loop dimension appears in the output index.
 static bool isGEMM(const LoopNestInfo &Info) {
   if (Info.Depth < 3)
     return false;
@@ -90,7 +94,10 @@ static bool isGEMM(const LoopNestInfo &Info) {
     else if (MA.Kind == AccessKind::Write)
       ++Writes;
   }
-  return Bases.size() == 3 && Reads == 2 && Writes == 1;
+  if (Bases.size() != 3 || Reads != 2 || Writes != 1)
+    return false;
+  // Require at least one reduction dimension (loop dim absent from the store).
+  return Info.ReductionDims.any();
 }
 
 PatternHint llvm::classifyPattern(const LoopNestInfo &Info) {

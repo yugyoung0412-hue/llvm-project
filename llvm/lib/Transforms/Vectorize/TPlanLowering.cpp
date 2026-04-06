@@ -254,6 +254,37 @@ static FunctionCallee getTensorReduceFn(Module &M, StringRef OpName,
   return M.getOrInsertFunction(Name, FT);
 }
 
+/// Returns (creating if needed) @llvm.tensor.binary.<op>.<Ra>d.<Rb>d.<Rc>d.<type>.
+/// Signature:
+///   void(ptr C, i64×RankC C_strides,
+///        ptr A, i64×RankC A_strides,   ; 0 if A ∌ that dim (broadcast)
+///        ptr B, i64×RankC B_strides,   ; 0 if B ∌ that dim (broadcast)
+///        i64×RankC output_dims)
+/// RankC = |(A.DimSet ∪ B.DimSet)|  (no contraction dim removed).
+static FunctionCallee getTensorBinaryFn(Module &M, StringRef Op,
+                                         unsigned RankA, unsigned RankB,
+                                         unsigned RankC, Type *ElemTy) {
+  LLVMContext &Ctx = M.getContext();
+  StringRef TypeSuffix = getTypeSuffix(ElemTy);
+  assert(!TypeSuffix.empty() && "unsupported element type for binary");
+  std::string Name = (Twine("llvm.tensor.binary.") + Op + "." +
+                      Twine(RankA) + "d." + Twine(RankB) + "d." +
+                      Twine(RankC) + "d." + TypeSuffix).str();
+  Type *PtrTy = PointerType::getUnqual(Ctx);
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+  SmallVector<Type *> Params;
+  Params.push_back(PtrTy);                                          // C
+  for (unsigned i = 0; i < RankC; ++i) Params.push_back(I64Ty);   // C strides
+  Params.push_back(PtrTy);                                          // A
+  for (unsigned i = 0; i < RankC; ++i) Params.push_back(I64Ty);   // A strides
+  Params.push_back(PtrTy);                                          // B
+  for (unsigned i = 0; i < RankC; ++i) Params.push_back(I64Ty);   // B strides
+  for (unsigned i = 0; i < RankC; ++i) Params.push_back(I64Ty);   // output dims
+  FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), Params,
+                                        /*isVarArg=*/false);
+  return M.getOrInsertFunction(Name, FT);
+}
+
 //===----------------------------------------------------------------------===//
 // Stage-print helpers (unconditional; not gated by LLVM_DEBUG)
 //===----------------------------------------------------------------------===//
@@ -475,6 +506,157 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
 }
 
 //===----------------------------------------------------------------------===//
+// Helper: emit @llvm.tensor.binary for a BinaryOp recipe
+//===----------------------------------------------------------------------===//
+
+/// Returns true if the tensor.binary intrinsic was emitted; false triggers
+/// scalar-clone fallback in the caller.
+static bool emitBinaryOp(const TPWidenRecipe *WR,
+                          TPTransformState &State) {
+  auto *ADR = dyn_cast<TPSingleDefRecipe>(WR->getOperand(0));
+  auto *BDR = dyn_cast<TPSingleDefRecipe>(WR->getOperand(1));
+  if (!ADR || !BDR) return false;
+
+  unsigned RankA = ADR->DimSet.count();
+  unsigned RankB = BDR->DimSet.count();
+  if (RankA < 1 || RankA > 4 || RankB < 1 || RankB > 4) {
+    LLVM_DEBUG(dbgs() << "TPlanLowering: BinaryOp rank out of [1,4]\n");
+    return false;
+  }
+
+  Instruction *Inst = WR->getInstruction();
+
+  std::string OpName = getOpcodeStr(Inst);
+  if (OpName.empty()) return false;
+
+  // For CmpInst the result type is i1 — use operand type for the suffix.
+  Type *ElemTy = Inst->getType()->getScalarType();
+  if (isa<CmpInst>(Inst) && Inst->getNumOperands() >= 1)
+    ElemTy = Inst->getOperand(0)->getType()->getScalarType();
+  if (getTypeSuffix(ElemTy).empty()) return false;
+
+  auto *ALoad = dyn_cast<TPWidenLoadRecipe>(ADR);
+  auto *BLoad = dyn_cast<TPWidenLoadRecipe>(BDR);
+  if (!ALoad || !BLoad) return false;
+
+  auto *APtrDR = dyn_cast<TPSingleDefRecipe>(ALoad->getOperand(0));
+  auto *BPtrDR = dyn_cast<TPSingleDefRecipe>(BLoad->getOperand(0));
+  if (!APtrDR || !BPtrDR) return false;
+
+  // Use the GEP's IR base pointer (tensor base), not the indexed GEP result.
+  // Strides encode all per-dim offsets; the intrinsic expects a flat base ptr.
+  auto getBasePtr = [&](const TPSingleDefRecipe *PtrDR) -> Value * {
+    if (auto *GR = dyn_cast<TPWidenGEPRecipe>(PtrDR)) {
+      Value *Base = cast<GetElementPtrInst>(GR->getInstruction())->getPointerOperand();
+      // Check if this base ptr was itself emitted (i.e., is a cloned instruction).
+      auto It = State.EmittedMap.find(Base);
+      return It != State.EmittedMap.end() ? It->second : Base;
+    }
+    // Not a GEP recipe — fall back to the emitted value.
+    return State.getValue(PtrDR);
+  };
+
+  Value *APtr = getBasePtr(APtrDR);
+  Value *BPtr = getBasePtr(BPtrDR);
+  if (!APtr || !BPtr) return false;
+
+  // Build OutputDimSet = A.DimSet ∪ B.DimSet (no contraction dim removed).
+  unsigned NBits = std::max(ADR->DimSet.size(), BDR->DimSet.size());
+  SmallBitVector ABits = ADR->DimSet, BBits = BDR->DimSet;
+  ABits.resize(NBits); BBits.resize(NBits);
+  SmallBitVector OutputDimSet = ABits;
+  OutputDimSet |= BBits;
+  unsigned RankC = OutputDimSet.count();
+  if (RankC < 1 || RankC > 4) {
+    LLVM_DEBUG(dbgs() << "TPlanLowering: BinaryOp output rank out of [1,4]\n");
+    return false;
+  }
+
+  // Locate C pointer from the store recipe that uses this recipe's result.
+  Value *CPtr = nullptr;
+  TPWidenStoreRecipe *CStoreRecipe = nullptr;
+  if (auto *DefVal = WR->getDefinedValue()) {
+    for (TPUser *U : DefVal->users()) {
+      auto *RB = dyn_cast<TPRecipeBase>(U);
+      if (!RB) continue;
+      if (auto *SR = dyn_cast<TPWidenStoreRecipe>(RB)) {
+        CStoreRecipe = SR;
+        if (auto *PD = dyn_cast<TPSingleDefRecipe>(SR->getOperand(0)))
+          CPtr = State.getValue(PD);
+        break;
+      }
+    }
+  }
+  // Fallback: look through IR users of the original instruction for a store.
+  if (!CPtr) {
+    for (User *U : WR->getInstruction()->users()) {
+      if (auto *SI = dyn_cast<StoreInst>(U)) {
+        Value *P = SI->getPointerOperand();
+        CPtr = isa<GetElementPtrInst>(P)
+                   ? cast<GetElementPtrInst>(P)->getPointerOperand()
+                   : P;
+        break;
+      }
+    }
+  }
+  if (!CPtr) {
+    LLVM_DEBUG(dbgs() << "TPlanLowering: emitBinaryOp: CPtr not found\n");
+    return false;
+  }
+
+  IRBuilder<> &B = State.Builder;
+  auto I64 = [&](uint64_t V) -> Value * { return B.getInt64(V); };
+  auto expandStride = [&](const SCEV *S, unsigned Dim) -> Value * {
+    if (State.Expander && State.Expander->isSafeToExpand(S))
+      return State.Expander->expandCodeFor(S, B.getInt64Ty(),
+                                            &*B.GetInsertPoint());
+    return I64(State.Plan.getDenseStrideForDim(Dim));
+  };
+  // Returns stride for output dim D in operand DR; 0 if DR doesn't span it.
+  auto getOperandStride = [&](const TPSingleDefRecipe *DR,
+                               unsigned D) -> Value * {
+    if (D >= DR->DimSet.size() || !DR->DimSet.test(D))
+      return I64(0);
+    return expandStride(DR->getMemStride(D, State.Plan, *State.SE), D);
+  };
+
+  // Collect output dims in outer-to-inner order (highest dim index first).
+  SmallVector<unsigned> OrderedDims;
+  for (int D = OutputDimSet.find_last(); D >= 0;
+       D = OutputDimSet.find_prev(static_cast<unsigned>(D))) {
+    OrderedDims.push_back(static_cast<unsigned>(D));
+  }
+
+  // Build stride/dim vectors in outer-to-inner order.
+  SmallVector<Value *> CStrides, AStrides, BStrides, OutDims;
+  for (unsigned UD : OrderedDims) {
+    if (CStoreRecipe && State.SE)
+      CStrides.push_back(expandStride(
+          CStoreRecipe->getMemStride(UD, State.Plan, *State.SE), UD));
+    else
+      CStrides.push_back(I64(State.Plan.getDenseStrideForDim(UD)));
+    AStrides.push_back(getOperandStride(ADR, UD));
+    BStrides.push_back(getOperandStride(BDR, UD));
+    OutDims.push_back(I64(State.Plan.getPFForDim(UD)));
+  }
+
+  Module *Mod = B.GetInsertBlock()->getModule();
+  FunctionCallee BinFn =
+      getTensorBinaryFn(*Mod, StringRef(OpName), RankA, RankB, RankC, ElemTy);
+
+  SmallVector<Value *> Args;
+  Args.push_back(CPtr);
+  Args.append(CStrides.begin(), CStrides.end());
+  Args.push_back(APtr);
+  Args.append(AStrides.begin(), AStrides.end());
+  Args.push_back(BPtr);
+  Args.append(BStrides.begin(), BStrides.end());
+  Args.append(OutDims.begin(), OutDims.end());
+  B.CreateCall(BinFn, Args);
+  return true;
+}
+
+//===----------------------------------------------------------------------===//
 // execute() implementations per recipe kind
 //===----------------------------------------------------------------------===//
 
@@ -576,9 +758,8 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
   }
 
   case TensorOpKind::BinaryOp: {
-    // Temporary scalar fallback — full tensor emission added in Task 5.
-    LLVM_DEBUG(dbgs() << "TPlanLowering: BinaryOp not yet implemented, "
-                         "falling back to scalar clone\n");
+    if (emitBinaryOp(this, State)) return;
+    // Scalar fallback.
     auto *Clone = Inst->clone();
     State.remapClone(Clone);
     Value *Result = State.Builder.Insert(Clone);
