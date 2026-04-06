@@ -174,56 +174,6 @@ static FunctionCallee getTensorContractFn(Module &M, unsigned RankA,
   return M.getOrInsertFunction(Name, FT);
 }
 
-/// Returns (creating if needed) @llvm.tensor.elementwise.<op>.<rank>d.<type>.
-/// Signature: void( (ptr, i64×Rank) × 3 tensors,  i64×Rank dims )
-static FunctionCallee getTensorElementwiseFn(Module &M, StringRef OpName,
-                                              unsigned Rank, Type *ElemTy) {
-  LLVMContext &Ctx = M.getContext();
-  StringRef TypeSuffix = getTypeSuffix(ElemTy);
-  assert(!TypeSuffix.empty() && "unsupported element type");
-  std::string Name = "llvm.tensor.elementwise.";
-  Name += OpName.str();
-  Name += "." + std::to_string(Rank) + "d.";
-  Name += TypeSuffix;
-  Type *PtrTy = PointerType::getUnqual(Ctx);
-  Type *I64Ty = Type::getInt64Ty(Ctx);
-  SmallVector<Type *> Params;
-  for (unsigned T = 0; T < 3; ++T) {
-    Params.push_back(PtrTy);
-    for (unsigned R = 0; R < Rank; ++R)
-      Params.push_back(I64Ty);
-  }
-  for (unsigned R = 0; R < Rank; ++R)
-    Params.push_back(I64Ty);
-  FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), Params, false);
-  return M.getOrInsertFunction(Name, FT);
-}
-
-/// Returns (creating if needed) @llvm.tensor.broadcast.<op>.<rank_out>d.<type>.
-/// Signature identical to getTensorElementwiseFn — stride=0 on broadcast dims
-/// is conveyed through the stride arguments, not the function type.
-static FunctionCallee getTensorBroadcastFn(Module &M, StringRef OpName,
-                                            unsigned RankOut, Type *ElemTy) {
-  StringRef TypeSuffix = getTypeSuffix(ElemTy);
-  assert(!TypeSuffix.empty() && "unsupported element type");
-  std::string Name = "llvm.tensor.broadcast.";
-  Name += OpName.str();
-  Name += "." + std::to_string(RankOut) + "d.";
-  Name += TypeSuffix;
-  LLVMContext &Ctx = M.getContext();
-  Type *PtrTy = PointerType::getUnqual(Ctx);
-  Type *I64Ty = Type::getInt64Ty(Ctx);
-  SmallVector<Type *> Params;
-  for (unsigned T = 0; T < 3; ++T) {
-    Params.push_back(PtrTy);
-    for (unsigned R = 0; R < RankOut; ++R)
-      Params.push_back(I64Ty);
-  }
-  for (unsigned R = 0; R < RankOut; ++R)
-    Params.push_back(I64Ty);
-  FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), Params, false);
-  return M.getOrInsertFunction(Name, FT);
-}
 
 /// Returns (creating if needed) @llvm.tensor.reduce.<op>.<rank_in>d.<type>.
 /// Signature: void(ptr Acc, i64×rank_in Acc_strides,
