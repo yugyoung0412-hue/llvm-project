@@ -246,7 +246,8 @@ static void populateSCEVStrides(TPWidenLoadRecipe &LR,
                                  const DenseMap<unsigned, Loop *> &DimToLoop,
                                  ScalarEvolution &SE) {
   auto *Load = cast<LoadInst>(LR.getInstruction());
-  auto *GEP = dyn_cast<GetElementPtrInst>(Load->getPointerOperand());
+  auto *GEP = dyn_cast<GetElementPtrInst>(
+      Load->getPointerOperand()->stripPointerCasts());
   if (!GEP || GEP->getNumIndices() != 1)
     return;
   populateSCEVStridesFromIndex(LR.MemStrides, LR.DimSet,
@@ -263,7 +264,8 @@ static void populateSCEVStrides(TPWidenStoreRecipe &SR,
   if (SR.DimSet.none())
     return;
   auto *SI = cast<StoreInst>(SR.getInstruction());
-  auto *GEP = dyn_cast<GetElementPtrInst>(SI->getPointerOperand());
+  auto *GEP = dyn_cast<GetElementPtrInst>(
+      SI->getPointerOperand()->stripPointerCasts());
   if (!GEP || GEP->getNumIndices() != 1)
     return;
   populateSCEVStridesFromIndex(SR.MemStrides, SR.DimSet,
