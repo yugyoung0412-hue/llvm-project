@@ -475,18 +475,15 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
       unsigned Rank = ADR->DimSet.count();
       if (Rank < 1 || Rank > 3) return false; // TODO: support rank > 3
 
-      // Determine op name from the BinaryOperator opcode.
-      StringRef OpName;
-      if (auto *BO = dyn_cast<BinaryOperator>(Inst)) {
-        switch (BO->getOpcode()) {
-        case Instruction::FAdd: OpName = "fadd"; break;
-        case Instruction::FSub: OpName = "fsub"; break;
-        case Instruction::FMul: OpName = "fmul"; break;
-        default: return false;
-        }
-      } else {
-        return false;
-      }
+      // Determine op name and element type from the instruction.
+      std::string OpName = getOpcodeStr(Inst);
+      if (OpName.empty()) return false;
+
+      // For CmpInst the result type is i1 — use operand type for the suffix.
+      Type *ElemTyForSuffix = Inst->getType()->getScalarType();
+      if (isa<CmpInst>(Inst) && Inst->getNumOperands() >= 1)
+        ElemTyForSuffix = Inst->getOperand(0)->getType()->getScalarType();
+      if (getTypeSuffix(ElemTyForSuffix).empty()) return false;
 
       // Get pointer operands from load recipes.
       auto *ALoad = dyn_cast<TPWidenLoadRecipe>(ADR);
@@ -540,10 +537,9 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
       if (CStrides.empty())
         CStrides = AStrides; // fallback: use A's strides
 
-      Type *ElemTy = ALoad->getInstruction()->getType()->getScalarType();
-      if (!ElemTy->isFloatTy() && !ElemTy->isDoubleTy()) return false;
+      Type *ElemTy = ElemTyForSuffix;
       Module *Mod  = State.Builder.GetInsertBlock()->getModule();
-      auto EltFn   = getTensorElementwiseFn(*Mod, OpName, Rank, ElemTy);
+      auto EltFn   = getTensorElementwiseFn(*Mod, StringRef(OpName), Rank, ElemTy);
       IRBuilder<> &B = State.Builder;
       auto I64 = [&](uint64_t V) -> Value * { return B.getInt64(V); };
       auto expandStride = [&](const SCEV *S, unsigned Dim) -> Value * {

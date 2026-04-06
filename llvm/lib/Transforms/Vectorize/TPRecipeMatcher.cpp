@@ -308,10 +308,10 @@ void llvm::TPRecipePatternMatcher_match(TPlan &Plan, RecipeClassMap &Out,
       if (isReductionUpdate(&R)) {
         C = classifyReduction(R, Plan);
       } else if (R.getTPRecipeID() == TPRecipeBase::TPWidenSC &&
-                 isa<BinaryOperator>(
-                     cast<TPWidenRecipe>(R).getInstruction()) &&
                  R.operands().size() == 2) {
-        C.Kind = classifyBinaryOp(R);
+        auto *Inst = cast<TPWidenRecipe>(R).getInstruction();
+        if (isa<BinaryOperator>(Inst) || isa<CmpInst>(Inst))
+          C.Kind = classifyBinaryOp(R);
       }
       // else: load, store, cast, PHI, canonical IV → default Scalar
       Out[&R] = C;
