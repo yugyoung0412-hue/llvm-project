@@ -380,6 +380,8 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   }
 
   // Locate C accumulator pointer (primary: recipe users; fallback: IR users).
+  // For RankC=0 (dot product), CPtr is the scalar accumulator address,
+  // not a tensor base. The store-lookup logic below handles both cases.
   Value *CPtr = nullptr;
   TPWidenStoreRecipe *CStoreRecipe = nullptr;
   if (auto *DefVal = ReductionUpdate->getDefinedValue()) {

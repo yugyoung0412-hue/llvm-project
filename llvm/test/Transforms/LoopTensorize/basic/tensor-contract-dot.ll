@@ -7,6 +7,9 @@
 ; — no stride arrays since RankC=0.
 ;
 ; CHECK: call void @llvm.tensor.contract.1d.1d.0d.f32(
+; CHECK-NOT: i64 0, i64 0
+; CHECK-SAME: i64 1
+; CHECK-SAME: i64 1
 
 target datalayout = "e-m:e-i64:64-n32:64"
 target triple = "aarch64"
