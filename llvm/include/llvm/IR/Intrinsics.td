@@ -2776,6 +2776,10 @@ def int_matrix_column_major_store
                WriteOnly<ArgIndex<1>>, NoCapture<ArgIndex<1>>,
                ImmArg<ArgIndex<3>>, ImmArg<ArgIndex<4>>, ImmArg<ArgIndex<5>>]>;
 
+//===---------- TPlan tensor intrinsics ---------------------------------===//
+
+include "llvm/IR/IntrinsicsTPlan.td"
+
 //===---------- Intrinsics to control hardware supported loops ----------===//
 
 // Specify that the value given is the number of iterations that the next loop
