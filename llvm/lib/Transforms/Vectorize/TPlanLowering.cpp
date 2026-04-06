@@ -374,8 +374,8 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   OutputDimSet.reset(static_cast<unsigned>(ContractDim));
 
   unsigned RankC = OutputDimSet.count();
-  if (RankC < 1 || RankC > 4) {
-    LLVM_DEBUG(dbgs() << "TPlanLowering: Contraction output rank out of [1,4]\n");
+  if (RankC > 4) {
+    LLVM_DEBUG(dbgs() << "TPlanLowering: Contraction output rank out of [0,4]\n");
     return nullptr;
   }
 
