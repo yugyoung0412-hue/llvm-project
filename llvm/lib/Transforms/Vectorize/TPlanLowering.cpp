@@ -917,25 +917,20 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
             &Phi->getParent()->getParent()->getEntryBlock().front());
         AccPtr = AllocaB.CreateAlloca(ElemTy, nullptr, "reduce.acc");
         // Store initial value (preheader incoming).
-        // A loop-header PHI has exactly two incoming edges: the preheader and
-        // the backedge.  Identify the preheader as the predecessor that does
-        // NOT branch back to the header — i.e., the header is not among its
-        // successors.  This is the correct invariant for loop-simplify form:
-        // the latch always has HeaderBB as a successor (the backedge), while
-        // the preheader enters from outside the loop and only reaches the
-        // header through the forward entry edge.
-        // Note: succ_size(InBB)==1 was the old heuristic but it fails when an
-        // outer-loop latch branches to both the inner-loop header AND the
-        // outer-loop exit (succ_size==2), causing false negatives.
-        BasicBlock *HeaderBB = Phi->getParent();
+        // Identify the preheader incoming by exclusion: the latch incoming
+        // value IS the reduction-update instruction (Inst) itself; the
+        // preheader incoming is the initial accumulator value.
         Value *InitVal = nullptr;
         for (unsigned Idx = 0; Idx < Phi->getNumIncomingValues(); ++Idx) {
-          BasicBlock *InBB = Phi->getIncomingBlock(Idx);
-          // Preheader: does NOT have HeaderBB as a successor (not the latch).
-          if (!llvm::is_contained(successors(InBB), HeaderBB)) {
-            InitVal = Phi->getIncomingValue(Idx);
-            break;
-          }
+          Value *InVal = Phi->getIncomingValue(Idx);
+          // The latch feeds the reduction-update instruction back into the phi;
+          // the preheader feeds the initial value (which is NOT Inst).
+          // This correctly handles nested loops where the preheader block also
+          // has the loop header as a successor (the forward entry edge).
+          if (InVal == Inst)
+            continue;
+          InitVal = InVal;
+          break;
         }
         if (!InitVal) return false;
         State.Builder.CreateStore(InitVal, AccPtr);
