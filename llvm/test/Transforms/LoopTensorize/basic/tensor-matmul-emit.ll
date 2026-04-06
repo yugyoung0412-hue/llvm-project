@@ -1,11 +1,11 @@
 ; RUN: opt -passes=loop-tensorize -S < %s | FileCheck %s
 ;
 ; 3-level GEMM (16x16x16, static trip counts) using reduction-PHI form.
-; Contraction must emit @llvm.tensor.matmul.f32 with correct M/N/K dimensions.
+; Contraction must emit @llvm.tensor.contract.2d.2d.f32.
 ;
-; CHECK: call void @llvm.tensor.matmul.f32(ptr {{.*}}, i64 256, i64 256, i64 16777216,
-; CHECK-SAME: ptr {{.*}}, i64 256, i64 256, i64 65536,
-; CHECK-SAME: ptr {{.*}}, i64 256, i64 256, i64 256)
+; CHECK: call void @llvm.tensor.contract.2d.2d.f32(
+; CHECK-SAME: i64 0
+; CHECK-SAME: i64 256, i64 256
 
 target datalayout = "e-m:e-i64:64-n32:64"
 target triple = "aarch64"
