@@ -215,45 +215,8 @@ buildDimToLoop(TPlan &Plan, LoopInfo &LI) {
   return DimToLoop;
 }
 
-/// Recursively collect per-loop step values from a SCEV expression into
-/// \p LoopStep.  Handles two IR patterns produced by TPlan canonicalization:
-///
-///  1. Nested AddRec chain  — {{base,+,s0}_L0,+,s1}_L1,+,s2}_L2
-///     Generated when a single GEP carries a multi-loop flat index.
-///     The original while-loop already handles this case, but with canonical
-///     IVs (start == 0) it exits after the first iteration because
-///     AR->getStart() returns the scalar zero.  We keep the while-loop to
-///     handle any remaining nesting below the outermost AddRec.
-///
-///  2. SCEVAdd of per-loop AddRecs — Add({0,+,s0}_L0, {0,+,s1}_L1, ...)
-///     Generated when the index is a sum of separate canonical-IV products
-///     (e.g. i*stride_i + k*stride_k).  Each operand is an independent
-///     AddRec, so we recurse into every SCEVAdd operand.
-///
-/// Entries already present in \p LoopStep are left unchanged (try_emplace),
-/// so the innermost call wins when the same loop appears at multiple levels.
-static void extractAddRecSteps(const SCEV *S, ScalarEvolution &SE,
-                                DenseMap<const Loop *, const SCEV *> &LoopStep) {
-  if (!S || isa<SCEVCouldNotCompute>(S))
-    return;
-  // Case 2: flat sum — recurse into each operand independently.
-  if (const auto *Add = dyn_cast<SCEVAddExpr>(S)) {
-    for (const SCEV *Op : Add->operands())
-      extractAddRecSteps(Op, SE, LoopStep);
-    return;
-  }
-  // Case 1: nested AddRec chain — walk until start is no longer an AddRec.
-  while (const auto *AR = dyn_cast<SCEVAddRecExpr>(S)) {
-    LoopStep.try_emplace(AR->getLoop(), AR->getStepRecurrence(SE));
-    S = AR->getStart();
-  }
-}
-
 /// Extract per-dimension element-count strides from \p GEPIdx (the flat index
-/// expression of a single-index GEP) and accumulate results into \p MemStrides.
-///
-/// Delegates SCEV decomposition to extractAddRecSteps so that both nested
-/// AddRec chains and SCEVAdd-of-AddRecs are handled correctly.
+/// expression of a single-index GEP) and store them in \p MemStrides.
 static void populateSCEVStridesFromIndex(
     DenseMap<unsigned, const SCEV *> &MemStrides,
     const SmallBitVector &DimSet,
@@ -261,65 +224,37 @@ static void populateSCEVStridesFromIndex(
     const DenseMap<unsigned, Loop *> &DimToLoop,
     ScalarEvolution &SE) {
   const SCEV *IdxSCEV = SE.getSCEV(GEPIdx);
-  if (isa<SCEVCouldNotCompute>(IdxSCEV))
-    return;
   DenseMap<const Loop *, const SCEV *> LoopStep;
-  extractAddRecSteps(IdxSCEV, SE, LoopStep);
+  const SCEV *S = IdxSCEV;
+  while (const auto *AR = dyn_cast<SCEVAddRecExpr>(S)) {
+    LoopStep[AR->getLoop()] = AR->getStepRecurrence(SE);
+    S = AR->getStart();
+  }
   for (int D = DimSet.find_first(); D >= 0; D = DimSet.find_next(D)) {
     auto DIt = DimToLoop.find(static_cast<unsigned>(D));
     if (DIt == DimToLoop.end())
       continue;
     auto SIt = LoopStep.find(DIt->second);
     if (SIt != LoopStep.end())
-      MemStrides.try_emplace(static_cast<unsigned>(D), SIt->second);
+      MemStrides[static_cast<unsigned>(D)] = SIt->second;
   }
 }
 
-/// Walk the GEP pointer chain starting from \p Ptr and call
-/// populateSCEVStridesFromIndex on every single-index GEP encountered.
-///
-/// TPlan's canonical-IV lowering produces a chain of GEPs where each link
-/// adds exactly one loop dimension's byte offset:
-///
-///   store_ptr = GEP(GEP(GEP(base, batch*nb3), i*nb2), k*nb0)
-///                          ^outermost              ^innermost
-///
-/// A single call to populateSCEVStridesFromIndex on the innermost GEP only
-/// captures the innermost stride.  Walking the full chain collects all
-/// affine dimensions; non-affine steps (e.g. srem-based batch broadcasting)
-/// are silently skipped because their SCEV is SCEVCouldNotCompute.
-static void walkGEPChainForStrides(
-    DenseMap<unsigned, const SCEV *> &MemStrides,
-    const SmallBitVector &DimSet,
-    Value *Ptr,
-    const DenseMap<unsigned, Loop *> &DimToLoop,
-    ScalarEvolution &SE) {
-  // Bound the walk to avoid pathological IR (e.g. pointer cycles).
-  unsigned MaxDepth = 32;
-  while (Ptr && MaxDepth-- > 0) {
-    auto *GEP = dyn_cast<GetElementPtrInst>(Ptr);
-    if (!GEP)
-      break;
-    if (GEP->getNumIndices() == 1)
-      populateSCEVStridesFromIndex(MemStrides, DimSet,
-                                   GEP->getOperand(1), DimToLoop, SE);
-    Ptr = GEP->getPointerOperand();
-  }
-}
-
-/// Populate MemStrides on a load recipe by walking the full GEP chain of
+/// Populate MemStrides on a load recipe by analysing the GEP index of
 /// its load instruction's pointer operand.
 static void populateSCEVStrides(TPWidenLoadRecipe &LR,
                                  const DenseMap<unsigned, Loop *> &DimToLoop,
                                  ScalarEvolution &SE) {
   auto *Load = cast<LoadInst>(LR.getInstruction());
-  walkGEPChainForStrides(LR.MemStrides, LR.DimSet,
-                          Load->getPointerOperand(), DimToLoop, SE);
+  auto *GEP = dyn_cast<GetElementPtrInst>(Load->getPointerOperand());
+  if (!GEP || GEP->getNumIndices() != 1)
+    return;
+  populateSCEVStridesFromIndex(LR.MemStrides, LR.DimSet,
+                                GEP->getOperand(1), DimToLoop, SE);
 }
 
 /// Populate DimSet + MemStrides on a store recipe. DimSet is copied from
-/// the stored-value operand's DimSet; strides come from walking the full
-/// GEP chain of the store's pointer operand.
+/// the stored-value operand's DimSet; strides come from the store's GEP index.
 static void populateSCEVStrides(TPWidenStoreRecipe &SR,
                                  const DenseMap<unsigned, Loop *> &DimToLoop,
                                  ScalarEvolution &SE) {
@@ -328,8 +263,11 @@ static void populateSCEVStrides(TPWidenStoreRecipe &SR,
   if (SR.DimSet.none())
     return;
   auto *SI = cast<StoreInst>(SR.getInstruction());
-  walkGEPChainForStrides(SR.MemStrides, SR.DimSet,
-                          SI->getPointerOperand(), DimToLoop, SE);
+  auto *GEP = dyn_cast<GetElementPtrInst>(SI->getPointerOperand());
+  if (!GEP || GEP->getNumIndices() != 1)
+    return;
+  populateSCEVStridesFromIndex(SR.MemStrides, SR.DimSet,
+                                GEP->getOperand(1), DimToLoop, SE);
 }
 
 /// Collect all TPBasicBlock instances by recursively walking block successors
