@@ -20,54 +20,50 @@ Successor(s): tensor loop4
 
 <x1> tensor loop4: {
   ir-bb<tensor.header4>:
-    EMIT tp<%5> = CANONICAL-INDUCTION ir<0>, tp<%28>[PF= 1]
-    WIDEN-INDUCTION %55 = phi 0, %65, ir<1>[PF= 1]
-    CLONE br ir<%50>, ir<%64>, ir<%tensor.ph3>[PF= 1]
+    EMIT tp<%5> = CANONICAL-INDUCTION ir<0>, tp<%22>, [PF= 1]
+    WIDEN-INDUCTION %55 = phi 0, %65, ir<1>, [PF= 1]
+    CLONE br ir<%50>, ir<%64>, ir<%tensor.ph3>, [PF= 1]
   Successor(s): tensor.latch4, tensor.ph3
 
   tensor.latch4:
-    EMIT tp<%28> = add nuw tp<%5>, ir<1>[PF= 1]
-    EMIT branch-on-count tp<%28>, ir<%17>[PF= 1]
-    EMIT tp<%30> = not ir<%50>[PF= 1]
-    EMIT tp<%31> = or tp<%27>, tp<%30>[PF= 1]
-    WIDEN ir<%65>.1 = add nuw nsw ir<%55>, ir<1>[PF= 1]
-    WIDEN ir<%66> = icmp eq ir<%65>.1, ir<%17>.1[PF= 1]
-    CLONE br ir<%66>, ir<%54>, ir<%.loopexit4>[PF= 1]
+    EMIT tp<%22> = add nuw tp<%5>, ir<1>, [PF= 1]
+    WIDEN ir<%65>.1 = add nuw nsw ir<%55>, ir<1>, [PF= 1]
+    WIDEN ir<%66> = icmp eq ir<%65>.1, ir<%17>.1, [PF= 1]
+    CLONE br ir<%66>, ir<%54>, ir<%.loopexit4>, [PF= 1]
+    EMIT branch-on-count tp<%22>, ir<%17>, [PF= 1]
   No successors
 
   tensor.ph3:
-    EMIT tp<%6> = select ir<%50>, ir<%7>, ir<1>[PF= 1]
-    WIDEN ir<%56> = srem ir<%55>, tp<%6>[PF= 1]
-    WIDEN ir<%57> = mul ir<%56>, ir<%25>[PF= 1]
-    WIDEN-GEP Inv[Var] ir<%58>.1 = getelementptr inbounds ir<%43>, ir<%57>[PF= 1]
-    WIDEN ir<%59> = mul ir<%55>, ir<%33>[PF= 1]
-    WIDEN-GEP Inv[Var] ir<%60>.1 = getelementptr inbounds ir<%45>, ir<%59>[PF= 1]
-    WIDEN ir<%61> = mul ir<%55>, ir<%41>[PF= 1]
-    WIDEN-GEP Inv[Var] ir<%62>.1 = getelementptr inbounds ir<%47>, ir<%61>[PF= 1]
+    EMIT tp<%6> = select ir<%50>, ir<%7>, ir<1>, [PF= 1]
+    WIDEN ir<%56> = srem ir<%55>, tp<%6>, [PF= 1]
+    WIDEN ir<%57> = mul ir<%56>, ir<%25>, [PF= 1]
+    WIDEN-GEP Inv[Var] ir<%58> = getelementptr inbounds ir<%43>, ir<%57>, [PF= 1]
+    WIDEN ir<%59> = mul ir<%55>, ir<%33>, [PF= 1]
+    WIDEN-GEP Inv[Var] ir<%60> = getelementptr inbounds ir<%45>, ir<%59>, [PF= 1]
+    WIDEN ir<%61> = mul ir<%55>, ir<%41>, [PF= 1]
+    WIDEN-GEP Inv[Var] ir<%62> = getelementptr inbounds ir<%47>, ir<%61>, [PF= 1]
   Successor(s): tensor loop3
 
   <x1> tensor loop3: {
     ir-bb<tensor.header3>:
-      EMIT tp<%7> = CANONICAL-INDUCTION ir<0>, tp<%23>[PF= 1]
-      WIDEN-INDUCTION %68 = phi 0, %83, ir<1>[PF= 1]
-      WIDEN ir<%69> = srem ir<%68>, ir<%5>[PF= 1]
-      WIDEN ir<%70> = mul ir<%69>, ir<%23>[PF= 1]
-      WIDEN-GEP Inv[Var] ir<%71>.1 = getelementptr inbounds ir<%58>, ir<%70>[PF= 1]
-      WIDEN ir<%72> = mul ir<%68>, ir<%31>[PF= 1]
-      WIDEN-GEP Inv[Var] ir<%73>.1 = getelementptr inbounds ir<%60>, ir<%72>[PF= 1]
-      WIDEN ir<%74> = mul ir<%68>, ir<%39>[PF= 1]
-      WIDEN-GEP Inv[Var] ir<%75>.1 = getelementptr inbounds ir<%62>, ir<%74>[PF= 1]
-      CLONE br ir<%51>, ir<%82>, ir<%tensor.ph2>[PF= 1]
+      EMIT tp<%7> = CANONICAL-INDUCTION ir<0>, tp<%20>, [PF= 1]
+      WIDEN-INDUCTION %68 = phi 0, %83, ir<1>, [PF= 1]
+      WIDEN ir<%69> = srem ir<%68>, ir<%5>, [PF= 1]
+      WIDEN ir<%70> = mul ir<%69>, ir<%23>, [PF= 1]
+      WIDEN-GEP Var[Var] ir<%71> = getelementptr inbounds ir<%58>, ir<%70>, [PF= 1]
+      WIDEN ir<%72> = mul ir<%68>, ir<%31>, [PF= 1]
+      WIDEN-GEP Var[Var] ir<%73> = getelementptr inbounds ir<%60>, ir<%72>, [PF= 1]
+      WIDEN ir<%74> = mul ir<%68>, ir<%39>, [PF= 1]
+      WIDEN-GEP Var[Var] ir<%75> = getelementptr inbounds ir<%62>, ir<%74>, [PF= 1]
+      CLONE br ir<%51>, ir<%82>, ir<%tensor.ph2>, [PF= 1]
     Successor(s): tensor.latch3, tensor.ph2
 
     tensor.latch3:
-      EMIT tp<%23> = add nuw tp<%7>, ir<1>[PF= 1]
-      EMIT branch-on-count tp<%23>, ir<%15>[PF= 1]
-      EMIT tp<%25> = not ir<%51>[PF= 1]
-      EMIT tp<%26> = or tp<%22>, tp<%25>[PF= 1]
-      WIDEN ir<%83>.1 = add nuw nsw ir<%68>, ir<1>[PF= 1]
-      WIDEN ir<%84> = icmp eq ir<%83>.1, ir<%15>.1[PF= 1]
-      CLONE br ir<%84>, ir<%67>, ir<%.loopexit3>[PF= 1]
+      EMIT tp<%20> = add nuw tp<%7>, ir<1>, [PF= 1]
+      WIDEN ir<%83>.1 = add nuw nsw ir<%68>, ir<1>, [PF= 1]
+      WIDEN ir<%84> = icmp eq ir<%83>.1, ir<%15>.1, [PF= 1]
+      CLONE br ir<%84>, ir<%67>, ir<%.loopexit3>, [PF= 1]
+      EMIT branch-on-count tp<%20>, ir<%15>, [PF= 1]
     No successors
 
     tensor.ph2:
@@ -75,78 +71,76 @@ Successor(s): tensor loop4
 
     <x1> tensor loop2: {
       ir-bb<tensor.header2>:
-        EMIT tp<%8> = CANONICAL-INDUCTION ir<0>, tp<%18>[PF= 1]
-        WIDEN-INDUCTION %77 = phi %90, 0, ir<1>[PF= 1]
-        CLONE br ir<%52>, ir<%89>, ir<%tensor.ph1>[PF= 1]
+        EMIT tp<%8> = CANONICAL-INDUCTION ir<0>, tp<%18>, [PF= 1]
+        WIDEN-INDUCTION %77 = phi %90, 0, ir<1>, [PF= 1]
+        CLONE br ir<%52>, ir<%89>, ir<%tensor.ph1>, [PF= 1]
       Successor(s): tensor.latch2, tensor.ph1
 
       tensor.latch2:
-        EMIT tp<%18> = add nuw tp<%8>, ir<1>[PF= 1]
-        EMIT branch-on-count tp<%18>, ir<%13>[PF= 1]
-        EMIT tp<%20> = not ir<%52>[PF= 1]
-        EMIT tp<%21> = or tp<%17>, tp<%20>[PF= 1]
-        WIDEN ir<%90>.1 = add nuw nsw ir<%77>, ir<1>[PF= 1]
-        WIDEN ir<%91> = icmp eq ir<%90>.1, ir<%13>.1[PF= 1]
-        CLONE br ir<%91>, ir<%76>, ir<%.loopexit2>[PF= 1]
+        EMIT tp<%18> = add nuw tp<%8>, ir<1>, [PF= 1]
+        WIDEN ir<%90>.1 = add nuw nsw ir<%77>, ir<1>, [PF= 1]
+        WIDEN ir<%91> = icmp eq ir<%90>.1, ir<%13>.1, [PF= 1]
+        CLONE br ir<%91>, ir<%76>, ir<%.loopexit2>, [PF= 1]
+        EMIT branch-on-count tp<%18>, ir<%13>, [PF= 1]
       No successors
 
       tensor.ph1:
-        WIDEN ir<%78> = mul ir<%77>, ir<%29>[PF= 1]
-        WIDEN ir<%79> = mul ir<%77>, ir<%37>[PF= 1]
-        WIDEN-GEP Inv[Var] ir<%80>.1 = getelementptr inbounds ir<%73>, ir<%78>[PF= 1]
-        WIDEN-GEP Inv[Var] ir<%81>.1 = getelementptr inbounds ir<%75>, ir<%79>[PF= 1]
+        WIDEN ir<%78> = mul ir<%77>, ir<%29>, [PF= 1]
+        WIDEN ir<%79> = mul ir<%77>, ir<%37>, [PF= 1]
+        WIDEN-GEP Var[Var] ir<%80> = getelementptr inbounds ir<%73>, ir<%78>, [PF= 1]
+        WIDEN-GEP Var[Var] ir<%81> = getelementptr inbounds ir<%75>, ir<%79>, [PF= 1]
       Successor(s): tensor loop1
 
       <x1> tensor loop1: {
         ir-bb<tensor.header1>:
-          EMIT tp<%9> = CANONICAL-INDUCTION ir<0>, tp<%13>[PF= 1]
-          WIDEN-INDUCTION %86 = phi 0, %97, ir<1>[PF= 1]
-          CLONE br ir<%53>, ir<%92>, ir<%tensor.ph0>[PF= 1]
+          EMIT tp<%9> = CANONICAL-INDUCTION ir<0>, tp<%13>, [PF= 1]
+          WIDEN-INDUCTION %86 = phi 0, %97, ir<1>, [PF= 1]
+          CLONE br ir<%53>, ir<%92>, ir<%tensor.ph0>, [PF= 1]
         Successor(s): tensor.latch1, tensor.ph0
 
         tensor.latch1:
-          EMIT tp<%13> = add nuw tp<%9>, ir<1>[PF= 1]
-          EMIT branch-on-count tp<%13>, ir<%11>[PF= 1]
-          EMIT tp<%15> = not ir<%53>[PF= 1]
-          EMIT tp<%16> = or ir<%113>, tp<%15>[PF= 1]
-          BLEND ir<%93> = ir<0.000000e+00> ir<%.lcssa>/ir<%113>[PF= 1]
-          WIDEN ir<%94> = mul ir<%86>, ir<%35>[PF= 1]
-          WIDEN-GEP Inv[Var] ir<%95> = getelementptr inbounds ir<%81>, ir<%94>[PF= 1]
-          WIDEN-CAST ir<%96> = bitcast  ir<%95> to ptr[PF= 0]
-          WIDEN store ir<%96>, ir<%93>[PF= 0]
-          WIDEN ir<%97>.1 = add nuw nsw ir<%86>, ir<1>[PF= 1]
-          WIDEN ir<%98> = icmp eq ir<%97>.1, ir<%11>.1[PF= 1]
-          CLONE br ir<%98>, ir<%85>, ir<%.loopexit1>[PF= 1]
+          EMIT tp<%13> = add nuw tp<%9>, ir<1>, [PF= 1]
+          EMIT tp<%14> = not ir<%53>, [PF= 1]
+          EMIT tp<%15> = or ir<%113>, tp<%14>, [PF= 1]
+          BLEND ir<%93> = ir<0.000000e+00> ir<%.lcssa>/ir<%113>, [PF= 1]
+          WIDEN ir<%94> = mul ir<%86>, ir<%35>, [PF= 1]
+          WIDEN-GEP Var[Var] ir<%95> = getelementptr inbounds ir<%81>, ir<%94>, [PF= 1]
+          WIDEN-CAST ir<%96> = bitcast  ir<%95> to ptr, [PF= 1]
+          WIDEN store ir<%96>, ir<%93>, [PF= 1]
+          WIDEN ir<%97>.1 = add nuw nsw ir<%86>, ir<1>, [PF= 1]
+          WIDEN ir<%98> = icmp eq ir<%97>.1, ir<%11>.1, [PF= 1]
+          CLONE br ir<%98>, ir<%85>, ir<%.loopexit1>, [PF= 1]
+          EMIT branch-on-count tp<%13>, ir<%11>, [PF= 1]
         No successors
 
         tensor.ph0:
-          WIDEN ir<%87> = mul ir<%86>, ir<%21>[PF= 1]
-          WIDEN-GEP Inv[Var] ir<%88>.1 = getelementptr inbounds ir<%71>, ir<%87>[PF= 1]
+          WIDEN ir<%87> = mul ir<%86>, ir<%21>, [PF= 1]
+          WIDEN-GEP Var[Var] ir<%88> = getelementptr inbounds ir<%71>, ir<%87>, [PF= 1]
         Successor(s): tensor loop0
 
         <x1> tensor loop0: {
           ir-bb<tensor.header0>:
-            EMIT tp<%10> = CANONICAL-INDUCTION ir<0>, tp<%11>[PF= 1]
-            WIDEN-INDUCTION %100 = phi 0, %112, ir<1>[PF= 1]
-            FIRST-ORDER-RECURRENCE-PHI ir<%101> = phi ir<0.000000e+00>[PF= 1]
-            WIDEN ir<%102> = mul ir<%100>, ir<%19>[PF= 1]
-            WIDEN-GEP Inv[Var] ir<%103> = getelementptr inbounds ir<%88>, ir<%102>[PF= 1]
-            WIDEN-CAST ir<%104> = bitcast  ir<%103> to ptr[PF= 0]
-            WIDEN ir<%105> = load ir<%104>[PF= 0]
-            WIDEN ir<%106> = mul ir<%100>, ir<%27>[PF= 1]
-            WIDEN-GEP Inv[Var] ir<%107> = getelementptr inbounds ir<%80>, ir<%106>[PF= 1]
-            WIDEN-CAST ir<%108> = bitcast  ir<%107> to ptr[PF= 0]
-            WIDEN ir<%109> = load ir<%108>[PF= 0]
-            WIDEN ir<%110> = fmul ir<%105>, ir<%109>[PF= 1]
-            WIDEN ir<%111>.1 = fadd ir<%101>, ir<%110>[PF= 1]
-            WIDEN ir<%112>.1 = add nuw nsw ir<%100>, ir<1>[PF= 1]
-            WIDEN ir<%113> = icmp eq ir<%112>.1, ir<%9>.1[PF= 1]
-            CLONE br ir<%113>, ir<%99>, ir<%.loopexit>[PF= 1]
+            EMIT tp<%10> = CANONICAL-INDUCTION ir<0>, tp<%11>, [PF= 1]
+            WIDEN-INDUCTION %100 = phi 0, %112, ir<1>, [PF= 1]
+            WIDEN-REDUCTION-PHI ir<%101> = phi ir<0.000000e+00>, [PF= 1]
           Successor(s): tensor.latch0
 
           tensor.latch0:
-            EMIT tp<%11> = add nuw tp<%10>, ir<1>[PF= 1]
-            EMIT branch-on-count tp<%11>, ir<%9>[PF= 1]
+            EMIT tp<%11> = add nuw tp<%10>, ir<1>, [PF= 1]
+            WIDEN ir<%102> = mul ir<%100>, ir<%19>, [PF= 1]
+            WIDEN-GEP Var[Var] ir<%103> = getelementptr inbounds ir<%88>, ir<%102>, [PF= 1]
+            WIDEN-CAST ir<%104> = bitcast  ir<%103> to ptr, [PF= 1]
+            WIDEN ir<%105> = load ir<%104>, [PF= 1]
+            WIDEN ir<%106> = mul ir<%100>, ir<%27>, [PF= 1]
+            WIDEN-GEP Var[Var] ir<%107> = getelementptr inbounds ir<%80>, ir<%106>, [PF= 1]
+            WIDEN-CAST ir<%108> = bitcast  ir<%107> to ptr, [PF= 1]
+            WIDEN ir<%109> = load ir<%108>, [PF= 1]
+            WIDEN ir<%110> = fmul ir<%105>, ir<%109>, [PF= 1]
+            WIDEN ir<%111>.1 = fadd ir<%101>, ir<%110>, [PF= 1]
+            WIDEN ir<%112>.1 = add nuw nsw ir<%100>, ir<1>, [PF= 1]
+            WIDEN ir<%113> = icmp eq ir<%112>.1, ir<%9>.1, [PF= 1]
+            CLONE br ir<%113>, ir<%99>, ir<%.loopexit>, [PF= 1]
+            EMIT branch-on-count tp<%11>, ir<%9>, [PF= 1]
           No successors
         }
         Successor(s): middle.block0
@@ -155,7 +149,7 @@ Successor(s): tensor loop4
         Successor(s): ir-bb<.loopexit>, scalar.ph0
 
         ir-bb<.loopexit>:
-          BLEND ir<%.lcssa>.1 = ir<%111>[PF= 1]
+          BLEND ir<%.lcssa>.1 = ir<%111>, [PF= 1]
         Successor(s): scalar.ph0
 
         scalar.ph0:
@@ -167,7 +161,7 @@ Successor(s): tensor loop4
       Successor(s): ir-bb<.loopexit1>, scalar.ph1
 
       ir-bb<.loopexit1>:
-        EMIT tp<%17> = logical-and tp<%16>, ir<%98>[PF= 1]
+        EMIT tp<%17> = logical-and tp<%15>, ir<%98>, [PF= 1]
       Successor(s): scalar.ph1
 
       scalar.ph1:
@@ -179,7 +173,6 @@ Successor(s): tensor loop4
     Successor(s): ir-bb<.loopexit2>, scalar.ph2
 
     ir-bb<.loopexit2>:
-      EMIT tp<%22> = logical-and tp<%21>, ir<%91>[PF= 1]
     Successor(s): scalar.ph2
 
     scalar.ph2:
@@ -191,7 +184,6 @@ Successor(s): tensor loop4
   Successor(s): ir-bb<.loopexit3>, scalar.ph3
 
   ir-bb<.loopexit3>:
-    EMIT tp<%27> = logical-and tp<%26>, ir<%84>[PF= 1]
   Successor(s): scalar.ph3
 
   scalar.ph3:
