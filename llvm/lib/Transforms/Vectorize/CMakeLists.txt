@@ -10,6 +10,7 @@ add_llvm_component_library(LLVMVectorize
   TensorCodeGen.cpp
   TensorCostModel.cpp
   TPlan.cpp
+  TPlanAnalysis.cpp
   TPlanWidener.cpp
   TPRecipeMatcher.cpp
   TPlanLowering.cpp
