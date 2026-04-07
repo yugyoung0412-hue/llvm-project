@@ -16,6 +16,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Vectorize/TPlan.h"
+#include "llvm/Transforms/Vectorize/TPlanAnalysis.h"
 #include "llvm/Transforms/Vectorize/TPRecipeMatcher.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -294,6 +295,33 @@ static void printClassificationSummary(const TPlan &Plan,
     OS << "  (none)\n";
 }
 
+/// Build a map from TPlan dimension index -> Loop* by scanning IV recipes.
+/// Mirrors the same function in TPRecipeMatcher.cpp for use during lowering.
+static DenseMap<unsigned, Loop *>
+buildDimToLoopForLowering(TPlan &Plan, LoopInfo &LI) {
+  DenseMap<unsigned, Loop *> DimToLoop;
+  SmallVector<TPBlockBase *> Worklist;
+  SmallPtrSet<TPBlockBase *, 32> Visited;
+  if (Plan.getEntry())
+    Worklist.push_back(const_cast<TPBlockBase *>(Plan.getEntry()));
+  while (!Worklist.empty()) {
+    auto *Blk = Worklist.pop_back_val();
+    if (!Visited.insert(Blk).second)
+      continue;
+    if (auto *BB = dyn_cast<TPBasicBlock>(Blk))
+      for (TPRecipeBase &R : *BB)
+        if (auto *IV = dyn_cast<TPWidenInductionRecipe>(&R))
+          if (Loop *L = LI.getLoopFor(IV->getIVPhi()->getParent()))
+            DimToLoop[IV->getDimIndex()] = L;
+    if (auto *Reg = dyn_cast<TPRegionBlock>(Blk))
+      if (Reg->getEntry())
+        Worklist.push_back(Reg->getEntry());
+    for (TPBlockBase *S : Blk->getSuccessors())
+      Worklist.push_back(S);
+  }
+  return DimToLoop;
+}
+
 //===----------------------------------------------------------------------===//
 // Helper: emit @llvm.tensor.contract for a Contraction reduction
 //===----------------------------------------------------------------------===//
@@ -321,15 +349,48 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   if (!LHSLoad || !RHSLoad)
     return nullptr;
 
-  auto *LHSPtrDR = dyn_cast<TPSingleDefRecipe>(LHSLoad->getOperand(0));
-  auto *RHSPtrDR = dyn_cast<TPSingleDefRecipe>(RHSLoad->getOperand(0));
-  if (!LHSPtrDR || !RHSPtrDR)
-    return nullptr;
+  // Find the outermost loop covering the GEMM dims (highest-numbered in DimSet).
+  Loop *OutermostGEMMLoop = nullptr;
+  for (int D = static_cast<int>(LHSDR->DimSet.size()) - 1; D >= 0; --D) {
+    if (!LHSDR->DimSet.test(static_cast<unsigned>(D)))
+      continue;
+    auto It = State.DimToLoop.find(static_cast<unsigned>(D));
+    if (It != State.DimToLoop.end()) {
+      OutermostGEMMLoop = It->second;
+      break;
+    }
+  }
 
-  Value *LHSPtr = State.getValue(LHSPtrDR);
-  Value *RHSPtr = State.getValue(RHSPtrDR);
+  // Decompose A and B pointer chains into base + per-dim affine strides.
+  PtrDecomposition ADecomp = decomposePtrForDims(
+      cast<LoadInst>(LHSLoad->getInstruction())->getPointerOperand(),
+      LHSDR->DimSet, State.DimToLoop, OutermostGEMMLoop, *State.SE);
+  PtrDecomposition BDecomp = decomposePtrForDims(
+      cast<LoadInst>(RHSLoad->getInstruction())->getPointerOperand(),
+      RHSDR->DimSet, State.DimToLoop, OutermostGEMMLoop, *State.SE);
+
+  Value *LHSPtr = ADecomp.Base;
+  Value *RHSPtr = BDecomp.Base;
   if (!LHSPtr || !RHSPtr)
     return nullptr;
+
+  // Ensure base pointers are in the default address space (intrinsics expect ptr).
+  IRBuilder<> &PreB = State.Builder;
+  auto ensureAS0 = [&](Value *P) -> Value * {
+    if (P->getType()->getPointerAddressSpace() != 0)
+      return PreB.CreateAddrSpaceCast(P, PointerType::get(P->getType()->getContext(), 0));
+    return P;
+  };
+  LHSPtr = ensureAS0(LHSPtr);
+  RHSPtr = ensureAS0(RHSPtr);
+
+  // Recompute ranks from affine dims only (non-affine dims excluded from intrinsic).
+  RankA = ADecomp.AffineDims.count();
+  RankB = BDecomp.AffineDims.count();
+  if (RankA < 1 || RankA > 4 || RankB < 1 || RankB > 4) {
+    LLVM_DEBUG(dbgs() << "TPlanLowering: Contraction effective rank out of [1,4]\n");
+    return nullptr;
+  }
 
   Type *ElemTy = LHSLoad->getInstruction()->getType()->getScalarType();
   StringRef TypeSuffix = getTypeSuffix(ElemTy);
@@ -345,6 +406,8 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   }
 
   // Build OutputDimSet = (A.DimSet | B.DimSet) - {ContractDim}.
+  // Non-affine dims (e.g. srem batch broadcasting) are excluded — the outer
+  // scalar loops already handle them; their effect is baked into Base.
   unsigned NBits = std::max({static_cast<unsigned>(LHSDR->DimSet.size()),
                               static_cast<unsigned>(RHSDR->DimSet.size()),
                               static_cast<unsigned>(ContractDim + 1)});
@@ -354,6 +417,10 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   SmallBitVector OutputDimSet = LHSBits;
   OutputDimSet |= RHSBits;
   OutputDimSet.reset(static_cast<unsigned>(ContractDim));
+  // Exclude non-affine dims (handled by outer scalar loops).
+  SmallBitVector NonAffine = ADecomp.NonAffineDims;
+  NonAffine.resize(NBits);
+  OutputDimSet &= ~NonAffine;
 
   unsigned RankC = OutputDimSet.count();
   if (RankC > 4) {
@@ -405,12 +472,15 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
                                             &*B.GetInsertPoint());
     return I64(State.Plan.getDenseStrideForDim(Dim));
   };
-  // Returns stride for output dim Dim in operand DR; 0 if DR doesn't span it.
-  auto getOperandStride = [&](const TPSingleDefRecipe *DR,
-                               unsigned Dim) -> Value * {
-    if (Dim >= DR->DimSet.size() || !DR->DimSet.test(Dim))
-      return I64(0);
-    return expandStride(DR->getMemStride(Dim, State.Plan, *State.SE), Dim);
+  auto getAStride = [&](unsigned Dim) -> Value * {
+    auto It = ADecomp.Strides.find(Dim);
+    if (It == ADecomp.Strides.end()) return I64(0);
+    return expandStride(It->second, Dim);
+  };
+  auto getBStride = [&](unsigned Dim) -> Value * {
+    auto It = BDecomp.Strides.find(Dim);
+    if (It == BDecomp.Strides.end()) return I64(0);
+    return expandStride(It->second, Dim);
   };
 
   // Build stride/dim vectors in output-dim order (OutputDimSet iteration order).
@@ -423,17 +493,15 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
           CStoreRecipe->getMemStride(UD, State.Plan, *State.SE), UD));
     else
       CStrides.push_back(I64(State.Plan.getDenseStrideForDim(UD)));
-    AStrides.push_back(getOperandStride(LHSDR, UD));
-    BStrides.push_back(getOperandStride(RHSDR, UD));
+    AStrides.push_back(getAStride(UD));
+    BStrides.push_back(getBStride(UD));
     OutDims.push_back(I64(State.Plan.getPFForDim(UD)));
   }
 
   // Contraction dim strides and K size.
   unsigned ContUD = static_cast<unsigned>(ContractDim);
-  Value *AContractStride =
-      expandStride(LHSDR->getMemStride(ContUD, State.Plan, *State.SE), ContUD);
-  Value *BContractStride =
-      expandStride(RHSDR->getMemStride(ContUD, State.Plan, *State.SE), ContUD);
+  Value *AContractStride = getAStride(ContUD);
+  Value *BContractStride = getBStride(ContUD);
   Value *K = I64(State.Plan.getPFForDim(ContUD));
 
   Module *Mod = B.GetInsertBlock()->getModule();
@@ -980,6 +1048,8 @@ bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
   SCEVExpander Expander(SE, "tplan.stride");
   State.SE = &SE;
   State.Expander = &Expander;
+  // Build DimToLoop for use in decomposePtrForDims().
+  State.DimToLoop = buildDimToLoopForLowering(Plan, LI);
 
   if (Plan.getEntry()) {
     // Collect and execute all blocks in top-level construction order.

@@ -1408,6 +1408,9 @@ struct TPTransformState {
   ScalarEvolution *SE = nullptr;
   /// Set by TPlanLowering_lower() before execute() loop. Owned by the caller.
   SCEVExpander *Expander = nullptr;
+  /// Populated by TPlanLowering_lower(); maps TPlan dim index -> Loop*.
+  /// Used by decomposePtrForDims() in emitContraction().
+  DenseMap<unsigned, Loop *> DimToLoop;
 
   TPTransformState(IRBuilder<> &B, const TPlan &P) : Builder(B), Plan(P) {}
 
