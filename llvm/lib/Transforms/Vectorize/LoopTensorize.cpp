@@ -127,7 +127,10 @@ PreservedAnalyses LoopTensorizePass::run(Function &F,
     LLVM_DEBUG(dbgs() << "Best cost: " << Best.Cost
                       << " transforms: " << Best.Applied.size() << "\n");
 
-    Changed |= applyPlan(Best, Hint, EffectiveOps, F, LI, SE, DT);
+    bool PlanChanged = applyPlan(Best, Hint, EffectiveOps, F, LI, SE, DT);
+    Changed |= PlanChanged;
+    errs() << "\n=== Stage 4: Final Lowered LLVM IR ===\n";
+    F.print(errs());
   }
 
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
