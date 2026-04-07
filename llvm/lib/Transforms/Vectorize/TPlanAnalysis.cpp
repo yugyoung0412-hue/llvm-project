@@ -11,7 +11,6 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/IR/Operator.h"
 
 using namespace llvm;
 
