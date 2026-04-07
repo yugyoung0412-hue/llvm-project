@@ -428,10 +428,12 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     return nullptr;
   }
 
-  // Locate C accumulator pointer (primary: recipe users; fallback: IR users).
-  // For RankC=0 (dot product), CPtr is the scalar accumulator address,
-  // not a tensor base. The store-lookup logic below handles both cases.
-  Value *CPtr = nullptr;
+  // Locate the C accumulator store instruction.
+  // Primary: trace through TPlan recipe users of the reduction update.
+  // Fallback: walk IR users, following one level of PHI nodes (handles the
+  //   fadd→phi→store pattern that arises when the outer loop writes back via
+  //   a phi-selected accumulator).
+  StoreInst *CStore = nullptr;
   TPWidenStoreRecipe *CStoreRecipe = nullptr;
   if (auto *DefVal = ReductionUpdate->getDefinedValue()) {
     for (TPUser *U : DefVal->users()) {
@@ -440,29 +442,41 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
         continue;
       if (auto *SR = dyn_cast<TPWidenStoreRecipe>(RB)) {
         CStoreRecipe = SR;
-        if (auto *PD = dyn_cast<TPSingleDefRecipe>(SR->getOperand(0)))
-          CPtr = State.getValue(PD);
+        CStore = cast<StoreInst>(SR->getInstruction());
         break;
       }
     }
   }
-  if (!CPtr) {
+  if (!CStore) {
     if (auto *WR = dyn_cast<TPWidenRecipe>(ReductionUpdate)) {
-      for (User *U : WR->getInstruction()->users()) {
-        if (auto *SI = dyn_cast<StoreInst>(U)) {
-          Value *P = SI->getPointerOperand();
-          CPtr = isa<GetElementPtrInst>(P)
-                     ? cast<GetElementPtrInst>(P)->getPointerOperand()
-                     : P;
-          break;
+      Instruction *UpdInst = WR->getInstruction();
+      // Level 0: direct StoreInst users.
+      for (User *U : UpdInst->users()) {
+        if (auto *SI = dyn_cast<StoreInst>(U)) { CStore = SI; break; }
+      }
+      // Level 1: through a single PHI node (fadd → phi → store).
+      if (!CStore) {
+        for (User *U : UpdInst->users()) {
+          if (auto *Phi = dyn_cast<PHINode>(U)) {
+            for (User *PU : Phi->users()) {
+              if (auto *SI = dyn_cast<StoreInst>(PU)) { CStore = SI; break; }
+            }
+            if (CStore) break;
+          }
         }
       }
     }
   }
-  if (!CPtr) {
+  if (!CStore) {
     LLVM_DEBUG(dbgs() << "TPlanLowering: Contraction cannot find C pointer\n");
     return nullptr;
   }
+
+  // Decompose the C store pointer into base + per-dim affine strides.
+  PtrDecomposition CDecomp = decomposePtrForDims(
+      CStore->getPointerOperand(),
+      OutputDimSet, State.DimToLoop, OutermostGEMMLoop, *State.SE);
+  Value *CPtr = CDecomp.Base ? CDecomp.Base : CStore->getPointerOperand();
 
   IRBuilder<> &B = State.Builder;
   auto I64 = [&](uint64_t V) -> Value * { return B.getInt64(V); };
@@ -483,16 +497,22 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     return expandStride(It->second, Dim);
   };
 
+  auto getCStride = [&](unsigned Dim) -> Value * {
+    // Prefer decomposed strides; fall back to CStoreRecipe SCEV; then dense.
+    auto It = CDecomp.Strides.find(Dim);
+    if (It != CDecomp.Strides.end())
+      return expandStride(It->second, Dim);
+    if (CStoreRecipe && State.SE)
+      return expandStride(CStoreRecipe->getMemStride(Dim, State.Plan, *State.SE), Dim);
+    return I64(State.Plan.getDenseStrideForDim(Dim));
+  };
+
   // Build stride/dim vectors in output-dim order (OutputDimSet iteration order).
   SmallVector<Value *> CStrides, AStrides, BStrides, OutDims;
   for (int D = OutputDimSet.find_first(); D >= 0;
        D = OutputDimSet.find_next(D)) {
     unsigned UD = static_cast<unsigned>(D);
-    if (CStoreRecipe && State.SE)
-      CStrides.push_back(expandStride(
-          CStoreRecipe->getMemStride(UD, State.Plan, *State.SE), UD));
-    else
-      CStrides.push_back(I64(State.Plan.getDenseStrideForDim(UD)));
+    CStrides.push_back(getCStride(UD));
     AStrides.push_back(getAStride(UD));
     BStrides.push_back(getBStride(UD));
     OutDims.push_back(I64(State.Plan.getPFForDim(UD)));
