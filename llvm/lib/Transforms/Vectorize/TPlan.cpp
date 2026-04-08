@@ -737,11 +737,12 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
 
     // Get trip count from InductionDesc
     const SCEV *TC = Info.IVs[Idx].TripCount;
-    (void)TC; // Trip count stored for future use
 
     // Compute per-level naming suffix.
     unsigned Level  = P.Depth - 1 - Idx;
     unsigned DimIdx = Level; // innermost=0, outermost=Depth-1 (equals Level)
+    if (TC)
+      P.setDimTC(DimIdx, TC); // Stores backedge-taken count; real TC = TC+1.
     std::string LevelStr = std::to_string(Level);
 
     // Get the loop exit bound: latch branch condition ICmpInst RHS.

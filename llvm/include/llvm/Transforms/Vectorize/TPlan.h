@@ -1325,6 +1325,21 @@ public:
   }
   /// \p Dim uses the DimIdx convention (innermost=0, outermost=Depth-1).
   void setDimPF(unsigned Dim, unsigned PF) { DimPFMap[Dim] = PF; }
+  /// Returns true if a parallel factor has been explicitly set for \p Dim.
+  /// Used by TPlanWidener to avoid overwriting caller-supplied overrides.
+  bool hasDimPF(unsigned Dim) const { return DimPFMap.count(Dim) > 0; }
+
+  /// Stores the backedge-taken count SCEV for dimension \p Dim.
+  /// The real trip count is getTCForDim(Dim) + 1.
+  /// \p Dim uses the DimIdx convention (innermost=0, outermost=Depth-1).
+  void setDimTC(unsigned Dim, const SCEV *BTC) { DimBackedgeTakenMap[Dim] = BTC; }
+
+  /// Returns the backedge-taken count SCEV for dimension \p Dim,
+  /// or nullptr if not available. Real TC = returned value + 1.
+  const SCEV *getTCForDim(unsigned Dim) const {
+    auto It = DimBackedgeTakenMap.find(Dim);
+    return It != DimBackedgeTakenMap.end() ? It->second : nullptr;
+  }
   /// Returns the dense (packed) stride for dimension \p Dim.
   /// Dense stride(D) = product of getPFForDim(d) for all d < D.
   /// Dim 0 (innermost) always returns 1.
@@ -1378,6 +1393,7 @@ private:
   unsigned Depth = 0;
   SmallBitVector ReductionDims;              ///< Dims not in any store IndexExpr.
   DenseMap<unsigned, unsigned> DimPFMap;     ///< dim index (DimIdx, innermost=0) → parallel factor.
+  DenseMap<unsigned, const SCEV *> DimBackedgeTakenMap; ///< dim → backedge-taken count (real TC = value+1). nullptr if unknown.
   SmallVector<std::unique_ptr<TPIRValue>> LiveIns;
   TPBlockBase *Entry = nullptr;                 ///< Outermost preheader block.
   TPBasicBlock *Preheader = nullptr;               ///< Reserved for SCEV expansions.

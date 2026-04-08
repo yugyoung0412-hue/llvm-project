@@ -66,7 +66,8 @@ void llvm::TPlanWidener_widen(TPlan &Plan) {
         WI->DimSet.set(Dim);
         // Default PF=256 per dimension; may be overridden by the caller after
         // this function returns (e.g. from a target-specific cost model).
-        Plan.setDimPF(Dim, 256u);
+        if (!Plan.hasDimPF(Dim))  // Don't overwrite caller-supplied PF override.
+          Plan.setDimPF(Dim, 256u);
         Worklist.push_back(WI);
       }
     }
