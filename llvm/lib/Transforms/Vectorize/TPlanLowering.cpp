@@ -640,6 +640,29 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   // ----------------------------------------------------------------
   // Tiling path: nested loops around a PF-sized tensor.contract.
   //
+  // Pre-cache all stride Values needed in STEP C and STEP D while B's
+  // insert point is still in the preheader. This prevents stride SCEV
+  // expansion from landing inside a tiling loop body.
+  struct DimStrideCache {
+    Value *AStr;
+    Value *BStr;
+    Value *CStr;
+  };
+  // Cache strides for tiled dims (used in STEP C pointer offsets).
+  SmallVector<DimStrideCache, 4> TiledStrides;
+  for (auto &TD : TiledDims)
+    TiledStrides.push_back({getAStride(TD.Dim), getBStride(TD.Dim),
+                             getCStride(TD.Dim)});
+  // Cache strides for output dims and contract dim (used in STEP D args).
+  SmallVector<DimStrideCache, 4> OutputStrides; // parallel to OutputDimSet iteration
+  for (int D = OutputDimSet.find_first(); D >= 0;
+       D = OutputDimSet.find_next(D)) {
+    unsigned UD = static_cast<unsigned>(D);
+    OutputStrides.push_back({getAStride(UD), getBStride(UD), getCStride(UD)});
+  }
+  Value *CachedAContractStride = getAStride(ContUD);
+  Value *CachedBContractStride = getBStride(ContUD);
+
   // STEP A: Expand ALL TripCount SCEVs to Value* BEFORE creating any
   // loop BBs. This keeps expansion code in the current preheader BB,
   // not inside a loop body (which would cause dominance violations).
@@ -670,38 +693,35 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     Value   *IV      = LoopInfos[I].IV;
     ActualSizes[Dim] = LoopInfos[I].ActualSize;
 
-    auto offsetPtr = [&](Value *Base, Value *Stride) -> Value * {
+    auto OffsetPtr = [&](Value *Base, Value *Stride) -> Value * {
       Value *Off = B.CreateMul(IV, Stride, "tile.off");
       return B.CreateGEP(ElemTy, Base, Off, "tile.ptr");
     };
-    auto nonZero = [](Value *V) -> bool {
+    auto NonZero = [](Value *V) -> bool {
       auto *CI = dyn_cast<ConstantInt>(V);
       return !CI || !CI->isZero();
     };
-    Value *AStr = getAStride(Dim);
-    Value *BStr = getBStride(Dim);
-    Value *CStr = getCStride(Dim);
-    if (nonZero(AStr)) TiledAPtr = offsetPtr(TiledAPtr, AStr);
-    if (nonZero(BStr)) TiledBPtr = offsetPtr(TiledBPtr, BStr);
-    if (nonZero(CStr)) TiledCPtr = offsetPtr(TiledCPtr, CStr);
+    Value *AStr = TiledStrides[I].AStr;
+    Value *BStr = TiledStrides[I].BStr;
+    Value *CStr = TiledStrides[I].CStr;
+    if (NonZero(AStr)) TiledAPtr = OffsetPtr(TiledAPtr, AStr);
+    if (NonZero(BStr)) TiledBPtr = OffsetPtr(TiledBPtr, BStr);
+    if (NonZero(CStr)) TiledCPtr = OffsetPtr(TiledCPtr, CStr);
   }
 
   // STEP D: Build tile-sized tensor.contract arguments and call.
   SmallVector<Value *> Args;
   Args.push_back(TiledCPtr);
-  for (int D = OutputDimSet.find_first(); D >= 0;
-       D = OutputDimSet.find_next(D))
-    Args.push_back(getCStride(static_cast<unsigned>(D)));
+  for (unsigned SI = 0; SI < OutputStrides.size(); ++SI)
+    Args.push_back(OutputStrides[SI].CStr);
   Args.push_back(TiledAPtr);
-  for (int D = OutputDimSet.find_first(); D >= 0;
-       D = OutputDimSet.find_next(D))
-    Args.push_back(getAStride(static_cast<unsigned>(D)));
-  Args.push_back(getAStride(ContUD));
+  for (unsigned SI = 0; SI < OutputStrides.size(); ++SI)
+    Args.push_back(OutputStrides[SI].AStr);
+  Args.push_back(CachedAContractStride);
   Args.push_back(TiledBPtr);
-  for (int D = OutputDimSet.find_first(); D >= 0;
-       D = OutputDimSet.find_next(D))
-    Args.push_back(getBStride(static_cast<unsigned>(D)));
-  Args.push_back(getBStride(ContUD));
+  for (unsigned SI = 0; SI < OutputStrides.size(); ++SI)
+    Args.push_back(OutputStrides[SI].BStr);
+  Args.push_back(CachedBContractStride);
   Args.push_back(ActualSizes.count(ContUD) ? ActualSizes[ContUD]
                                             : I64(State.Plan.getPFForDim(ContUD)));
   for (int D = OutputDimSet.find_first(); D >= 0;
