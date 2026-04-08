@@ -666,44 +666,29 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   Value *CachedAContractStride = getAStride(ContUD);
   Value *CachedBContractStride = getBStride(ContUD);
 
-  // Tiling loops must be emitted from a proper preheader block — a block
-  // that enters the tiling structure once and is not a loop body itself.
-  // The builder's current insert block is inside the innermost loop body
-  // (k.loop), which has a back-edge and PHI nodes; using it directly as a
-  // tiling preheader would leave orphaned instructions after the new branch.
+  // TPIRBasicBlock::execute positions B at IRBB->getFirstNonPHIIt(), which is
+  // BEFORE the original (scalar) loop instructions. Inserting the tiling
+  // branch at the current point would strand those instructions after the
+  // terminator. Reposition to just before the scalar terminator so that:
+  //   (a) SCEV expansion and the tiling branch land at the END of the block,
+  //       after all original instructions.
+  //   (b) Erasing OrigTerm leaves the block with exactly one terminator.
   //
-  // Strategy: use the outermost GEMM loop's preheader as the tiling
-  // preheader. We position the builder there, emit the full tiling nest
-  // (which replaces the scalar loop nest), and redirect the preheader's
-  // original branch to the outermost tiling loop. The scalar loop nest
-  // becomes unreachable dead code (cleaned up by later DCE passes).
-  BasicBlock *TilingPreheader = nullptr;
-  BasicBlock *OrigScalarEntry = nullptr; // original successor of preheader
-  if (OutermostGEMMLoop) {
-    TilingPreheader = OutermostGEMMLoop->getLoopPreheader();
+  // OrigSuccessor: The latch block (tensor.latch0) has InsertionBB = the
+  // inner loop's IR latch (k.loop), so it repositions B back into k.loop
+  // after emitContraction returns. The outermost tiling-loop exit must be
+  // explicitly terminated with a branch to OrigSuccessor (the scalar loop
+  // exit, i.e., k.latch) so that the loop-exit path is CFG-complete.
+  Instruction *OrigTerm = B.GetInsertBlock()->getTerminator();
+  BasicBlock  *OrigSuccessor = nullptr;
+  if (OrigTerm) {
+    B.SetInsertPoint(OrigTerm); // insert before the scalar loop exit branch
+    if (OrigTerm->getNumSuccessors() > 0)
+      OrigSuccessor = OrigTerm->getSuccessor(0);
   }
-  if (!TilingPreheader) {
-    // Fallback: use the current insert block (may produce sub-optimal IR
-    // but avoids a crash). This path should not normally be reached.
-    TilingPreheader = B.GetInsertBlock();
-  }
-
-  // Record the original branch target from the tiling preheader so that
-  // the outermost tiling-loop exit can branch past the scalar loops.
-  Instruction *OrigTerm = TilingPreheader->getTerminator();
-  assert(OrigTerm &&
-         "emitContraction tiling path requires a pre-terminated preheader BB");
-  OrigScalarEntry = OrigTerm->getNumSuccessors() > 0
-                        ? OrigTerm->getSuccessor(0)
-                        : nullptr;
-
-  // Switch the builder to emit at the END of the tiling preheader (just
-  // before its existing terminator). All SCEV expansions and the tiling
-  // loop headers will be anchored there.
-  B.SetInsertPoint(OrigTerm);
 
   // STEP A: Expand ALL TripCount SCEVs to Value* BEFORE creating any
-  // loop BBs. This keeps expansion code in the tiling preheader,
+  // loop BBs. This keeps expansion code in the current preheader BB,
   // not inside a loop body (which would cause dominance violations).
   // ----------------------------------------------------------------
   SmallVector<Value *> TCValues; // parallel to TiledDims
@@ -714,8 +699,7 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   }
 
   // STEP B: Emit tiling loops (outermost first = TiledDims order).
-  // emitTilingLoop inserts a branch to the new loop header at the current
-  // insert point and leaves the builder in the loop's body BB.
+  // Each call nests inside the previous loop's body.
   SmallVector<TilingLoopInfo, 4> LoopInfos;
   for (unsigned I = 0; I < TiledDims.size(); ++I) {
     std::string Name = "tile.d" + std::to_string(TiledDims[I].Dim);
@@ -724,11 +708,25 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     // B's insertion point is now in loop I's body BB.
   }
 
-  // Erase the tiling preheader's original terminator. emitTilingLoop()
-  // already inserted a new branch (br tile.d*.header) before OrigTerm;
-  // the original terminator now falls after the new branch and must be
-  // removed to keep the block well-formed (one terminator per block).
-  OrigTerm->eraseFromParent();
+  // Erase the preheader's original terminator. emitTilingLoop() already
+  // inserted a new branch (br tile.d*.header) in its place; leaving the
+  // original terminator would make the preheader have two terminators.
+  BasicBlock *LoopHeaderBB = OrigTerm ? OrigTerm->getParent() : nullptr;
+  if (OrigTerm)
+    OrigTerm->eraseFromParent();
+
+  // The original loop's back-edge (br i1 %k.done, label %k.latch, label %k.loop)
+  // has been replaced by the tiling branch. The loop header is no longer a
+  // predecessor of itself. Remove self-referencing incoming values from PHIs
+  // in the loop header to match the new (reduced) predecessor count; otherwise
+  // the IR verifier fires "PHINode should have one entry for each predecessor".
+  if (LoopHeaderBB) {
+    for (PHINode &Phi : LoopHeaderBB->phis()) {
+      int Idx = Phi.getBasicBlockIndex(LoopHeaderBB);
+      if (Idx >= 0)
+        Phi.removeIncomingValue(Idx, /*DeletePHIIfEmpty=*/false);
+    }
+  }
 
   // STEP C: Compute offset base pointers inside the innermost body.
   // For each tiled dim: tile_ptr = base_ptr + IV * stride (GEP in elements).
@@ -786,24 +784,13 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     B.SetInsertPoint(LoopInfos[I].ExitBB);
   }
 
-  // Connect the outermost tiling-loop exit to the scalar loop entry
-  // (OrigScalarEntry). This makes the scalar loops unreachable dead code
-  // that DCE can clean up, while allowing the IR verifier to accept the
-  // module. Without this, the outermost tile.d*.exit has no terminator.
-  // At this point B is positioned in the outermost tiling-loop exit block.
-  BasicBlock *OutermostTileExit = B.GetInsertBlock();
-  if (OrigScalarEntry) {
-    B.CreateBr(OrigScalarEntry);
-    // The scalar loop entry (e.g., i.loop) may have PHI nodes that reference
-    // TilingPreheader as a predecessor. Now that TilingPreheader branches to
-    // the outermost tiling loop instead of directly to OrigScalarEntry, the
-    // actual predecessor is OutermostTileExit. Update all PHIs in the entry.
-    for (PHINode &Phi : OrigScalarEntry->phis()) {
-      int Idx = Phi.getBasicBlockIndex(TilingPreheader);
-      if (Idx >= 0)
-        Phi.setIncomingBlock(static_cast<unsigned>(Idx), OutermostTileExit);
-    }
-  }
+  // Terminate the outermost tiling-loop exit block. After all tiling
+  // iterations, control must fall through to the scalar loop's exit
+  // (OrigSuccessor = k.latch). The TPlan latch block (tensor.latch0)
+  // runs next with InsertionBB = k.loop, repositioning B back into the
+  // scalar loop body — so these latch emissions do NOT land here.
+  if (OrigSuccessor)
+    B.CreateBr(OrigSuccessor);
 
   return Call;
 }
@@ -1052,32 +1039,31 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
     // For the reduction update (fadd): emit @llvm.matrix.multiply.
     TPRecipeBase *FusedMul = State.getFusedMulRecipe(this);
     if (FusedMul) {
-      // Guard against double-emission: single-BB innermost loops (where the
-      // header and latch are the same IR block) cause the same IR instruction
-      // to be covered by recipes in both the header TPIRBasicBlock and the
-      // latch TPBasicBlock. The first call emits the tiling loops and erases
-      // the original block terminator; the second call would find no terminator
-      // and assert. Skip if the underlying IR instruction was already lowered.
-      const Instruction *ReductionInst = this->getInstruction();
-      if (State.EmittedContractions.count(ReductionInst))
+      // Guard against double-emission: depth-3 GEMMs cause the same IR
+      // instruction to appear in two recipe objects (once in ir-bb<k.loop>
+      // and once in the latch block). The second execution must reuse the
+      // first emitContraction() result rather than re-emitting the call.
+      Instruction *ReductionInst = this->getInstruction();
+      if (State.EmittedContractions.count(ReductionInst)) {
+        if (Value *Cached = State.ContractionResults.lookup(ReductionInst))
+          State.setValue(this, Cached);
         return;
-      // Save the builder position before emitting. In the tiling path,
-      // emitContraction repositions the builder to the outermost tiling-loop
-      // exit block (tile.d*.exit). Subsequent recipes in the same TPlan block
-      // (k.next, k.done, etc.) are no longer needed — the tiling loops handle
-      // the full computation — but they still get executed by the recipe loop.
-      // We restore the builder to the original insert block so that these
-      // leftover insertions land in the original (now unreachable) scalar loop
-      // body rather than corrupting the tiling loop structure.
-      BasicBlock *SavedInsertBB = State.Builder.GetInsertBlock();
-      BasicBlock::iterator SavedInsertPt = State.Builder.GetInsertPoint();
+      }
+      // Save the builder position. In the tiling path, emitContraction()
+      // moves B into the outermost tiling-loop exit (tile.d*.exit) so that
+      // the exit block gets a `br OrigSuccessor` terminator. Any recipes
+      // that follow the fadd in this TPBasicBlock (k.next, k.done) must NOT
+      // emit into that terminated block; restoring B keeps them in k.loop
+      // where they become harmless dead code before `br tile.d*.header`.
+      BasicBlock           *SaveBB = State.Builder.GetInsertBlock();
+      BasicBlock::iterator  SavePt = State.Builder.GetInsertPoint();
       Value *Result = emitContraction(FusedMul, this, State);
       if (Result) {
         State.setValue(this, Result);
         State.EmittedContractions.insert(ReductionInst);
-        // Restore insert point to the original scalar loop body so that
-        // subsequent recipe insertions are safe (landed in dead code).
-        State.Builder.SetInsertPoint(SavedInsertBB, SavedInsertPt);
+        State.ContractionResults[ReductionInst] = Result;
+        // Restore insert point for subsequent recipes in this block.
+        State.Builder.SetInsertPoint(SaveBB, SavePt);
       }
     }
     // else: this is the fmul itself (FusedMulRecipe==nullptr here) — no-op.
