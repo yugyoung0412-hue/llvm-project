@@ -326,6 +326,67 @@ buildDimToLoopForLowering(TPlan &Plan, LoopInfo &LI) {
 // Helper: emit @llvm.tensor.contract for a Contraction reduction
 //===----------------------------------------------------------------------===//
 
+/// Describes the structure of one tiling loop emitted by emitTilingLoop().
+struct TilingLoopInfo {
+  BasicBlock *LatchBB;    ///< Back-edge block: IV += TileSize, br Header.
+  BasicBlock *ExitBB;     ///< Fall-through after loop completes.
+  PHINode    *IV;         ///< i64 induction: 0, TileSize, 2*TileSize, ...
+  Value      *ActualSize; ///< min(TileSize, TripCount - IV) for remainder.
+};
+
+/// Emits a counting loop around a tensor tile:
+///   header: IV = phi [0, preheader], [IV+TileSize, latch]
+///           if IV >= TripCount goto exit else goto body
+///   body:   ActualSize = umin(TileSize, TripCount - IV)
+///           [caller inserts code here, then calls B.CreateBr(info.LatchBB)]
+///   latch:  IV.next = IV + TileSize; br header
+///   exit:   [set as insertion point by loop-close reversal in caller]
+///
+/// On return, B's insertion point is in `body`. The caller MUST:
+///   1. Insert body code (tensor.contract call, etc.)
+///   2. Call B.CreateBr(info.LatchBB) to terminate the body
+///   3. Call B.SetInsertPoint(info.ExitBB) to advance past the loop
+/// Use the loop-close reversal pattern (innermost first) for nested loops.
+static TilingLoopInfo emitTilingLoop(IRBuilder<> &B, Value *TripCount,
+                                      Value *TileSize, const Twine &Name) {
+  Function    *F   = B.GetInsertBlock()->getParent();
+  LLVMContext &Ctx = F->getContext();
+  Type        *I64 = Type::getInt64Ty(Ctx);
+
+  BasicBlock *PreheaderBB = B.GetInsertBlock();
+  BasicBlock *HeaderBB = BasicBlock::Create(Ctx, Name + ".header", F);
+  BasicBlock *BodyBB   = BasicBlock::Create(Ctx, Name + ".body",   F);
+  BasicBlock *LatchBB  = BasicBlock::Create(Ctx, Name + ".latch",  F);
+  BasicBlock *ExitBB   = BasicBlock::Create(Ctx, Name + ".exit",   F);
+
+  // Preheader → Header.
+  B.CreateBr(HeaderBB);
+
+  // Header: phi + exit-check.
+  B.SetInsertPoint(HeaderBB);
+  PHINode *IV = B.CreatePHI(I64, 2, Name + ".iv");
+  IV->addIncoming(ConstantInt::get(I64, 0), PreheaderBB);
+  Value *Done = B.CreateICmpUGE(IV, TripCount, Name + ".done");
+  B.CreateCondBr(Done, ExitBB, BodyBB);
+
+  // Body: compute remainder-safe tile size.
+  B.SetInsertPoint(BodyBB);
+  Value *Remaining  = B.CreateSub(TripCount, IV, Name + ".rem");
+  Value *ActualSize = B.CreateIntrinsic(Intrinsic::umin, {I64},
+                                         {TileSize, Remaining},
+                                         nullptr, Name + ".actual");
+  // Insertion point stays in BodyBB for the caller.
+
+  // Latch: advance IV and loop back. Use a separate builder so the
+  // caller's builder stays in BodyBB.
+  IRBuilder<> LB(LatchBB);
+  Value *NextIV = LB.CreateAdd(IV, TileSize, Name + ".next");
+  IV->addIncoming(NextIV, LatchBB);
+  LB.CreateBr(HeaderBB);
+
+  return TilingLoopInfo{LatchBB, ExitBB, IV, ActualSize};
+}
+
 static Value *emitContraction(const TPRecipeBase *FusedMul,
                                const TPRecipeBase *ReductionUpdate,
                                TPTransformState &State) {
@@ -507,40 +568,159 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     return I64(State.Plan.getDenseStrideForDim(Dim));
   };
 
-  // Build stride/dim vectors in output-dim order (OutputDimSet iteration order).
-  SmallVector<Value *> CStrides, AStrides, BStrides, OutDims;
+  // --- Tiling decision ---
+  // Collect dimensions where real TripCount > PF (needs tiling loops).
+  // getTCForDim() stores backedge-taken count (BTC); real TC = BTC+1.
+  struct TileDimInfo {
+    unsigned     Dim;     // DimIdx (innermost=0)
+    unsigned     PF;      // Tile size
+    const SCEV  *BTCSCEV; // Backedge-taken count SCEV for runtime expansion
+  };
+  SmallVector<TileDimInfo, 4> TiledDims;
+
+  auto checkDim = [&](unsigned D) {
+    const SCEV *BTC = State.Plan.getTCForDim(D);
+    if (!BTC)
+      return; // Unknown TC — skip tiling for this dim.
+    unsigned PF = State.Plan.getPFForDim(D);
+    if (auto *C = dyn_cast<SCEVConstant>(BTC)) {
+      uint64_t RealTC = C->getValue()->getZExtValue() + 1;
+      if (RealTC > static_cast<uint64_t>(PF))
+        TiledDims.push_back({D, PF, BTC});
+    } else {
+      // Dynamic TC: tile conservatively.
+      TiledDims.push_back({D, PF, BTC});
+    }
+  };
+
   for (int D = OutputDimSet.find_first(); D >= 0;
-       D = OutputDimSet.find_next(D)) {
-    unsigned UD = static_cast<unsigned>(D);
-    CStrides.push_back(getCStride(UD));
-    AStrides.push_back(getAStride(UD));
-    BStrides.push_back(getBStride(UD));
-    OutDims.push_back(I64(State.Plan.getPFForDim(UD)));
-  }
+       D = OutputDimSet.find_next(D))
+    checkDim(static_cast<unsigned>(D));
+  checkDim(static_cast<unsigned>(ContractDim));
 
-  // Contraction dim strides and K size.
+  bool NeedsTiling = !TiledDims.empty();
+
+  // Common setup used by both paths.
   unsigned ContUD = static_cast<unsigned>(ContractDim);
-  Value *AContractStride = getAStride(ContUD);
-  Value *BContractStride = getBStride(ContUD);
-  Value *K = I64(State.Plan.getPFForDim(ContUD));
-
   Module *Mod = B.GetInsertBlock()->getModule();
   FunctionCallee ContractFn =
       getTensorContractFn(*Mod, RankA, RankB, RankC, ElemTy);
 
-  SmallVector<Value *> Args;
-  Args.push_back(CPtr);
-  Args.append(CStrides.begin(), CStrides.end());
-  Args.push_back(LHSPtr);
-  Args.append(AStrides.begin(), AStrides.end());
-  Args.push_back(AContractStride);
-  Args.push_back(RHSPtr);
-  Args.append(BStrides.begin(), BStrides.end());
-  Args.push_back(BContractStride);
-  Args.push_back(K);
-  Args.append(OutDims.begin(), OutDims.end());
+  if (!NeedsTiling) {
+    // ----------------------------------------------------------------
+    // Fast path: TC <= PF for all dims — single tensor.contract call.
+    // ----------------------------------------------------------------
+    SmallVector<Value *> CStrides, AStrides, BStrides, OutDims;
+    for (int D = OutputDimSet.find_first(); D >= 0;
+         D = OutputDimSet.find_next(D)) {
+      unsigned UD = static_cast<unsigned>(D);
+      CStrides.push_back(getCStride(UD));
+      AStrides.push_back(getAStride(UD));
+      BStrides.push_back(getBStride(UD));
+      OutDims.push_back(I64(State.Plan.getPFForDim(UD)));
+    }
+    Value *AContractStride = getAStride(ContUD);
+    Value *BContractStride = getBStride(ContUD);
+    Value *K = I64(State.Plan.getPFForDim(ContUD));
 
-  return B.CreateCall(ContractFn, Args);
+    SmallVector<Value *> Args;
+    Args.push_back(CPtr);
+    Args.append(CStrides.begin(), CStrides.end());
+    Args.push_back(LHSPtr);
+    Args.append(AStrides.begin(), AStrides.end());
+    Args.push_back(AContractStride);
+    Args.push_back(RHSPtr);
+    Args.append(BStrides.begin(), BStrides.end());
+    Args.push_back(BContractStride);
+    Args.push_back(K);
+    Args.append(OutDims.begin(), OutDims.end());
+    return B.CreateCall(ContractFn, Args);
+  }
+
+  // ----------------------------------------------------------------
+  // Tiling path: nested loops around a PF-sized tensor.contract.
+  //
+  // STEP A: Expand ALL TripCount SCEVs to Value* BEFORE creating any
+  // loop BBs. This keeps expansion code in the current preheader BB,
+  // not inside a loop body (which would cause dominance violations).
+  // ----------------------------------------------------------------
+  SmallVector<Value *> TCValues; // parallel to TiledDims
+  for (auto &TD : TiledDims) {
+    Value *BTC = State.Expander->expandCodeFor(
+        TD.BTCSCEV, B.getInt64Ty(), &*B.GetInsertPoint());
+    TCValues.push_back(B.CreateAdd(BTC, B.getInt64(1), "tc.real"));
+  }
+
+  // STEP B: Emit tiling loops (outermost first = TiledDims order).
+  // Each call nests inside the previous loop's body.
+  SmallVector<TilingLoopInfo, 4> LoopInfos;
+  for (unsigned I = 0; I < TiledDims.size(); ++I) {
+    std::string Name = "tile.d" + std::to_string(TiledDims[I].Dim);
+    Value *TileSize  = B.getInt64(TiledDims[I].PF);
+    LoopInfos.push_back(emitTilingLoop(B, TCValues[I], TileSize, Name));
+    // B's insertion point is now in loop I's body BB.
+  }
+
+  // STEP C: Compute offset base pointers inside the innermost body.
+  // For each tiled dim: tile_ptr = base_ptr + IV * stride (GEP in elements).
+  Value *TiledCPtr = CPtr, *TiledAPtr = LHSPtr, *TiledBPtr = RHSPtr;
+  DenseMap<unsigned, Value *> ActualSizes; // dim → min(PF, TC-IV)
+  for (unsigned I = 0; I < TiledDims.size(); ++I) {
+    unsigned Dim     = TiledDims[I].Dim;
+    Value   *IV      = LoopInfos[I].IV;
+    ActualSizes[Dim] = LoopInfos[I].ActualSize;
+
+    auto offsetPtr = [&](Value *Base, Value *Stride) -> Value * {
+      Value *Off = B.CreateMul(IV, Stride, "tile.off");
+      return B.CreateGEP(ElemTy, Base, Off, "tile.ptr");
+    };
+    auto nonZero = [](Value *V) -> bool {
+      auto *CI = dyn_cast<ConstantInt>(V);
+      return !CI || !CI->isZero();
+    };
+    Value *AStr = getAStride(Dim);
+    Value *BStr = getBStride(Dim);
+    Value *CStr = getCStride(Dim);
+    if (nonZero(AStr)) TiledAPtr = offsetPtr(TiledAPtr, AStr);
+    if (nonZero(BStr)) TiledBPtr = offsetPtr(TiledBPtr, BStr);
+    if (nonZero(CStr)) TiledCPtr = offsetPtr(TiledCPtr, CStr);
+  }
+
+  // STEP D: Build tile-sized tensor.contract arguments and call.
+  SmallVector<Value *> Args;
+  Args.push_back(TiledCPtr);
+  for (int D = OutputDimSet.find_first(); D >= 0;
+       D = OutputDimSet.find_next(D))
+    Args.push_back(getCStride(static_cast<unsigned>(D)));
+  Args.push_back(TiledAPtr);
+  for (int D = OutputDimSet.find_first(); D >= 0;
+       D = OutputDimSet.find_next(D))
+    Args.push_back(getAStride(static_cast<unsigned>(D)));
+  Args.push_back(getAStride(ContUD));
+  Args.push_back(TiledBPtr);
+  for (int D = OutputDimSet.find_first(); D >= 0;
+       D = OutputDimSet.find_next(D))
+    Args.push_back(getBStride(static_cast<unsigned>(D)));
+  Args.push_back(getBStride(ContUD));
+  Args.push_back(ActualSizes.count(ContUD) ? ActualSizes[ContUD]
+                                            : I64(State.Plan.getPFForDim(ContUD)));
+  for (int D = OutputDimSet.find_first(); D >= 0;
+       D = OutputDimSet.find_next(D)) {
+    unsigned UD = static_cast<unsigned>(D);
+    Args.push_back(ActualSizes.count(UD) ? ActualSizes[UD]
+                                          : I64(State.Plan.getPFForDim(UD)));
+  }
+  Value *Call = B.CreateCall(ContractFn, Args);
+
+  // STEP E: Close tiling loops in reverse (innermost first).
+  // Pattern: branch current body to LatchBB, then move insert point to ExitBB.
+  // ExitBB of loop I becomes the effective "body" of loop I-1.
+  for (int I = static_cast<int>(LoopInfos.size()) - 1; I >= 0; --I) {
+    B.CreateBr(LoopInfos[I].LatchBB);
+    B.SetInsertPoint(LoopInfos[I].ExitBB);
+  }
+
+  return Call;
 }
 
 //===----------------------------------------------------------------------===//
