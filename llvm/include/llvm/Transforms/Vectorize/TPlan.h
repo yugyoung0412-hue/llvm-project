@@ -1428,6 +1428,13 @@ struct TPTransformState {
   /// Used by decomposePtrForDims() in emitContraction().
   DenseMap<unsigned, Loop *> DimToLoop;
 
+  /// Tracks which contraction reduction-update IR instructions have already been
+  /// lowered to tensor.contract calls (including tiling loops). Prevents
+  /// double-emission when the same IR instruction appears in recipes in both the
+  /// loop header and latch TPlan blocks (single-BB innermost loops where header
+  /// == latch). Keyed on the underlying IR Instruction, not the recipe object.
+  SmallPtrSet<const Instruction *, 4> EmittedContractions;
+
   TPTransformState(IRBuilder<> &B, const TPlan &P) : Builder(B), Plan(P) {}
 
   Value *getValue(const TPRecipeValue *V) const { return ValueMap.lookup(V); }
