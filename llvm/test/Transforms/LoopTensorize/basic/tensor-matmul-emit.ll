@@ -1,11 +1,12 @@
-; RUN: opt -passes=loop-tensorize -S < %s | FileCheck %s
+; RUN: opt -passes=loop-tensorize -loop-tensorize-pf=256 -S < %s | FileCheck %s
 ;
 ; 3-level GEMM (16x16x16, static trip counts) using reduction-PHI form.
 ; Contraction must emit @llvm.tensor.contract.2d.2d.2d.f32.
+; With TC=16 <= PF=256, the fast path fires and uses the real TC (16) as dims.
 ;
 ; CHECK: call void @llvm.tensor.contract.2d.2d.2d.f32(
 ; CHECK-SAME: i64 0
-; CHECK-SAME: i64 256, i64 256
+; CHECK-SAME: i64 16, i64 16, i64 16
 
 target datalayout = "e-m:e-i64:64-n32:64"
 target triple = "aarch64"

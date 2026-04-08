@@ -605,6 +605,15 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
 
   // Common setup used by both paths.
   unsigned ContUD = static_cast<unsigned>(ContractDim);
+
+  // Returns the real dimension size as an i64 constant when the trip count is
+  // a compile-time constant; falls back to PF for dynamic/unknown TCs.
+  auto getRealDim = [&](unsigned D) -> Value * {
+    if (const SCEV *BTC = State.Plan.getTCForDim(D))
+      if (const auto *C = dyn_cast<SCEVConstant>(BTC))
+        return I64(C->getValue()->getZExtValue() + 1);
+    return I64(State.Plan.getPFForDim(D));
+  };
   Module *Mod = B.GetInsertBlock()->getModule();
   FunctionCallee ContractFn =
       getTensorContractFn(*Mod, RankA, RankB, RankC, ElemTy);
@@ -620,11 +629,11 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
       CStrides.push_back(getCStride(UD));
       AStrides.push_back(getAStride(UD));
       BStrides.push_back(getBStride(UD));
-      OutDims.push_back(I64(State.Plan.getPFForDim(UD)));
+      OutDims.push_back(getRealDim(UD));
     }
     Value *AContractStride = getAStride(ContUD);
     Value *BContractStride = getBStride(ContUD);
-    Value *K = I64(State.Plan.getPFForDim(ContUD));
+    Value *K = getRealDim(ContUD);
 
     SmallVector<Value *> Args;
     Args.push_back(CPtr);
@@ -772,12 +781,11 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     Args.push_back(OutputStrides[SI].BStr);
   Args.push_back(CachedBContractStride);
   Args.push_back(ActualSizes.count(ContUD) ? ActualSizes[ContUD]
-                                            : I64(State.Plan.getPFForDim(ContUD)));
+                                            : getRealDim(ContUD));
   for (int D = OutputDimSet.find_first(); D >= 0;
        D = OutputDimSet.find_next(D)) {
     unsigned UD = static_cast<unsigned>(D);
-    Args.push_back(ActualSizes.count(UD) ? ActualSizes[UD]
-                                          : I64(State.Plan.getPFForDim(UD)));
+    Args.push_back(ActualSizes.count(UD) ? ActualSizes[UD] : getRealDim(UD));
   }
   Value *Call = B.CreateCall(ContractFn, Args);
 

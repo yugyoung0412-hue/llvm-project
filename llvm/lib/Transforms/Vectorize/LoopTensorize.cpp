@@ -57,8 +57,6 @@ PreservedAnalyses LoopTensorizePass::run(Function &F,
     // Build and print the initial TPlan.
     TPlan Plan = TPlan::buildInitial(*InfoOpt);
     LLVM_DEBUG(Plan.print(dbgs()));
-    errs() << "\n=== Stage 1: Initial TPlan ===\n";
-    Plan.print(errs());
 
     // Lower to IR.  TPlanWidener_widen() (called inside lower()) seeds
     // Plan.DimPFMap with the default PF=256 for each IV dimension.
@@ -143,8 +141,7 @@ PreservedAnalyses LoopTensorizePass::run(Function &F,
 
     bool PlanChanged = applyPlan(Best, Hint, EffectiveOps, F, LI, SE, DT);
     Changed |= PlanChanged;
-    errs() << "\n=== Stage 4: Final Lowered LLVM IR ===\n";
-    F.print(errs());
+    LLVM_DEBUG(F.print(dbgs()));
   }
 
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
