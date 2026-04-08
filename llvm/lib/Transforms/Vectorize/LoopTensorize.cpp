@@ -8,12 +8,12 @@
 
 #include "llvm/Transforms/Vectorize/LoopTensorize.h"
 #include "llvm/Analysis/DependenceAnalysis.h"
-#include "llvm/IR/Dominators.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/PassManager.h"
