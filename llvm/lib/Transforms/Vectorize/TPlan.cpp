@@ -742,7 +742,7 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
     unsigned Level  = P.Depth - 1 - Idx;
     unsigned DimIdx = Level; // innermost=0, outermost=Depth-1 (equals Level)
     if (TC)
-      P.setDimTC(DimIdx, TC); // Stores backedge-taken count; real TC = TC+1.
+      P.setDimTC(DimIdx, TC); // SE returns backedge-taken count (iterations-1).
     std::string LevelStr = std::to_string(Level);
 
     // Get the loop exit bound: latch branch condition ICmpInst RHS.
