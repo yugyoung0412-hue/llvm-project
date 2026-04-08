@@ -591,6 +591,8 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
       // Dynamic TC: cannot determine at compile time whether TC > PF.
       // Skip tiling; fall through to single-call fast path.
       // (Dynamic tiling would require runtime comparison, not yet implemented.)
+      LLVM_DEBUG(dbgs() << "TPlanLowering: skipping tiling for dim " << D
+                        << " (dynamic TC)\n");
     }
   };
 
@@ -669,10 +671,11 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   //   (b) connect the outermost tiling-loop exit back to the continuation.
   // Successor 0 is used: unconditional branches have only one successor;
   // conditional branches (br i1 cond, %exit, %loop) put the exit first.
-  BasicBlock    *OrigSuccessor = nullptr;
   Instruction   *OrigTerm      = B.GetInsertBlock()->getTerminator();
-  if (OrigTerm && OrigTerm->getNumSuccessors() > 0)
-    OrigSuccessor = OrigTerm->getSuccessor(0);
+  assert(OrigTerm && "emitContraction tiling path requires a pre-terminated preheader BB");
+  BasicBlock    *OrigSuccessor = OrigTerm->getNumSuccessors() > 0
+                                     ? OrigTerm->getSuccessor(0)
+                                     : nullptr;
 
   // STEP A: Expand ALL TripCount SCEVs to Value* BEFORE creating any
   // loop BBs. This keeps expansion code in the current preheader BB,
