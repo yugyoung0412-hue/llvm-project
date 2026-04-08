@@ -17,6 +17,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/Vectorize/LoopNestAnalyzer.h"
 #include "llvm/Transforms/Vectorize/TPlan.h"
@@ -29,6 +30,12 @@
 #define DEBUG_TYPE "loop-tensorize"
 
 using namespace llvm;
+
+static cl::opt<unsigned> OverridePF(
+    "loop-tensorize-pf",
+    cl::desc("Override parallel factor (tile size) for all dimensions. "
+             "0 = use default (256). Intended for testing only."),
+    cl::init(0));
 
 PreservedAnalyses LoopTensorizePass::run(Function &F,
                                           FunctionAnalysisManager &FAM) {
@@ -56,6 +63,13 @@ PreservedAnalyses LoopTensorizePass::run(Function &F,
     // Lower to IR.  TPlanWidener_widen() (called inside lower()) seeds
     // Plan.DimPFMap with the default PF=256 for each IV dimension.
     // Override specific dims here if a target-specific tile size is needed.
+
+    // Apply command-line PF override for testing.
+    // hasDimPF() in the widener will preserve these values.
+    if (OverridePF > 0)
+      for (unsigned D = 0; D < InfoOpt->Depth; ++D)
+        Plan.setDimPF(D, OverridePF);
+
     TPlanLowering_lower(Plan, F, LI, SE, DT);
 
     PatternHint Hint = classifyPattern(*InfoOpt);
