@@ -588,8 +588,9 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
       if (RealTC > static_cast<uint64_t>(PF))
         TiledDims.push_back({D, PF, BTC});
     } else {
-      // Dynamic TC: tile conservatively.
-      TiledDims.push_back({D, PF, BTC});
+      // Dynamic TC: cannot determine at compile time whether TC > PF.
+      // Skip tiling; fall through to single-call fast path.
+      // (Dynamic tiling would require runtime comparison, not yet implemented.)
     }
   };
 
@@ -663,6 +664,16 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   Value *CachedAContractStride = getAStride(ContUD);
   Value *CachedBContractStride = getBStride(ContUD);
 
+  // Save the preheader's original terminator so we can:
+  //   (a) erase it after emitTilingLoop() inserts a new branch, and
+  //   (b) connect the outermost tiling-loop exit back to the continuation.
+  // Successor 0 is used: unconditional branches have only one successor;
+  // conditional branches (br i1 cond, %exit, %loop) put the exit first.
+  BasicBlock    *OrigSuccessor = nullptr;
+  Instruction   *OrigTerm      = B.GetInsertBlock()->getTerminator();
+  if (OrigTerm && OrigTerm->getNumSuccessors() > 0)
+    OrigSuccessor = OrigTerm->getSuccessor(0);
+
   // STEP A: Expand ALL TripCount SCEVs to Value* BEFORE creating any
   // loop BBs. This keeps expansion code in the current preheader BB,
   // not inside a loop body (which would cause dominance violations).
@@ -683,6 +694,12 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     LoopInfos.push_back(emitTilingLoop(B, TCValues[I], TileSize, Name));
     // B's insertion point is now in loop I's body BB.
   }
+
+  // Erase the preheader's original terminator. emitTilingLoop() already
+  // inserted a new branch (br tile.d*.header) in its place; leaving the
+  // original terminator would make the preheader have two terminators.
+  if (OrigTerm)
+    OrigTerm->eraseFromParent();
 
   // STEP C: Compute offset base pointers inside the innermost body.
   // For each tiled dim: tile_ptr = base_ptr + IV * stride (GEP in elements).
@@ -739,6 +756,11 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     B.CreateBr(LoopInfos[I].LatchBB);
     B.SetInsertPoint(LoopInfos[I].ExitBB);
   }
+
+  // Connect the outermost tiling-loop exit to the preheader's original
+  // continuation. Without this, tile.d*.exit has no terminator.
+  if (OrigSuccessor)
+    B.CreateBr(OrigSuccessor);
 
   return Call;
 }
