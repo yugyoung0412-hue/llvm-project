@@ -674,18 +674,25 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   //       after all original instructions.
   //   (b) Erasing OrigTerm leaves the block with exactly one terminator.
   //
+  // Save the entry block NOW (before any repositioning) — this IS the loop
+  // header block whose PHIs carry the back-edge incoming value.
+  //
   // OrigSuccessor: The latch block (tensor.latch0) has InsertionBB = the
   // inner loop's IR latch (k.loop), so it repositions B back into k.loop
   // after emitContraction returns. The outermost tiling-loop exit must be
   // explicitly terminated with a branch to OrigSuccessor (the scalar loop
   // exit, i.e., k.latch) so that the loop-exit path is CFG-complete.
-  Instruction *OrigTerm = B.GetInsertBlock()->getTerminator();
+  BasicBlock *LoopHeaderBB = B.GetInsertBlock(); // loop header before any move
+  Instruction *OrigTerm = LoopHeaderBB->getTerminator();
   BasicBlock  *OrigSuccessor = nullptr;
-  if (OrigTerm) {
-    B.SetInsertPoint(OrigTerm); // insert before the scalar loop exit branch
-    if (OrigTerm->getNumSuccessors() > 0)
-      OrigSuccessor = OrigTerm->getSuccessor(0);
+  if (!OrigTerm) {
+    LLVM_DEBUG(dbgs() << "TPlanLowering: emitContraction tiling: "
+                         "no terminator in current block, skipping tiling\n");
+    return nullptr;
   }
+  B.SetInsertPoint(OrigTerm); // insert before the scalar loop exit branch
+  if (OrigTerm->getNumSuccessors() > 0)
+    OrigSuccessor = OrigTerm->getSuccessor(0);
 
   // STEP A: Expand ALL TripCount SCEVs to Value* BEFORE creating any
   // loop BBs. This keeps expansion code in the current preheader BB,
@@ -702,7 +709,7 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   // Each call nests inside the previous loop's body.
   SmallVector<TilingLoopInfo, 4> LoopInfos;
   for (unsigned I = 0; I < TiledDims.size(); ++I) {
-    std::string Name = "tile.d" + std::to_string(TiledDims[I].Dim);
+    std::string Name = (Twine("tile.d") + Twine(TiledDims[I].Dim)).str();
     Value *TileSize  = B.getInt64(TiledDims[I].PF);
     LoopInfos.push_back(emitTilingLoop(B, TCValues[I], TileSize, Name));
     // B's insertion point is now in loop I's body BB.
@@ -711,9 +718,7 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   // Erase the preheader's original terminator. emitTilingLoop() already
   // inserted a new branch (br tile.d*.header) in its place; leaving the
   // original terminator would make the preheader have two terminators.
-  BasicBlock *LoopHeaderBB = OrigTerm ? OrigTerm->getParent() : nullptr;
-  if (OrigTerm)
-    OrigTerm->eraseFromParent();
+  OrigTerm->eraseFromParent();
 
   // The original loop's back-edge (br i1 %k.done, label %k.latch, label %k.loop)
   // has been replaced by the tiling branch. The loop header is no longer a

@@ -1,4 +1,4 @@
-; RUN: opt -passes=loop-tensorize -S < %s | FileCheck %s
+; RUN: opt -passes=loop-tensorize -loop-tensorize-pf=256 -S < %s | FileCheck %s
 ;
 ; GEMM 64x64x64 with default PF=256. All dimensions fit in one tile.
 ; Expected: single tensor.contract call, no tile.d* blocks.
