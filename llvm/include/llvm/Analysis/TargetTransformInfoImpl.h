@@ -1208,6 +1208,11 @@ public:
   virtual SmallVector<TensorOpDesc> getSupportedTensorOps() const { return {}; }
   virtual unsigned getTensorTileSize(Type *) const { return 0; }
 
+  virtual std::optional<TensorContractTileInfo>
+  getTensorContractTileInfo(Type *, unsigned, unsigned, unsigned) const {
+    return std::nullopt;
+  }
+
   virtual bool allowVectorElementIndexingUsingGEP() const { return true; }
 
 protected:

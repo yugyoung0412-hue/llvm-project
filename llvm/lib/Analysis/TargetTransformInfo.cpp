@@ -1554,6 +1554,13 @@ unsigned TargetTransformInfo::getTensorTileSize(Type *ElemTy) const {
   return TTIImpl->getTensorTileSize(ElemTy);
 }
 
+std::optional<TensorContractTileInfo>
+TargetTransformInfo::getTensorContractTileInfo(Type *ElemTy, unsigned RankA,
+                                               unsigned RankB,
+                                               unsigned RankC) const {
+  return TTIImpl->getTensorContractTileInfo(ElemTy, RankA, RankB, RankC);
+}
+
 TargetTransformInfoImplBase::~TargetTransformInfoImplBase() = default;
 
 TargetIRAnalysis::TargetIRAnalysis() : TTICallback(&getDefaultTTI) {}

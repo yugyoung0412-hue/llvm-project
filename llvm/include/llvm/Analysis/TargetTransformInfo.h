@@ -2078,6 +2078,14 @@ public:
   /// Returns the native tile size (rows/cols) for tensor ops on this target.
   LLVM_ABI unsigned getTensorTileSize(Type *ElemTy) const;
 
+  /// Returns tile sizing policy for dynamic-TC tensor contractions.
+  /// Queries target ISA (AMX, NEON MMLA, SVE, …) for the given element type
+  /// and contraction ranks. Returns std::nullopt when the target has no
+  /// native tensor support — callers should fall back to the CLI PF.
+  LLVM_ABI std::optional<TensorContractTileInfo>
+  getTensorContractTileInfo(Type *ElemTy, unsigned RankA, unsigned RankB,
+                            unsigned RankC) const;
+
 private:
   std::unique_ptr<const TargetTransformInfoImplBase> TTIImpl;
 };
