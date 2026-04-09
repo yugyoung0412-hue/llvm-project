@@ -331,6 +331,9 @@ public:
   bool hasTensorOps() const override;
   SmallVector<TensorOpDesc> getSupportedTensorOps() const override;
   unsigned getTensorTileSize(Type *ElemTy) const override;
+  std::optional<TensorContractTileInfo>
+  getTensorContractTileInfo(Type *ElemTy, unsigned RankA, unsigned RankB,
+                            unsigned RankC) const override;
 
 private:
   bool supportsGather() const;

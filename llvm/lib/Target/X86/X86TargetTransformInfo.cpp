@@ -7316,3 +7316,29 @@ unsigned X86TTIImpl::getTensorTileSize(Type *ElemTy) const {
     return 16;
   return 0;
 }
+
+std::optional<TensorContractTileInfo>
+X86TTIImpl::getTensorContractTileInfo(Type *ElemTy, unsigned /*RankA*/,
+                                      unsigned /*RankB*/,
+                                      unsigned /*RankC*/) const {
+  // AMX BF16 (TDPBF16PS): 16×16 FP32 output, K=32 BF16 elements per tile.
+  // Tile reconfiguration (LDTILECFG) is expensive — no epilogue tensor tiers.
+  if (ST->hasAMXBF16() && ElemTy->isBFloatTy())
+    return TensorContractTileInfo{/*PrimaryK=*/32, /*EpilogueKSizes=*/{},
+                                  /*RequiresAlignedK=*/true,
+                                  /*SupportsMasking=*/false};
+
+  // AMX INT8 (TDPBSSD): K=64 bytes per tile.
+  if (ST->hasAMXINT8() && ElemTy->isIntegerTy(8))
+    return TensorContractTileInfo{/*PrimaryK=*/64, /*EpilogueKSizes=*/{},
+                                  /*RequiresAlignedK=*/true,
+                                  /*SupportsMasking=*/false};
+
+  // AMX FP16 (Granite Rapids+): same tile geometry as BF16.
+  if (ST->hasAMXFP16() && ElemTy->isHalfTy())
+    return TensorContractTileInfo{/*PrimaryK=*/32, /*EpilogueKSizes=*/{},
+                                  /*RequiresAlignedK=*/true,
+                                  /*SupportsMasking=*/false};
+
+  return std::nullopt;
+}
