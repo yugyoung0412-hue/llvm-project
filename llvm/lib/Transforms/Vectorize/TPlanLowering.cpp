@@ -989,57 +989,6 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
         EpiPFs = SmallVector<unsigned, 4>(TileInfo->EpilogueKSizes);
     }
 
-    // STEP 0': Optionally hoist a profitability guard before the outermost
-    // GEMM loop. This mirrors VPlan's createVectorizedLoopSkeleton(): the
-    // guard fires ONCE before M iterations, not M×N times inside the K body.
-    //
-    // Preconditions (all must hold; we silently skip otherwise):
-    //   - State.LI/DT must be available (set by TPlanLowering_lower).
-    //   - OutermostGEMMLoop must be found (non-null).
-    //   - OutermostGEMMLoop must have a unique preheader with one predecessor.
-    //   - The K TC SCEV must be safely expandable before the outer preheader.
-    //   - OutermostGEMMLoop must have a single exit block.
-    {
-      ValueToValueMapTy SkelVMap;
-      BasicBlock *OuterPH =
-          OutermostGEMMLoop ? OutermostGEMMLoop->getLoopPreheader() : nullptr;
-      BasicBlock *OuterPred = OuterPH ? OuterPH->getSinglePredecessor() : nullptr;
-      LLVM_DEBUG(dbgs() << "TPlanLowering: skeleton check: LI=" << !!State.LI
-                        << " DT=" << !!State.DT
-                        << " OutermostGEMMLoop=" << (OutermostGEMMLoop ? OutermostGEMMLoop->getName() : "(null)")
-                        << " OuterPH=" << (OuterPH ? OuterPH->getName() : "(null)")
-                        << " OuterPred=" << (OuterPred ? OuterPred->getName() : "(null)")
-                        << " ExitBlock=" << (OutermostGEMMLoop && OutermostGEMMLoop->getExitBlock() ? OutermostGEMMLoop->getExitBlock()->getName() : "(null)")
-                        << "\n");
-      if (State.LI && State.DT && OuterPred &&
-          OutermostGEMMLoop->getExitBlock()) {
-        // Expand the K trip-count SCEV in OrigPred so it dominates GuardBB.
-        // (OrigPred is the immediate predecessor of OuterPH; GuardBB will be
-        // inserted between them by createTensorizedLoopSkeleton.)
-        Instruction *ExpandAt = OuterPred->getTerminator();
-        // Expand K TC SCEV in OrigPred so the guard value dominates GuardBB.
-        // expandCodeFor() handles loop-invariant SCEVs regardless of the
-        // isSafeToExpand predicate; use it unconditionally since the BTC SCEV
-        // for the K loop (a linear function of the trip count argument) is
-        // always representable as simple arithmetic.
-        Value *GuardBTC = State.Expander->expandCodeFor(
-            DD.BTCSCEV, B.getInt64Ty(), ExpandAt);
-        IRBuilder<> PredB(ExpandAt);
-        Value *GuardTC = PredB.CreateAdd(GuardBTC, PredB.getInt64(1),
-                                         "k.tc.guard");
-        TensorizedLoopSkeleton Skel = createTensorizedLoopSkeleton(
-            OutermostGEMMLoop, GuardTC, PrimaryPF, *State.LI, *State.DT,
-            SkelVMap);
-        if (Skel.Valid) {
-          LLVM_DEBUG(dbgs() << "TPlanLowering: skeleton guard inserted "
-                               "before outermost GEMM loop\n");
-        } else {
-          LLVM_DEBUG(dbgs() << "TPlanLowering: skeleton creation failed; "
-                               "proceeding without guard\n");
-        }
-      }
-    }
-
     // STEP A': Expand runtime TC for the dynamic dim.
     Value *BTCVal = State.Expander->expandCodeFor(
         DD.BTCSCEV, B.getInt64Ty(), &*B.GetInsertPoint());
@@ -1797,6 +1746,67 @@ bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
       dbgs() << "  dim=" << S.Dim << " PF=" << S.PF << " mode=" << Mode << "\n";
     }
   });
+
+  // If any dim needs a runtime profitability guard, insert the skeleton ONCE
+  // before the outermost tensor loop — here, before execute(), not inside
+  // emitContraction(). Mirrors VPlan's createVectorizedLoopSkeleton() call
+  // site: the guard fires once, not once per M×N iteration.
+  if (State.Policy.needsGuard()) {
+    // Find the outermost loop in the tensor nest (highest dim index in
+    // DimToLoop — outermost in DimIdx convention).
+    Loop *OutermostLoop = nullptr;
+    unsigned MaxDim = 0;
+    for (const auto &[D, L] : State.DimToLoop) {
+      if (!OutermostLoop || D > MaxDim) {
+        MaxDim = D;
+        OutermostLoop = L;
+      }
+    }
+
+    // For each DynamicTiled dim, the PF in the Policy (from Plan.getPFForDim)
+    // serves as the guard threshold: TC >=u PF means at least one full tile
+    // can run on the tensor path.
+    for (const DimEmissionSpec &Spec : State.Policy.Specs) {
+      if (Spec.Mode != DimEmitMode::DynamicTiled)
+        continue;
+
+      if (!OutermostLoop)
+        break;
+
+      BasicBlock *OuterPH   = OutermostLoop->getLoopPreheader();
+      BasicBlock *OuterPred = OuterPH ? OuterPH->getSinglePredecessor() : nullptr;
+      if (!OuterPred || !OutermostLoop->getExitBlock())
+        break;
+
+      const SCEV *BTCSCEV = Plan.getTCForDim(Spec.Dim);
+      if (!BTCSCEV)
+        break;
+
+      // Expand the dim's backedge-taken count in OuterPred so it dominates
+      // the guard block that createTensorizedLoopSkeleton() will insert.
+      Instruction *ExpandAt = OuterPred->getTerminator();
+      Value *GuardBTC = Expander.expandCodeFor(
+          BTCSCEV, Builder.getInt64Ty(), ExpandAt);
+      IRBuilder<> PredB(ExpandAt);
+      Value *GuardTC =
+          PredB.CreateAdd(GuardBTC, PredB.getInt64(1), "tc.guard");
+
+      ValueToValueMapTy SkelVMap;
+      TensorizedLoopSkeleton Skel = createTensorizedLoopSkeleton(
+          OutermostLoop, GuardTC, Spec.PF, LI, DT, SkelVMap);
+      LLVM_DEBUG({
+        if (Skel.Valid)
+          dbgs() << "TPlanLowering: profitability guard inserted before "
+                 << OutermostLoop->getName() << " (dim=" << Spec.Dim
+                 << " PF=" << Spec.PF << ")\n";
+        else
+          dbgs() << "TPlanLowering: skeleton creation failed for dim "
+                 << Spec.Dim << "; proceeding without guard\n";
+      });
+      // Currently only one DynamicTiled dim is supported per lowering.
+      break;
+    }
+  }
 
   if (Plan.getEntry()) {
     // Collect and execute all blocks in top-level construction order.

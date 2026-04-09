@@ -23,7 +23,7 @@
 ;
 ; Guard block: emitted before the outermost M loop (tensor path).
 ; CHECK:       tensor.guard:
-; CHECK-NEXT:    %tensor.profitable = icmp uge i64 %k.tc.guard, 16
+; CHECK-NEXT:    %tensor.profitable = icmp uge i64 %tc.guard, 16
 ; CHECK-NEXT:    br i1 %tensor.profitable, label %gemm.ph, label %gemm.ph.scalar
 ;
 ; Tensor path entry.
