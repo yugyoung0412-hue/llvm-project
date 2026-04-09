@@ -462,6 +462,32 @@ static TilingLoopInfo emitTilingLoop(IRBuilder<> &B, Value *TripCount,
   return TilingLoopInfo{LatchBB, ExitBB, IV, ActualSize};
 }
 
+/// Tiling loop skeleton pre-built by preBuildTilingBlocks() before execute().
+/// Stored via State.PrebuiltTilingPtr (opaque void*); cast in callers.
+struct PrebuiltTilingInfo {
+  /// Static tiling loops for output dims (M, N, ...), outermost first.
+  SmallVector<TilingLoopInfo, 4>  StaticLoops;
+  /// Fixed-count tiling loop for the dynamic contract dim (K).
+  std::optional<FixedCountLoopInfo> DynamicLoop;
+  /// Innermost body BB — where tensor.contract is emitted.
+  BasicBlock                     *BodyBB    = nullptr;
+  /// Floating preheader block used during pre-build; replaced by LoopHeaderBB
+  /// and erased in emitContraction(). Its only instruction is br FirstHeader.
+  BasicBlock                     *AnchorBB  = nullptr;
+  /// Expanded TC value* parallel to StaticLoops (i64).
+  SmallVector<Value *, 4>         TCValues;
+  /// PF parallel to StaticLoops (used for ActualSize arg).
+  SmallVector<unsigned, 4>        PFs;
+  /// Dim indices parallel to StaticLoops.
+  SmallVector<unsigned, 4>        Dims;
+  /// Dynamic loop dim index and PF (for K pointer offset).
+  unsigned                        DynDim = 0;
+  unsigned                        DynPF  = 0;
+  /// Expanded real trip-count for the dynamic dim (needed for scalar.block).
+  Value                          *DynTCVal = nullptr;
+
+};
+
 /// Builds an EmissionPolicy by classifying every dimension known to the plan.
 ///
 /// Classification rules (per dim in \p DimToLoop):
@@ -1695,6 +1721,150 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
   }
 }
 
+/// Scans the ClassMap for Contraction recipes, determines OutputDimSet and
+/// ContractDim, then builds FLOATING tiling loop block skeletons for all
+/// non-Inline Policy dims BEFORE execute(). On success, allocates a
+/// PrebuiltTilingInfo and stores it in State.PrebuiltTilingPtr.
+///
+/// Design — AnchorBB pattern:
+///   1. SCEV expansion instructions land in InsertBB (TensorPH), BEFORE its
+///      terminator. InsertBB is already in the dominator tree, so these Values
+///      dominate all tiling loop blocks once emitContraction() connects them.
+///   2. A floating AnchorBB (no predecessors yet) is the temporary preheader
+///      for emitTilingLoop / emitFixedCountingLoop. AnchorBB's only instruction
+///      is the br to the first tiling header.
+///   3. In emitContraction(): B.CreateBr(FirstHeader) + replaceIncomingBlockWith
+///      (AnchorBB → LoopHeaderBB) + AnchorBB->eraseFromParent() wires the
+///      pre-built structure into the live CFG.
+///
+/// \param InsertBB  Tensor path preheader (OutermostLoop->getLoopPreheader()).
+///                  Must have a terminator; SCEV expansions are inserted before
+///                  it. The tiling loops themselves go into a separate AnchorBB.
+static void preBuildTilingBlocks(BasicBlock *InsertBB,
+                                  TPTransformState &State,
+                                  const TPlan &Plan,
+                                  const RecipeClassMap &CM) {
+  if (!InsertBB)
+    return;
+  Instruction *InsertBefore = InsertBB->getTerminator();
+  if (!InsertBefore)
+    return; // InsertBB must be terminated (it still has br OutermostLoop)
+  Function *F = InsertBB->getParent();
+
+  // Step A: Find any Contraction recipe to get OutputDimSet + ContractDim.
+  int ContractDim = -1;
+  SmallBitVector LHSBits, RHSBits;
+  for (const auto &[R, Class] : CM) {
+    if (Class.Kind != TensorOpKind::Contraction)
+      continue;
+    ContractDim = Class.ContractDim;
+    if (Class.FusedMulRecipe) {
+      if (auto *L = dyn_cast<TPSingleDefRecipe>(
+              Class.FusedMulRecipe->getOperand(0)))
+        LHSBits = L->DimSet;
+      if (auto *R2 = dyn_cast<TPSingleDefRecipe>(
+              Class.FusedMulRecipe->getOperand(1)))
+        RHSBits = R2->DimSet;
+    } else {
+      LLVM_DEBUG(dbgs() << "TPlanLowering: preBuildTilingBlocks: Contraction "
+                           "recipe has no FusedMulRecipe, skipping\n");
+      break;
+    }
+    break; // one contraction per nest for now
+  }
+  if (ContractDim < 0)
+    return; // nothing to pre-build
+
+  unsigned NBits = std::max(LHSBits.size(), RHSBits.size());
+  if (NBits == 0) return;
+  LHSBits.resize(NBits); RHSBits.resize(NBits);
+  SmallBitVector OutputDimSet = LHSBits;
+  OutputDimSet |= RHSBits;
+  OutputDimSet.reset(static_cast<unsigned>(ContractDim));
+
+  // Step B: Expand all trip-count SCEVs into InsertBB BEFORE its terminator.
+  // For SCEVConstant / SCEVUnknown (function args), expandCodeFor returns the
+  // constant or the original Value* with no new instructions. For AddRec-
+  // derived BTC (e.g. %K-1 for a loop bound), it emits a sub into InsertBB.
+  // Either way, the result dominates all tiling loop blocks in the final CFG
+  // (InsertBB = TensorPH dominates the entire tensor path).
+  auto *Info = new PrebuiltTilingInfo();
+  LLVMContext &Ctx = F->getContext();
+  Type *I64 = Type::getInt64Ty(Ctx);
+  IRBuilder<> PH(InsertBefore); // inserts before InsertBefore (the br)
+
+  // Output dims (StaticTiled), outermost first (highest DimIdx first).
+  for (int D = static_cast<int>(NBits) - 1; D >= 0; --D) {
+    if (!OutputDimSet.test(static_cast<unsigned>(D))) continue;
+    const DimEmissionSpec *Spec =
+        State.Policy.getSpec(static_cast<unsigned>(D));
+    if (!Spec || Spec->Mode != DimEmitMode::StaticTiled) continue;
+    const SCEV *BTC = Plan.getTCForDim(static_cast<unsigned>(D));
+    if (!BTC) continue;
+    Value *BTCVal =
+        State.Expander->expandCodeFor(BTC, I64, InsertBefore);
+    Value *TCVal = PH.CreateAdd(BTCVal, PH.getInt64(1),
+                                "tc.d" + Twine(D));
+    Info->TCValues.push_back(TCVal);
+    Info->PFs.push_back(Spec->PF);
+    Info->Dims.push_back(static_cast<unsigned>(D));
+  }
+
+  // Dynamic contract dim (K).
+  Value *DynTCVal = nullptr;
+  {
+    const DimEmissionSpec *Spec =
+        State.Policy.getSpec(static_cast<unsigned>(ContractDim));
+    if (Spec && Spec->Mode == DimEmitMode::DynamicTiled) {
+      const SCEV *BTC = Plan.getTCForDim(static_cast<unsigned>(ContractDim));
+      if (BTC) {
+        Value *BTCVal =
+            State.Expander->expandCodeFor(BTC, I64, InsertBefore);
+        DynTCVal = PH.CreateAdd(BTCVal, PH.getInt64(1), "k.tc");
+        Info->DynDim    = static_cast<unsigned>(ContractDim);
+        Info->DynPF     = Spec->PF;
+        Info->DynTCVal  = DynTCVal;
+      }
+    }
+  }
+
+  // Step C: Build floating tiling loop skeletons from a temporary AnchorBB.
+  // AnchorBB has no predecessors. Its only instruction will be the br to the
+  // first tiling header, created by emitTilingLoop(). In emitContraction(),
+  // LoopHeaderBB's new br replaces this edge and AnchorBB is deleted.
+  BasicBlock *AnchorBB = BasicBlock::Create(Ctx, "tiling.anchor", F);
+  Info->AnchorBB = AnchorBB;
+  IRBuilder<> TileB(AnchorBB);
+
+  // Static loops — outermost first (Dims list is already highest-D-first).
+  for (unsigned I = 0; I < Info->Dims.size(); ++I) {
+    std::string Name = (Twine("tile.d") + Twine(Info->Dims[I])).str();
+    Value *TileSize  = TileB.getInt64(Info->PFs[I]);
+    TilingLoopInfo LI =
+        emitTilingLoop(TileB, Info->TCValues[I], TileSize, Name);
+    Info->StaticLoops.push_back(LI);
+    // TileB is now in LI's body BB; next iteration nests inside.
+  }
+
+  // Dynamic loop (K), if applicable.
+  if (DynTCVal) {
+    FixedCountLoopInfo FCI =
+        emitFixedCountingLoop(TileB, DynTCVal, Info->DynPF, "tensor.body");
+    Info->DynamicLoop = FCI;
+    // TileB is now in tensor.body.body.
+  }
+
+  // If no loops were built, clean up and return without setting PrebuiltTilingPtr.
+  if (Info->StaticLoops.empty() && !Info->DynamicLoop) {
+    Info->AnchorBB->eraseFromParent();
+    delete Info;
+    return;
+  }
+
+  Info->BodyBB = TileB.GetInsertBlock();
+  State.PrebuiltTilingPtr = Info;
+}
+
 //===----------------------------------------------------------------------===//
 // Public entry point
 //===----------------------------------------------------------------------===//
@@ -1749,22 +1919,18 @@ bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
     }
   });
 
+  // Find the outermost loop (highest dim index in DimToLoop).
+  Loop *OutermostLoop = nullptr;
+  unsigned MaxDim = 0;
+  for (const auto &[D, L] : State.DimToLoop) {
+    if (!OutermostLoop || D > MaxDim) { MaxDim = D; OutermostLoop = L; }
+  }
+
   // If any dim needs a runtime profitability guard, insert the skeleton ONCE
   // before the outermost tensor loop — here, before execute(), not inside
   // emitContraction(). Mirrors VPlan's createVectorizedLoopSkeleton() call
   // site: the guard fires once, not once per M×N iteration.
   if (State.Policy.needsGuard()) {
-    // Find the outermost loop in the tensor nest (highest dim index in
-    // DimToLoop — outermost in DimIdx convention).
-    Loop *OutermostLoop = nullptr;
-    unsigned MaxDim = 0;
-    for (const auto &[D, L] : State.DimToLoop) {
-      if (!OutermostLoop || D > MaxDim) {
-        MaxDim = D;
-        OutermostLoop = L;
-      }
-    }
-
     // For each DynamicTiled dim, the PF in the Policy (from Plan.getPFForDim)
     // serves as the guard threshold: TC >=u PF means at least one full tile
     // can run on the tensor path.
@@ -1810,11 +1976,27 @@ bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
     }
   }
 
+  // Section 2: Pre-build floating tiling loop skeletons before execute().
+  // State.Expander is already initialized; InsertBB is the tensor path
+  // preheader (OutermostLoop->getLoopPreheader()). SCEV expansions land
+  // in InsertBB (before its terminator); loop blocks float off AnchorBB
+  // until emitContraction() wires them into the live CFG.
+  if (State.Policy.needsGuard()) {
+    if (OutermostLoop) {
+      BasicBlock *TensorPH = OutermostLoop->getLoopPreheader();
+      preBuildTilingBlocks(TensorPH, State, Plan, CM);
+    }
+  }
+
   if (Plan.getEntry()) {
     // Collect and execute all blocks in top-level construction order.
     // TPRegionBlock::execute() recurses into its interior.
     for (TPBlockBase *B : constructionOrder(Plan.getEntry()))
       B->execute(State);
   }
+
+  // Clean up pre-built tiling info if allocated.
+  delete static_cast<PrebuiltTilingInfo *>(State.PrebuiltTilingPtr);
+
   return true;
 }
