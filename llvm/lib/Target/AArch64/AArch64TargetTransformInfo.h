@@ -564,6 +564,11 @@ public:
   bool enableAggressiveInterleaving(bool) const override {
     return ST->enableAggressiveInterleaving();
   }
+
+  std::optional<TensorContractTileInfo>
+  getTensorContractTileInfo(Type *ElemTy, unsigned RankA, unsigned RankB,
+                            unsigned RankC) const override;
+
   /// @}
 };
 
