@@ -469,20 +469,35 @@ static TilingLoopInfo emitTilingLoop(IRBuilder<> &B, Value *TripCount,
 ///   - TC constant, RealTC <= PF    → skip (Inline, not added).
 ///   - TC constant, RealTC >  PF    → StaticTiled.
 ///   - TC dynamic, output dim       → StaticTiled (umin-bounded tiling loop).
-///   - TC dynamic, reduction dim    → DynamicTiled (fixed-tile body loop).
+///   - TC dynamic, contraction dim  → DynamicTiled (fixed-tile body loop).
 ///
-/// "Output" vs. "reduction" is determined by Plan.getReductionDims() — no
-/// hard-coding of specific dim indices or tensor operation types.
+/// Contraction dims are identified from \p CM (RecipeClassMap), which gives
+/// the authoritative per-recipe ContractDim from pattern matching. This is
+/// more reliable than Plan.getReductionDims(), which uses loop-nest analysis
+/// that may misclassify dims with combined GEP indices (e.g. C[i+j]).
 ///
-/// For DynamicTiled dims the PF stored in the Policy is the Plan PF (from
-/// Plan.getPFForDim()). emitContraction() may query TTI at recipe time to
-/// refine the actual tile size used inside the tensor.body loop; the Policy
-/// PF is used as the guard threshold in createTensorizedLoopSkeleton().
+/// For DynamicTiled dims the PF in the Policy comes from Plan.getPFForDim().
+/// emitContraction() may refine via TTI at recipe time (when ElemTy/ranks
+/// are known). The Policy PF is used as the guard threshold in
+/// createTensorizedLoopSkeleton().
 static EmissionPolicy
 buildEmissionPolicy(const TPlan &Plan,
-                    const DenseMap<unsigned, Loop *> &DimToLoop) {
+                    const DenseMap<unsigned, Loop *> &DimToLoop,
+                    const RecipeClassMap &CM) {
+  // Collect contraction dims from all contraction recipes in the ClassMap.
+  // A dim with a dynamic TC is DynamicTiled iff it appears as a ContractDim
+  // in at least one contraction recipe.
+  SmallBitVector ContractionDims;
+  for (const auto &[R, Info] : CM) {
+    if (Info.Kind != TensorOpKind::Contraction || Info.ContractDim < 0)
+      continue;
+    unsigned CD = static_cast<unsigned>(Info.ContractDim);
+    if (CD >= ContractionDims.size())
+      ContractionDims.resize(CD + 1, false);
+    ContractionDims.set(CD);
+  }
+
   EmissionPolicy Policy;
-  const SmallBitVector &ReductionDims = Plan.getReductionDims();
 
   for (const auto &[D, _] : DimToLoop) {
     const SCEV *BTC = Plan.getTCForDim(D);
@@ -498,15 +513,15 @@ buildEmissionPolicy(const TPlan &Plan,
       Policy.Specs.push_back({D, PF, DimEmitMode::StaticTiled});
     } else {
       // Dynamic TC.
-      bool IsReduction = D < ReductionDims.size() && ReductionDims.test(D);
-      if (!IsReduction) {
+      bool IsContraction = D < ContractionDims.size() && ContractionDims.test(D);
+      if (!IsContraction) {
         // Output dim with runtime TC: use umin-bounded static tiling so the
         // tiling loop remains well-formed regardless of the runtime value.
         if (PF == 0)
           continue;
         Policy.Specs.push_back({D, PF, DimEmitMode::StaticTiled});
       } else {
-        // Reduction dim with runtime TC: emit fixed-tile tensor.body loop.
+        // Contraction dim with runtime TC: emit fixed-tile tensor.body loop.
         // Use Plan PF as the tile size; emitContraction() may refine via TTI.
         if (PF == 0)
           continue;
@@ -698,71 +713,57 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     return I64(State.Plan.getDenseStrideForDim(Dim));
   };
 
-  // --- Tiling decision ---
-  // Collect dimensions where real TripCount > PF (needs tiling loops).
-  // getTCForDim() stores backedge-taken count (BTC); real TC = BTC+1.
+  // --- Tiling decision (from EmissionPolicy built upfront in lower()) ---
+  // Translate Policy specs into per-dim tiling info, filtering to the dims
+  // that are actually in this contraction (OutputDimSet ∪ {ContractDim}).
+  // Policy classifies dims without GEMM/K-specific knowledge; we filter here
+  // to the dims relevant to this particular tensor operation.
+  //
+  // TileDimInfo carries the BTCSCEV needed for runtime SCEV expansion inside
+  // emitContraction() — the Policy stores mode/PF but not the SCEV itself.
   struct TileDimInfo {
-    unsigned     Dim;     // DimIdx (innermost=0)
-    unsigned     PF;      // tile size: PF for static; PrimaryK from TTI for dynamic
-    const SCEV  *BTCSCEV; // Backedge-taken count SCEV for runtime expansion
-    bool         IsDynamic = false; // true → TC is a runtime value
+    unsigned    Dim;
+    unsigned    PF;      // tile size for this dim's tiling loop
+    const SCEV *BTCSCEV; // backedge-taken count; real TC = BTCSCEV + 1
+    bool        IsDynamic = false; // true → DynamicTiled mode
   };
-  SmallVector<TileDimInfo, 4> TiledDims;
+  SmallVector<TileDimInfo, 4> StaticTiledDims, DynamicTiledDims;
 
-  auto checkDim = [&](unsigned D) {
+  auto addDimFromPolicy = [&](unsigned D) {
+    const DimEmissionSpec *Spec = State.Policy.getSpec(D);
+    if (!Spec || Spec->Mode == DimEmitMode::Inline)
+      return;
     const SCEV *BTC = State.Plan.getTCForDim(D);
     if (!BTC)
-      return; // Unknown TC — skip tiling for this dim.
-    unsigned PF = State.Plan.getPFForDim(D);
-    if (auto *C = dyn_cast<SCEVConstant>(BTC)) {
-      uint64_t RealTC = C->getValue()->getZExtValue() + 1;
-      if (RealTC > static_cast<uint64_t>(PF))
-        TiledDims.push_back({D, PF, BTC, /*IsDynamic=*/false});
-    } else {
-      // Dynamic TC path.
-      if (D != static_cast<unsigned>(ContractDim)) {
-        // Output dims (M, N) with dynamic TC: use static tiling with umin so
-        // the tiling loop stays well-formed regardless of TC. IsDynamic=false
-        // routes them through emitTilingLoop() (Option A), not tensor.body.
-        if (PF == 0)
-          return; // no usable PF, skip
-        TiledDims.push_back({D, PF, BTC, /*IsDynamic=*/false});
-        return;
-      }
-      // Contraction dim (K) with dynamic TC → tensor.body / epilogue path.
-      // Query TTI for primary tile size; fall back to CLI PF.
-      unsigned DynPF = 0;
-      if (State.TTI) {
-        auto TileInfo = State.TTI->getTensorContractTileInfo(
-            ElemTy, RankA, RankB, RankC);
-        if (TileInfo && TileInfo->PrimaryK > 0)
-          DynPF = TileInfo->PrimaryK;
-      }
-      if (DynPF == 0)
-        DynPF = PF; // CLI override / default PF as fallback
-      if (DynPF == 0)
-        return; // no usable PF, skip
-      LLVM_DEBUG(dbgs() << "TPlanLowering: dynamic TC dim " << D
-                        << " → tensor.body PrimaryPF=" << DynPF << "\n");
-      TiledDims.push_back({D, DynPF, BTC, /*IsDynamic=*/true});
+      return;
+    // For DynamicTiled reduction dims, emitContraction() may refine the tile
+    // size using TTI (which knows ElemTy and ranks, unavailable at Policy
+    // build time). Apply the TTI override here if available.
+    unsigned TilePF = Spec->PF;
+    if (Spec->Mode == DimEmitMode::DynamicTiled && State.TTI) {
+      auto TileInfo =
+          State.TTI->getTensorContractTileInfo(ElemTy, RankA, RankB, RankC);
+      if (TileInfo && TileInfo->PrimaryK > 0)
+        TilePF = TileInfo->PrimaryK;
     }
+    if (TilePF == 0)
+      return;
+    bool IsDyn = (Spec->Mode == DimEmitMode::DynamicTiled);
+    LLVM_DEBUG(dbgs() << "TPlanLowering: dim " << D << " mode="
+                      << (IsDyn ? "DynamicTiled" : "StaticTiled")
+                      << " PF=" << TilePF << "\n");
+    if (IsDyn)
+      DynamicTiledDims.push_back({D, TilePF, BTC, true});
+    else
+      StaticTiledDims.push_back({D, TilePF, BTC, false});
   };
 
   for (int D = OutputDimSet.find_first(); D >= 0;
        D = OutputDimSet.find_next(D))
-    checkDim(static_cast<unsigned>(D));
-  checkDim(static_cast<unsigned>(ContractDim));
+    addDimFromPolicy(static_cast<unsigned>(D));
+  addDimFromPolicy(static_cast<unsigned>(ContractDim));
 
-  bool NeedsTiling = !TiledDims.empty();
-
-  // Separate static-TC dims from dynamic-TC dims.
-  SmallVector<TileDimInfo, 4> StaticTiledDims, DynamicTiledDims;
-  for (auto &TD : TiledDims) {
-    if (TD.IsDynamic)
-      DynamicTiledDims.push_back(TD);
-    else
-      StaticTiledDims.push_back(TD);
-  }
+  bool NeedsTiling        = !StaticTiledDims.empty() || !DynamicTiledDims.empty();
   bool NeedsStaticTiling  = !StaticTiledDims.empty();
   bool NeedsDynamicTiling = !DynamicTiledDims.empty();
 
@@ -823,9 +824,10 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     Value *BStr;
     Value *CStr;
   };
-  // Cache strides for tiled dims (used in STEP C pointer offsets).
+  // Cache strides for static-tiled dims (indexed parallel to StaticTiledDims;
+  // used in STEP C pointer offset calculations).
   SmallVector<DimStrideCache, 4> TiledStrides;
-  for (auto &TD : TiledDims)
+  for (auto &TD : StaticTiledDims)
     TiledStrides.push_back({getAStride(TD.Dim), getBStride(TD.Dim),
                              getCStride(TD.Dim)});
   // Cache strides for output dims and contract dim (used in STEP D args).
@@ -1735,7 +1737,7 @@ bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
   // Build the EmissionPolicy upfront — before execute() — so that both the
   // skeleton guard insertion and emitContraction() share the same dim
   // classification derived from TPlan's PF/TC data.
-  State.Policy = buildEmissionPolicy(Plan, State.DimToLoop);
+  State.Policy = buildEmissionPolicy(Plan, State.DimToLoop, CM);
   LLVM_DEBUG({
     dbgs() << "TPlanLowering: EmissionPolicy (" << State.Policy.Specs.size()
            << " specs):\n";
