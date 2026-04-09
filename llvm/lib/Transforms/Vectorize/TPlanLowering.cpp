@@ -663,10 +663,17 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
       if (RealTC > static_cast<uint64_t>(PF))
         TiledDims.push_back({D, PF, BTC, /*IsDynamic=*/false});
     } else {
-      // Dynamic TC: only support dynamic tiling for the contraction dim (K).
-      // Output dims (M, N) with dynamic TCs are not yet supported; skip them.
-      if (D != static_cast<unsigned>(ContractDim))
+      // Dynamic TC path.
+      if (D != static_cast<unsigned>(ContractDim)) {
+        // Output dims (M, N) with dynamic TC: use static tiling with umin so
+        // the tiling loop stays well-formed regardless of TC. IsDynamic=false
+        // routes them through emitTilingLoop() (Option A), not tensor.body.
+        if (PF == 0)
+          return; // no usable PF, skip
+        TiledDims.push_back({D, PF, BTC, /*IsDynamic=*/false});
         return;
+      }
+      // Contraction dim (K) with dynamic TC → tensor.body / epilogue path.
       // Query TTI for primary tile size; fall back to CLI PF.
       unsigned DynPF = 0;
       if (State.TTI) {
