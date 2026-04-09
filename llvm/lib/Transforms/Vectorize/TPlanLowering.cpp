@@ -1652,6 +1652,8 @@ bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
   State.SE = &SE;
   State.Expander = &Expander;
   State.TTI = TTI;
+  State.LI = &LI;
+  State.DT = &DT;
   // Build DimToLoop for use in decomposePtrForDims().
   State.DimToLoop = buildDimToLoopForLowering(Plan, LI);
 

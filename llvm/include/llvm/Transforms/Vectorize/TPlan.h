@@ -1431,6 +1431,12 @@ struct TPTransformState {
   /// Available for dynamic-TC tiling queries in emitContraction().
   /// Null when no TTI is provided (e.g. unit tests).
   const TargetTransformInfo *TTI = nullptr;
+  /// Set by TPlanLowering_lower() before execute() loop. Required by
+  /// createTensorizedLoopSkeleton() to update loop nest structure.
+  LoopInfo *LI = nullptr;
+  /// Set by TPlanLowering_lower() before execute() loop. Required by
+  /// createTensorizedLoopSkeleton() to maintain dominator tree correctness.
+  DominatorTree *DT = nullptr;
 
   /// Tracks which IR instructions (the fadd/reduction-update) have already been
   /// lowered to tensor.contract calls (possibly with tiling loops). Depth-3 GEMMs
