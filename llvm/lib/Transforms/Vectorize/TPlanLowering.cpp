@@ -1062,6 +1062,18 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     }
 
     // STEP F': Scalar block for final remainder.
+    //
+    // Invariant: scalar.block iterates the contraction dim (K) only, one
+    // element at a time. It does NOT iterate M or N. This is correct because
+    // M and N are bounded by the outer GEMM loops that enclose emitContraction;
+    // each call to emitContraction() operates on a single M×N tile, so C, A,
+    // and B pointers are already advanced to the correct row/column. If an
+    // output dim had been routed into DynamicTiledDims, the scalar.block would
+    // silently compute the wrong result — hence the assertion below.
+    assert(DynamicTiledDims.size() == 1 &&
+           DynamicTiledDims[0].Dim == static_cast<unsigned>(ContractDim) &&
+           "scalar.block assumes exactly one dynamic-TC dim and it must be the "
+           "contraction dim (K). Route M/N dynamic-TC dims to StaticTiledDims.");
     Value *ScRem = B.CreateSub(TcVal, EpiStart, "scalar.rem");
     Value *HasSc = B.CreateICmpUGT(ScRem, B.getInt64(0), "scalar.guard");
 
