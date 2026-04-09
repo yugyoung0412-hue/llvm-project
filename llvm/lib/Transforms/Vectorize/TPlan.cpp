@@ -848,13 +848,15 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
       unsigned ChildLevel = Level - 1;
       std::string ChildStr = std::to_string(ChildLevel);
       auto *InnerPH = P.createTPBasicBlock("tensor.ph" + ChildStr);
-      auto *Child = BuildRegion(Idx + 1);
-      auto *MiddleBB = P.createTPBasicBlock("middle.block" + ChildStr);
-      BasicBlock *ExitBB = AllLoops[Idx + 1]->getExitBlock();
-      auto *CleanupBB = ExitBB ? P.createTPIRBasicBlock(ExitBB) : nullptr;
-      auto *ScalarPH = P.createTPBasicBlock("scalar.ph" + ChildStr);
 
-      // Emit body blocks (not header, not latch, not in inner loops) to InnerPH.
+      // Emit outer body blocks BEFORE recursing into the inner region so that
+      // any values computed between the outer loop header and the inner loop
+      // preheader (e.g. A's row GEP in ggml-style GEMM: %a.row = gep %A,
+      // %i*K, in an i.body block between i.loop header and j.loop) are in
+      // ValueMap when BuildRegion processes inner-loop GEP recipes.
+      // Without this ordering those GEPs fall back to ir<> live-ins (DimSet={})
+      // and BFS never propagates the outer-dim bit.
+      //
       // Pin InnerPH to the outer loop header so that its clones are inserted
       // at a block that dominates all inner content.  This is required because
       // InnerPH is visited in intraRegionOrder AFTER tensor.latch (which
@@ -868,6 +870,12 @@ TPlan TPlan::buildInitial(const LoopNestInfo &Info) {
         if (InnerLoop->contains(BB)) continue;
         EmitBlock(BB, InnerPH);
       }
+
+      auto *Child = BuildRegion(Idx + 1);
+      auto *MiddleBB = P.createTPBasicBlock("middle.block" + ChildStr);
+      BasicBlock *ExitBB = AllLoops[Idx + 1]->getExitBlock();
+      auto *CleanupBB = ExitBB ? P.createTPIRBasicBlock(ExitBB) : nullptr;
+      auto *ScalarPH = P.createTPBasicBlock("scalar.ph" + ChildStr);
 
       // Wire intra-region CFG.
       // Note: setParent() calls happen after wiring so connectBlocks asserts
