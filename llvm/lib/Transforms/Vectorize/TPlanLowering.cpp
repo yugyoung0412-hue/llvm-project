@@ -333,6 +333,7 @@ struct FixedCountLoopInfo {
   BasicBlock *LatchBB;     ///< IV += TileSize, br Header.
   BasicBlock *ExitBB;      ///< Fall-through after main_limit reached.
   PHINode    *IV;          ///< i64 induction: 0, PF, 2*PF, ...
+  PHINode    *ExitIV;      ///< PHI in ExitBB: 0 (no-tiles) or end-of-last-tile.
 };
 
 /// Emits a fixed-tile counting loop for Option B dynamic tiling:
@@ -360,8 +361,8 @@ static FixedCountLoopInfo emitFixedCountingLoop(IRBuilder<> &B,
   Value *MainTrips = B.CreateUDiv(TcVal, PF, Name + ".trips");
   Value *MainLimit = B.CreateMul(MainTrips, PF, Name + ".limit");
 
-  // Guard: skip the loop entirely if TC <= PF.
-  Value *HasTiles = B.CreateICmpUGT(TcVal, PF, Name + ".guard");
+  // Guard: skip the loop entirely if TC < PF (TC==PF means exactly one tile).
+  Value *HasTiles = B.CreateICmpUGE(TcVal, PF, Name + ".guard");
 
   BasicBlock *PreBB  = B.GetInsertBlock();
   BasicBlock *HdrBB  = BasicBlock::Create(Ctx, Name + ".header", F);
@@ -396,7 +397,7 @@ static FixedCountLoopInfo emitFixedCountingLoop(IRBuilder<> &B,
   // Restore insert point to body.
   B.SetInsertPoint(BodyBB);
 
-  return FixedCountLoopInfo{LchBB, ExitBB, IV};
+  return FixedCountLoopInfo{LchBB, ExitBB, IV, ExitIV};
 }
 
 /// Describes the structure of one tiling loop emitted by emitTilingLoop().
@@ -810,19 +811,19 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     // STEP A: Expand ALL TripCount SCEVs to Value* BEFORE creating any
     // loop BBs. This keeps expansion code in the current preheader BB,
     // not inside a loop body (which would cause dominance violations).
-    SmallVector<Value *> TCValues; // parallel to TiledDims
-    for (auto &TD : TiledDims) {
+    SmallVector<Value *> TCValues; // parallel to StaticTiledDims
+    for (auto &TD : StaticTiledDims) {
       Value *BTC = State.Expander->expandCodeFor(
           TD.BTCSCEV, B.getInt64Ty(), &*B.GetInsertPoint());
       TCValues.push_back(B.CreateAdd(BTC, B.getInt64(1), "tc.real"));
     }
 
-    // STEP B: Emit tiling loops (outermost first = TiledDims order).
+    // STEP B: Emit tiling loops (outermost first = StaticTiledDims order).
     // Each call nests inside the previous loop's body.
     SmallVector<TilingLoopInfo, 4> LoopInfos;
-    for (unsigned I = 0; I < TiledDims.size(); ++I) {
-      std::string Name = (Twine("tile.d") + Twine(TiledDims[I].Dim)).str();
-      Value *TileSize  = B.getInt64(TiledDims[I].PF);
+    for (unsigned I = 0; I < StaticTiledDims.size(); ++I) {
+      std::string Name = (Twine("tile.d") + Twine(StaticTiledDims[I].Dim)).str();
+      Value *TileSize  = B.getInt64(StaticTiledDims[I].PF);
       LoopInfos.push_back(emitTilingLoop(B, TCValues[I], TileSize, Name));
       // B's insertion point is now in loop I's body BB.
     }
@@ -846,8 +847,8 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     // For each tiled dim: tile_ptr = base_ptr + IV * stride (GEP in elements).
     Value *TiledCPtr = CPtr, *TiledAPtr = LHSPtr, *TiledBPtr = RHSPtr;
     DenseMap<unsigned, Value *> ActualSizes; // dim → min(PF, TC-IV)
-    for (unsigned I = 0; I < TiledDims.size(); ++I) {
-      unsigned Dim     = TiledDims[I].Dim;
+    for (unsigned I = 0; I < StaticTiledDims.size(); ++I) {
+      unsigned Dim     = StaticTiledDims[I].Dim;
       Value   *IV      = LoopInfos[I].IV;
       ActualSizes[Dim] = LoopInfos[I].ActualSize;
 
@@ -908,7 +909,11 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     // ----------------------------------------------------------------
 
     // Support exactly one dynamic dim (the contraction dim K) for now.
-    assert(DynamicTiledDims.size() == 1 && "only single dynamic dim supported");
+    if (DynamicTiledDims.size() != 1) {
+      LLVM_DEBUG(dbgs() << "TPlanLowering: expected 1 dynamic dim, got "
+                        << DynamicTiledDims.size() << "; skipping\n");
+      return nullptr;
+    }
     const TileDimInfo &DD = DynamicTiledDims[0];
     unsigned PrimaryPF = DD.PF;
 
@@ -926,16 +931,12 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
         DD.BTCSCEV, B.getInt64Ty(), &*B.GetInsertPoint());
     Value *TcVal = B.CreateAdd(BTCVal, B.getInt64(1), "k.tc");
 
-    // Pre-cache strides while still in the preheader.
-    Value *CachedAK = getAStride(static_cast<unsigned>(ContractDim));
-    Value *CachedBK = getBStride(static_cast<unsigned>(ContractDim));
-
     // STEP B': Erase OrigTerm and PHI self-edges (same as static path).
     // Note: B is already positioned before OrigTerm from the earlier
     // B.SetInsertPoint(OrigTerm) call. After erasing, we must reset B.
     OrigTerm->eraseFromParent();
     // Reset B to the end of the (now-unterminated) preheader block.
-    B.SetInsertPoint(LoopHeaderBB);
+    B.SetInsertPoint(LoopHeaderBB, LoopHeaderBB->end());
     if (LoopHeaderBB) {
       for (PHINode &Phi : LoopHeaderBB->phis()) {
         int Idx = Phi.getBasicBlockIndex(LoopHeaderBB);
@@ -949,9 +950,9 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
         emitFixedCountingLoop(B, TcVal, PrimaryPF, "tensor.body");
 
     // STEP C': Pointer offsets in the tensor.body body (B is in body BB).
-    Value *AOffMain = B.CreateMul(MainLoop.IV, CachedAK, "tensor.body.a.off");
+    Value *AOffMain = B.CreateMul(MainLoop.IV, CachedAContractStride, "tensor.body.a.off");
     Value *AMainPtr = B.CreateGEP(ElemTy, LHSPtr, AOffMain, "tensor.body.a.ptr");
-    Value *BOffMain = B.CreateMul(MainLoop.IV, CachedBK, "tensor.body.b.off");
+    Value *BOffMain = B.CreateMul(MainLoop.IV, CachedBContractStride, "tensor.body.b.off");
     Value *BMainPtr = B.CreateGEP(ElemTy, RHSPtr, BOffMain, "tensor.body.b.ptr");
 
     // STEP D': tensor.contract with fixed PrimaryPF as K dim.
@@ -961,10 +962,10 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
       for (auto &S : OutputStrides) Args.push_back(S.CStr);
       Args.push_back(AMainPtr);
       for (auto &S : OutputStrides) Args.push_back(S.AStr);
-      Args.push_back(CachedAK);
+      Args.push_back(CachedAContractStride);
       Args.push_back(BMainPtr);
       for (auto &S : OutputStrides) Args.push_back(S.BStr);
-      Args.push_back(CachedBK);
+      Args.push_back(CachedBContractStride);
       Args.push_back(B.getInt64(PrimaryPF)); // K = fixed PrimaryPF
       for (int D = OutputDimSet.find_first(); D >= 0;
            D = OutputDimSet.find_next(D))
@@ -976,13 +977,13 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     B.CreateBr(MainLoop.LatchBB);
     B.SetInsertPoint(MainLoop.ExitBB);
 
-    // Retrieve epi_start: first PHI of ExitBB holds main_limit (or 0).
-    Value *EpiStart = &MainLoop.ExitBB->front();
+    // Retrieve epi_start: ExitIV PHI holds main_limit (or 0 if no tiles ran).
+    Value *EpiStart = MainLoop.ExitIV;
 
     // STEP E': Epilogue tensor tiers (one per EpiPFs entry, often empty).
     for (unsigned EpiPF : EpiPFs) {
       Value *RemVal = B.CreateSub(TcVal, EpiStart, "epi.rem");
-      Value *HasEpi = B.CreateICmpUGT(RemVal, B.getInt64(EpiPF), "epi.guard");
+      Value *HasEpi = B.CreateICmpUGE(RemVal, B.getInt64(EpiPF), "epi.guard");
 
       BasicBlock *EpiPHBB  = B.GetInsertBlock();
       BasicBlock *EpiHdrBB = BasicBlock::Create(
@@ -1018,9 +1019,9 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
       B.CreateCondBr(EDone, EpiExitBB, EpiBodyBB);
 
       B.SetInsertPoint(EpiBodyBB);
-      Value *EAOff = B.CreateMul(EIV, CachedAK, "epi.a.off");
+      Value *EAOff = B.CreateMul(EIV, CachedAContractStride, "epi.a.off");
       Value *EAPtr = B.CreateGEP(ElemTy, LHSPtr, EAOff, "epi.a.ptr");
-      Value *EBOff = B.CreateMul(EIV, CachedBK, "epi.b.off");
+      Value *EBOff = B.CreateMul(EIV, CachedBContractStride, "epi.b.off");
       Value *EBPtr = B.CreateGEP(ElemTy, RHSPtr, EBOff, "epi.b.ptr");
       {
         SmallVector<Value *> Args;
@@ -1028,10 +1029,10 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
         for (auto &S : OutputStrides) Args.push_back(S.CStr);
         Args.push_back(EAPtr);
         for (auto &S : OutputStrides) Args.push_back(S.AStr);
-        Args.push_back(CachedAK);
+        Args.push_back(CachedAContractStride);
         Args.push_back(EBPtr);
         for (auto &S : OutputStrides) Args.push_back(S.BStr);
-        Args.push_back(CachedBK);
+        Args.push_back(CachedBContractStride);
         Args.push_back(B.getInt64(EpiPF));
         for (int D = OutputDimSet.find_first(); D >= 0;
              D = OutputDimSet.find_next(D))
@@ -1070,10 +1071,10 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     ScIV->addIncoming(EpiStart, ScPHBB);
 
     Value *CVal = B.CreateLoad(ElemTy, CPtr, "scalar.c");
-    Value *SAOff = B.CreateMul(ScIV, CachedAK, "scalar.a.off");
+    Value *SAOff = B.CreateMul(ScIV, CachedAContractStride, "scalar.a.off");
     Value *SAPtr = B.CreateGEP(ElemTy, LHSPtr, SAOff, "scalar.a.ptr");
     Value *SAVal = B.CreateLoad(ElemTy, SAPtr, "scalar.a");
-    Value *SBOff = B.CreateMul(ScIV, CachedBK, "scalar.b.off");
+    Value *SBOff = B.CreateMul(ScIV, CachedBContractStride, "scalar.b.off");
     Value *SBPtr = B.CreateGEP(ElemTy, RHSPtr, SBOff, "scalar.b.ptr");
     Value *SBVal = B.CreateLoad(ElemTy, SBPtr, "scalar.b");
     Value *SProd = B.CreateFMul(SAVal, SBVal, "scalar.mul");
