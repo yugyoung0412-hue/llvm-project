@@ -574,8 +574,9 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   // getTCForDim() stores backedge-taken count (BTC); real TC = BTC+1.
   struct TileDimInfo {
     unsigned     Dim;     // DimIdx (innermost=0)
-    unsigned     PF;      // Tile size
+    unsigned     PF;      // tile size: PF for static; PrimaryK from TTI for dynamic
     const SCEV  *BTCSCEV; // Backedge-taken count SCEV for runtime expansion
+    bool         IsDynamic = false; // true → TC is a runtime value
   };
   SmallVector<TileDimInfo, 4> TiledDims;
 
@@ -587,13 +588,21 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     if (auto *C = dyn_cast<SCEVConstant>(BTC)) {
       uint64_t RealTC = C->getValue()->getZExtValue() + 1;
       if (RealTC > static_cast<uint64_t>(PF))
-        TiledDims.push_back({D, PF, BTC});
+        TiledDims.push_back({D, PF, BTC, /*IsDynamic=*/false});
     } else {
-      // Dynamic TC: cannot determine at compile time whether TC > PF.
-      // Skip tiling; fall through to single-call fast path.
-      // (Dynamic tiling would require runtime comparison, not yet implemented.)
-      LLVM_DEBUG(dbgs() << "TPlanLowering: skipping tiling for dim " << D
-                        << " (dynamic TC)\n");
+      // Dynamic TC: query TTI for the hardware primary tile size.
+      // If TTI reports a valid PrimaryK, enqueue for dynamic Option-B tiling.
+      // Otherwise skip (single-call fast path as before).
+      if (!State.TTI)
+        return;
+      auto TileInfo = State.TTI->getTensorContractTileInfo(
+          ElemTy, RankA, RankB, RankC);
+      if (!TileInfo || TileInfo->PrimaryK == 0)
+        return;
+      LLVM_DEBUG(dbgs() << "TPlanLowering: dynamic TC dim " << D
+                        << " → tensor.body PrimaryK=" << TileInfo->PrimaryK
+                        << "\n");
+      TiledDims.push_back({D, TileInfo->PrimaryK, BTC, /*IsDynamic=*/true});
     }
   };
 
