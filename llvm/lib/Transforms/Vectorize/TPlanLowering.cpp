@@ -17,6 +17,7 @@
 
 #include "llvm/Transforms/Vectorize/TPlan.h"
 #include "llvm/Transforms/Vectorize/TPlanAnalysis.h"
+#include "llvm/Transforms/Vectorize/TPlanSkeleton.h"
 #include "llvm/Transforms/Vectorize/TPRecipeMatcher.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -931,6 +932,57 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
           ElemTy, RankA, RankB, RankC);
       if (TileInfo)
         EpiPFs = SmallVector<unsigned, 4>(TileInfo->EpilogueKSizes);
+    }
+
+    // STEP 0': Optionally hoist a profitability guard before the outermost
+    // GEMM loop. This mirrors VPlan's createVectorizedLoopSkeleton(): the
+    // guard fires ONCE before M iterations, not M×N times inside the K body.
+    //
+    // Preconditions (all must hold; we silently skip otherwise):
+    //   - State.LI/DT must be available (set by TPlanLowering_lower).
+    //   - OutermostGEMMLoop must be found (non-null).
+    //   - OutermostGEMMLoop must have a unique preheader with one predecessor.
+    //   - The K TC SCEV must be safely expandable before the outer preheader.
+    //   - OutermostGEMMLoop must have a single exit block.
+    {
+      ValueToValueMapTy SkelVMap;
+      BasicBlock *OuterPH =
+          OutermostGEMMLoop ? OutermostGEMMLoop->getLoopPreheader() : nullptr;
+      BasicBlock *OuterPred = OuterPH ? OuterPH->getSinglePredecessor() : nullptr;
+      LLVM_DEBUG(dbgs() << "TPlanLowering: skeleton check: LI=" << !!State.LI
+                        << " DT=" << !!State.DT
+                        << " OutermostGEMMLoop=" << (OutermostGEMMLoop ? OutermostGEMMLoop->getName() : "(null)")
+                        << " OuterPH=" << (OuterPH ? OuterPH->getName() : "(null)")
+                        << " OuterPred=" << (OuterPred ? OuterPred->getName() : "(null)")
+                        << " ExitBlock=" << (OutermostGEMMLoop && OutermostGEMMLoop->getExitBlock() ? OutermostGEMMLoop->getExitBlock()->getName() : "(null)")
+                        << "\n");
+      if (State.LI && State.DT && OuterPred &&
+          OutermostGEMMLoop->getExitBlock()) {
+        // Expand the K trip-count SCEV in OrigPred so it dominates GuardBB.
+        // (OrigPred is the immediate predecessor of OuterPH; GuardBB will be
+        // inserted between them by createTensorizedLoopSkeleton.)
+        Instruction *ExpandAt = OuterPred->getTerminator();
+        // Expand K TC SCEV in OrigPred so the guard value dominates GuardBB.
+        // expandCodeFor() handles loop-invariant SCEVs regardless of the
+        // isSafeToExpand predicate; use it unconditionally since the BTC SCEV
+        // for the K loop (a linear function of the trip count argument) is
+        // always representable as simple arithmetic.
+        Value *GuardBTC = State.Expander->expandCodeFor(
+            DD.BTCSCEV, B.getInt64Ty(), ExpandAt);
+        IRBuilder<> PredB(ExpandAt);
+        Value *GuardTC = PredB.CreateAdd(GuardBTC, PredB.getInt64(1),
+                                         "k.tc.guard");
+        TensorizedLoopSkeleton Skel = createTensorizedLoopSkeleton(
+            OutermostGEMMLoop, GuardTC, PrimaryPF, *State.LI, *State.DT,
+            SkelVMap);
+        if (Skel.Valid) {
+          LLVM_DEBUG(dbgs() << "TPlanLowering: skeleton guard inserted "
+                               "before outermost GEMM loop\n");
+        } else {
+          LLVM_DEBUG(dbgs() << "TPlanLowering: skeleton creation failed; "
+                               "proceeding without guard\n");
+        }
+      }
     }
 
     // STEP A': Expand runtime TC for the dynamic dim.
