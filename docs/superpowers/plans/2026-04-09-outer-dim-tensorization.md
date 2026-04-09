@@ -351,6 +351,9 @@ struct PrebuiltTilingInfo {
   Optional<FixedCountLoopInfo>    DynamicLoop;
   /// Innermost body BB — where tensor.contract is emitted.
   BasicBlock                     *BodyBB    = nullptr;
+  /// Floating preheader block used during pre-build; replaced by LoopHeaderBB
+  /// and erased in emitContraction(). Its only instruction is br FirstHeader.
+  BasicBlock                     *AnchorBB  = nullptr;
   /// Expanded TC value* parallel to StaticLoops (i64).
   SmallVector<Value *, 4>         TCValues;
   /// PF parallel to StaticLoops (used for ActualSize arg).
@@ -360,6 +363,8 @@ struct PrebuiltTilingInfo {
   /// Dynamic loop dim index and PF (for K pointer offset).
   unsigned                        DynDim = 0;
   unsigned                        DynPF  = 0;
+  /// Expanded real trip-count for the dynamic dim (needed for scalar.block).
+  Value                          *DynTCVal = nullptr;
 
   ~PrebuiltTilingInfo() = default;
 };
@@ -371,20 +376,34 @@ Add this function before `TPlanLowering_lower()` (around line 1725):
 
 ```cpp
 /// Scans the ClassMap for Contraction recipes, determines OutputDimSet and
-/// ContractDim, then builds tiling loop block skeletons for all non-Inline
-/// Policy dims BEFORE execute(). On success, allocates a PrebuiltTilingInfo
-/// and stores it in State.PrebuiltTilingPtr.
+/// ContractDim, then builds FLOATING tiling loop block skeletons for all
+/// non-Inline Policy dims BEFORE execute(). On success, allocates a
+/// PrebuiltTilingInfo and stores it in State.PrebuiltTilingPtr.
 ///
-/// \param InsertBB  The block to use as preheader for the outermost tiling
-///                  loop. Must be on the tensor path (after the guard) and
-///                  have no terminator yet (or the caller appends after it).
+/// Design — AnchorBB pattern:
+///   1. SCEV expansion instructions land in InsertBB (TensorPH), BEFORE its
+///      terminator. InsertBB is already in the dominator tree, so these Values
+///      dominate all tiling loop blocks once emitContraction() connects them.
+///   2. A floating AnchorBB (no predecessors yet) is the temporary preheader
+///      for emitTilingLoop / emitFixedCountingLoop. AnchorBB's only instruction
+///      is the br to the first tiling header.
+///   3. In emitContraction(): B.CreateBr(FirstHeader) + replaceIncomingBlockWith
+///      (AnchorBB → LoopHeaderBB) + AnchorBB->eraseFromParent() wires the
+///      pre-built structure into the live CFG.
+///
+/// \param InsertBB  Tensor path preheader (OutermostLoop->getLoopPreheader()).
+///                  Must have a terminator; SCEV expansions are inserted before
+///                  it. The tiling loops themselves go into a separate AnchorBB.
 static void preBuildTilingBlocks(BasicBlock *InsertBB,
                                   TPTransformState &State,
                                   const TPlan &Plan,
-                                  const RecipeClassMap &CM,
-                                  ScalarEvolution &SE) {
+                                  const RecipeClassMap &CM) {
   if (!InsertBB)
     return;
+  Instruction *InsertBefore = InsertBB->getTerminator();
+  if (!InsertBefore)
+    return; // InsertBB must be terminated (it still has br OutermostLoop)
+  Function *F = InsertBB->getParent();
 
   // Step A: Find any Contraction recipe to get OutputDimSet + ContractDim.
   int ContractDim = -1;
@@ -393,10 +412,12 @@ static void preBuildTilingBlocks(BasicBlock *InsertBB,
     if (Class.Kind != TensorOpKind::Contraction)
       continue;
     ContractDim = Class.ContractDim;
-    if (auto *FMul = Class.FusedMulRecipe) {
-      if (auto *L = dyn_cast<TPSingleDefRecipe>(FMul->getOperand(0)))
+    if (Class.FusedMulRecipe) {
+      if (auto *L = dyn_cast<TPSingleDefRecipe>(
+              Class.FusedMulRecipe->getOperand(0)))
         LHSBits = L->DimSet;
-      if (auto *R2 = dyn_cast<TPSingleDefRecipe>(FMul->getOperand(1)))
+      if (auto *R2 = dyn_cast<TPSingleDefRecipe>(
+              Class.FusedMulRecipe->getOperand(1)))
         RHSBits = R2->DimSet;
     }
     break; // one contraction per nest for now
@@ -404,57 +425,86 @@ static void preBuildTilingBlocks(BasicBlock *InsertBB,
   if (ContractDim < 0)
     return; // nothing to pre-build
 
-  // Build OutputDimSet = (LHS | RHS) - {ContractDim}.
   unsigned NBits = std::max(LHSBits.size(), RHSBits.size());
+  if (NBits == 0) return;
   LHSBits.resize(NBits); RHSBits.resize(NBits);
   SmallBitVector OutputDimSet = LHSBits;
   OutputDimSet |= RHSBits;
   OutputDimSet.reset(static_cast<unsigned>(ContractDim));
 
-  // Step B: Collect StaticTiled output dims and DynamicTiled contract dim.
-  SCEVExpander Exp(SE, "tplan.prebuild");
-  IRBuilder<> B(InsertBB, InsertBB->end());
+  // Step B: Expand all trip-count SCEVs into InsertBB BEFORE its terminator.
+  // For SCEVConstant / SCEVUnknown (function args), expandCodeFor returns the
+  // constant or the original Value* with no new instructions. For AddRec-
+  // derived BTC (e.g. %K-1 for a loop bound), it emits a sub into InsertBB.
+  // Either way, the result dominates all tiling loop blocks in the final CFG
+  // (InsertBB = TensorPH dominates the entire tensor path).
   auto *Info = new PrebuiltTilingInfo();
+  LLVMContext &Ctx = F->getContext();
+  Type *I64 = Type::getInt64Ty(Ctx);
+  IRBuilder<> PH(InsertBefore); // inserts before InsertBefore (the br)
 
   // Output dims (StaticTiled), outermost first (highest DimIdx first).
   for (int D = static_cast<int>(NBits) - 1; D >= 0; --D) {
     if (!OutputDimSet.test(static_cast<unsigned>(D))) continue;
-    const DimEmissionSpec *Spec = State.Policy.getSpec(static_cast<unsigned>(D));
+    const DimEmissionSpec *Spec =
+        State.Policy.getSpec(static_cast<unsigned>(D));
     if (!Spec || Spec->Mode != DimEmitMode::StaticTiled) continue;
     const SCEV *BTC = Plan.getTCForDim(static_cast<unsigned>(D));
     if (!BTC) continue;
-    Value *BTCVal = Exp.expandCodeFor(BTC, B.getInt64Ty(), &*B.GetInsertPoint());
-    Value *TCVal  = B.CreateAdd(BTCVal, B.getInt64(1), "tc.d" + Twine(D));
-    Value *PFVal  = B.getInt64(Spec->PF);
-    TilingLoopInfo LI = emitTilingLoop(B, TCVal, PFVal,
-                                        "tile.d" + Twine(D));
-    Info->StaticLoops.push_back(LI);
+    Value *BTCVal =
+        State.Expander->expandCodeFor(BTC, I64, InsertBefore);
+    Value *TCVal = PH.CreateAdd(BTCVal, PH.getInt64(1),
+                                "tc.d" + Twine(D));
     Info->TCValues.push_back(TCVal);
     Info->PFs.push_back(Spec->PF);
     Info->Dims.push_back(static_cast<unsigned>(D));
-    // B is now inside the body of this loop; next iteration nests inside.
   }
 
-  // Contract dim (DynamicTiled).
+  // Dynamic contract dim (K).
+  Value *DynTCVal = nullptr;
   {
-    const DimEmissionSpec *Spec = State.Policy.getSpec(
-        static_cast<unsigned>(ContractDim));
+    const DimEmissionSpec *Spec =
+        State.Policy.getSpec(static_cast<unsigned>(ContractDim));
     if (Spec && Spec->Mode == DimEmitMode::DynamicTiled) {
       const SCEV *BTC = Plan.getTCForDim(static_cast<unsigned>(ContractDim));
       if (BTC) {
-        Value *BTCVal = Exp.expandCodeFor(BTC, B.getInt64Ty(),
-                                           &*B.GetInsertPoint());
-        Value *TCVal = B.CreateAdd(BTCVal, B.getInt64(1), "k.tc");
-        unsigned PF = Spec->PF;
-        Info->DynamicLoop = emitFixedCountingLoop(B, TCVal, PF, "tensor.body");
-        Info->DynDim = static_cast<unsigned>(ContractDim);
-        Info->DynPF  = PF;
-        // B is now in tensor.body.body.
+        Value *BTCVal =
+            State.Expander->expandCodeFor(BTC, I64, InsertBefore);
+        DynTCVal = PH.CreateAdd(BTCVal, PH.getInt64(1), "k.tc");
+        Info->DynDim    = static_cast<unsigned>(ContractDim);
+        Info->DynPF     = Spec->PF;
+        Info->DynTCVal  = DynTCVal;
       }
     }
   }
 
-  Info->BodyBB = B.GetInsertBlock();
+  // Step C: Build floating tiling loop skeletons from a temporary AnchorBB.
+  // AnchorBB has no predecessors. Its only instruction will be the br to the
+  // first tiling header, created by emitTilingLoop(). In emitContraction(),
+  // LoopHeaderBB's new br replaces this edge and AnchorBB is deleted.
+  BasicBlock *AnchorBB = BasicBlock::Create(Ctx, "tiling.anchor", F);
+  Info->AnchorBB = AnchorBB;
+  IRBuilder<> TileB(AnchorBB);
+
+  // Static loops — outermost first (Dims list is already highest-D-first).
+  for (unsigned I = 0; I < Info->Dims.size(); ++I) {
+    std::string Name = (Twine("tile.d") + Twine(Info->Dims[I])).str();
+    Value *TileSize  = TileB.getInt64(Info->PFs[I]);
+    TilingLoopInfo LI =
+        emitTilingLoop(TileB, Info->TCValues[I], TileSize, Name);
+    Info->StaticLoops.push_back(LI);
+    // TileB is now in LI's body BB; next iteration nests inside.
+  }
+
+  // Dynamic loop (K), if applicable.
+  if (DynTCVal) {
+    FixedCountLoopInfo FCI =
+        emitFixedCountingLoop(TileB, DynTCVal, Info->DynPF, "tensor.body");
+    Info->DynamicLoop = FCI;
+    // TileB is now in tensor.body.body.
+  }
+
+  Info->BodyBB = TileB.GetInsertBlock();
   State.PrebuiltTilingPtr = Info;
 }
 ```
@@ -464,12 +514,12 @@ static void preBuildTilingBlocks(BasicBlock *InsertBB,
 In `TPlanLowering_lower()`, after the existing `createTensorizedLoopSkeleton()` block (lines 1756–1810) and before the `execute()` loop (line 1813), add:
 
 ```cpp
-  // Section 2: Pre-build tiling loop skeletons inside the tensor path before
-  // execute() runs. emitContraction() will later fill in the body block.
+  // Section 2: Pre-build floating tiling loop skeletons before execute().
+  // State.Expander is already initialized; InsertBB is the tensor path
+  // preheader (OutermostLoop->getLoopPreheader()). SCEV expansions land
+  // in InsertBB (before its terminator); loop blocks float off AnchorBB
+  // until emitContraction() wires them into the live CFG.
   if (State.Policy.needsGuard()) {
-    // Find the tensor path entry (outermost loop preheader on tensor side).
-    // After createTensorizedLoopSkeleton(), OutermostLoop's preheader is on
-    // the tensor path and has been redirected by the guard.
     Loop *OutermostLoop = nullptr;
     unsigned MaxDim = 0;
     for (const auto &[D, L] : State.DimToLoop) {
@@ -477,7 +527,7 @@ In `TPlanLowering_lower()`, after the existing `createTensorizedLoopSkeleton()` 
     }
     if (OutermostLoop) {
       BasicBlock *TensorPH = OutermostLoop->getLoopPreheader();
-      preBuildTilingBlocks(TensorPH, State, Plan, CM, SE);
+      preBuildTilingBlocks(TensorPH, State, Plan, CM);
     }
   }
 ```
@@ -520,110 +570,171 @@ EOF
 
 When `State.PrebuiltTilingPtr` is set, `emitContraction()` skips loop creation and directly uses the pre-built body BB.
 
-- [ ] **Step 1: Add early-exit path at the start of `emitContraction()`'s tiling section**
+- [ ] **Step 1: Add pre-built path at the start of `emitContraction()`'s tiling section**
 
-After the `NeedsTiling` / `NeedsStaticTiling` / `NeedsDynamicTiling` booleans are computed (around line 768) and before the static/dynamic tiling paths (line 871), add:
+After the `NeedsTiling` / `NeedsStaticTiling` / `NeedsDynamicTiling` booleans are computed (around line 768) and after `OrigTerm` / `OrigSuccessor` are set up (around line 869), add the pre-built path **before** the `if (NeedsStaticTiling && !NeedsDynamicTiling)` check (line 871).
 
 ```cpp
   // ----------------------------------------------------------------
   // Section 3 fast path: tiling skeleton was pre-built by preBuildTilingBlocks().
-  // Move to the pre-built body BB and emit only pointer offsets + call.
+  // Wire AnchorBB → LoopHeaderBB, move to BodyBB, emit pointer offsets + call,
+  // close pre-built loops, emit scalar.block remainder if dynamic K.
   // ----------------------------------------------------------------
-  if (NeedsTiling && State.PrebuiltTilingPtr) {
-    auto *Info = static_cast<PrebuiltTilingInfo *>(State.PrebuiltTilingPtr);
-    if (!Info->BodyBB)
-      goto scalar_fallback; // defensive
+  {
+    auto *Info = NeedsTiling
+                     ? static_cast<PrebuiltTilingInfo *>(State.PrebuiltTilingPtr)
+                     : nullptr;
+    if (Info && Info->BodyBB) {
+      // Erase the scalar loop terminator (same as existing tiling paths).
+      OrigTerm->eraseFromParent();
+      // Remove k-loop self-edge PHI incomings from LoopHeaderBB.
+      for (PHINode &Phi : LoopHeaderBB->phis()) {
+        int SelfIdx = Phi.getBasicBlockIndex(LoopHeaderBB);
+        if (SelfIdx >= 0)
+          Phi.removeIncomingValue(SelfIdx, /*DeletePHIIfEmpty=*/false);
+      }
 
-    // Erase the current block's original terminator (scalar loop exit branch).
-    OrigTerm->eraseFromParent();
-    // Remove self-loop PHI incoming from the header (same as existing paths).
-    for (PHINode &Phi : LoopHeaderBB->phis()) {
-      int Idx = Phi.getBasicBlockIndex(LoopHeaderBB);
-      if (Idx >= 0)
-        Phi.removeIncomingValue(Idx, /*DeletePHIIfEmpty=*/false);
-    }
+      // Connect LoopHeaderBB → first tiling header by replacing AnchorBB's role.
+      // The first tiling header's IV PHI has incoming(0, AnchorBB); we redirect
+      // that to LoopHeaderBB and erase AnchorBB (which held only the br).
+      if (!Info->StaticLoops.empty()) {
+        BasicBlock *FirstHeader = Info->StaticLoops[0].IV->getParent();
+        B.CreateBr(FirstHeader);
+        Info->StaticLoops[0].IV->replaceIncomingBlockWith(Info->AnchorBB,
+                                                           LoopHeaderBB);
+      } else {
+        // Dynamic-only case: connect directly to tensor.body header.
+        assert(Info->DynamicLoop.has_value());
+        BasicBlock *DynHeader = Info->DynamicLoop->IV->getParent();
+        B.CreateBr(DynHeader);
+        Info->DynamicLoop->IV->replaceIncomingBlockWith(Info->AnchorBB,
+                                                         LoopHeaderBB);
+      }
+      Info->AnchorBB->eraseFromParent(); // safe: no predecessors remain
 
-    // Connect preheader to the outermost pre-built loop (or directly to BodyBB
-    // if only a DynamicLoop was built).
-    if (!Info->StaticLoops.empty()) {
-      // StaticLoops[0] was built with LoopHeaderBB as preheader in preBuildTilingBlocks.
-      // Just set B to the inner-most static body (which is also inside DynamicLoop if present).
-    }
+      // Position B in the pre-built innermost body block.
+      B.SetInsertPoint(Info->BodyBB);
 
-    // Move B to the body.
-    B.SetInsertPoint(Info->BodyBB);
+      // Build dim → StaticLoops index mapping for ActualSize lookup below.
+      DenseMap<unsigned, unsigned> DimToLoopIdx;
+      for (unsigned I = 0; I < Info->Dims.size(); ++I)
+        DimToLoopIdx[Info->Dims[I]] = I;
 
-    // STEP C (from static path): compute per-StaticTiled-dim offset pointers.
-    Value *TiledCPtr = CPtr, *TiledAPtr = LHSPtr, *TiledBPtr = RHSPtr;
-    for (unsigned I = 0; I < Info->StaticLoops.size(); ++I) {
-      unsigned Dim  = Info->Dims[I];
-      Value   *IV   = Info->StaticLoops[I].IV;
-      auto OffsetPtr = [&](Value *Base, Value *Stride) -> Value * {
-        if (auto *CI = dyn_cast<ConstantInt>(Stride); CI && CI->isZero())
-          return Base;
-        return B.CreateGEP(ElemTy, Base,
-                           B.CreateMul(IV, Stride, "tile.off"), "tile.ptr");
-      };
-      TiledAPtr = OffsetPtr(TiledAPtr, getAStride(Dim));
-      TiledBPtr = OffsetPtr(TiledBPtr, getBStride(Dim));
-      TiledCPtr = OffsetPtr(TiledCPtr, getCStride(Dim));
-    }
+      // STEP C': Compute tile-offset base pointers using static loop IVs.
+      // For each StaticTiled output dim I: tiled_ptr = base + IV[I] * stride[dim].
+      Value *TiledCPtr = CPtr, *TiledAPtr = LHSPtr, *TiledBPtr = RHSPtr;
+      for (unsigned I = 0; I < Info->StaticLoops.size(); ++I) {
+        unsigned Dim = Info->Dims[I];
+        Value   *IV  = Info->StaticLoops[I].IV;
+        auto OffsetPtr = [&](Value *Base, Value *Stride) -> Value * {
+          if (auto *CI = dyn_cast<ConstantInt>(Stride); CI && CI->isZero())
+            return Base;
+          Value *Off = B.CreateMul(IV, Stride, "tile.off");
+          return B.CreateGEP(ElemTy, Base, Off, "tile.ptr");
+        };
+        TiledAPtr = OffsetPtr(TiledAPtr, getAStride(Dim));
+        TiledBPtr = OffsetPtr(TiledBPtr, getBStride(Dim));
+        TiledCPtr = OffsetPtr(TiledCPtr, getCStride(Dim));
+      }
 
-    // STEP D (from static path): If dynamic K loop, compute K-offset inside body.
-    if (Info->DynamicLoop) {
-      Value *KIV    = Info->DynamicLoop->IV;
-      Value *AKOff  = B.CreateMul(KIV, CachedAContractStride, "tensor.body.a.off");
-      TiledAPtr     = B.CreateGEP(ElemTy, TiledAPtr, AKOff, "tensor.body.a.ptr");
-      Value *BKOff  = B.CreateMul(KIV, CachedBContractStride, "tensor.body.b.off");
-      TiledBPtr     = B.CreateGEP(ElemTy, TiledBPtr, BKOff, "tensor.body.b.ptr");
-    }
+      // STEP D': If dynamic K loop, offset A/B by K-tile IV inside body.
+      if (Info->DynamicLoop) {
+        Value *KIV   = Info->DynamicLoop->IV;
+        Value *AKOff = B.CreateMul(KIV, CachedAContractStride,
+                                    "tensor.body.a.off");
+        TiledAPtr    = B.CreateGEP(ElemTy, TiledAPtr, AKOff,
+                                    "tensor.body.a.ptr");
+        Value *BKOff = B.CreateMul(KIV, CachedBContractStride,
+                                    "tensor.body.b.off");
+        TiledBPtr    = B.CreateGEP(ElemTy, TiledBPtr, BKOff,
+                                    "tensor.body.b.ptr");
+      }
 
-    // Build args and emit tensor.contract call.
-    SmallVector<Value *> Args;
-    Args.push_back(TiledCPtr);
-    for (unsigned SI = 0; SI < OutputStrides.size(); ++SI)
-      Args.push_back(OutputStrides[SI].CStr);
-    Args.push_back(TiledAPtr);
-    for (unsigned SI = 0; SI < OutputStrides.size(); ++SI)
-      Args.push_back(OutputStrides[SI].AStr);
-    Args.push_back(CachedAContractStride);
-    Args.push_back(TiledBPtr);
-    for (unsigned SI = 0; SI < OutputStrides.size(); ++SI)
-      Args.push_back(OutputStrides[SI].BStr);
-    Args.push_back(CachedBContractStride);
-    // K size: fixed PF for DynamicTiled, else getRealDim.
-    Value *KArg = Info->DynamicLoop
-                      ? B.getInt64(Info->DynPF)
-                      : getRealDim(static_cast<unsigned>(ContractDim));
-    Args.push_back(KArg);
-    for (int D = OutputDimSet.find_first(); D >= 0; D = OutputDimSet.find_next(D))
-      Args.push_back(Info->StaticLoops.empty()
-                         ? getRealDim(static_cast<unsigned>(D))
-                         : Info->StaticLoops[/* find index for D */0].ActualSize);
-    Value *Call = B.CreateCall(ContractFn, Args);
+      // Build tensor.contract args.
+      SmallVector<Value *> Args;
+      Args.push_back(TiledCPtr);
+      for (auto &S : OutputStrides) Args.push_back(S.CStr);
+      Args.push_back(TiledAPtr);
+      for (auto &S : OutputStrides) Args.push_back(S.AStr);
+      Args.push_back(CachedAContractStride);
+      Args.push_back(TiledBPtr);
+      for (auto &S : OutputStrides) Args.push_back(S.BStr);
+      Args.push_back(CachedBContractStride);
+      // K: fixed DynPF for dynamic loop, else full real dim.
+      Args.push_back(Info->DynamicLoop ? B.getInt64(Info->DynPF)
+                                       : getRealDim(ContUD));
+      // Output dims: ActualSize from the tiling loop if that dim was statically
+      // tiled (min(PF, TC - IV)); otherwise the full real dim.
+      for (int D = OutputDimSet.find_first(); D >= 0;
+           D = OutputDimSet.find_next(D)) {
+        unsigned UD = static_cast<unsigned>(D);
+        auto It = DimToLoopIdx.find(UD);
+        Args.push_back(It != DimToLoopIdx.end()
+                           ? Info->StaticLoops[It->second].ActualSize
+                           : getRealDim(UD));
+      }
+      Value *Call = B.CreateCall(ContractFn, Args);
 
-    // Close dynamic loop (br to latch), move to exit.
-    if (Info->DynamicLoop) {
-      B.CreateBr(Info->DynamicLoop->LatchBB);
-      B.SetInsertPoint(Info->DynamicLoop->ExitBB);
-      // scalar.block remainder handled by existing code in Info (if needed).
-    }
+      // Close dynamic K loop and emit scalar.block remainder.
+      if (Info->DynamicLoop) {
+        B.CreateBr(Info->DynamicLoop->LatchBB);
+        B.SetInsertPoint(Info->DynamicLoop->ExitBB);
 
-    // Close static loops in reverse (innermost first).
-    for (int I = static_cast<int>(Info->StaticLoops.size()) - 1; I >= 0; --I) {
-      B.CreateBr(Info->StaticLoops[I].LatchBB);
-      B.SetInsertPoint(Info->StaticLoops[I].ExitBB);
-    }
+        // scalar.block: iterate the remaining K elements one-by-one.
+        // EpiStart = ExitIV of the fixed-count loop = number of K elements
+        // consumed by full tiles. TcVal = total K trip count.
+        Value *EpiStart = Info->DynamicLoop->ExitIV;
+        Value *TcVal    = Info->DynTCVal; // pre-expanded in preBuildTilingBlocks
+        Value *ScRem    = B.CreateSub(TcVal, EpiStart, "scalar.rem");
+        Value *HasSc    = B.CreateICmpUGT(ScRem, B.getInt64(0), "scalar.guard");
 
-    if (OrigSuccessor)
-      B.CreateBr(OrigSuccessor);
+        BasicBlock *ScPHBB   = B.GetInsertBlock();
+        BasicBlock *ScBodyBB = BasicBlock::Create(
+            B.getContext(), "scalar.block", ScPHBB->getParent());
+        BasicBlock *ScExitBB = BasicBlock::Create(
+            B.getContext(), "scalar.block.exit", ScPHBB->getParent());
+        B.CreateCondBr(HasSc, ScBodyBB, ScExitBB);
 
-    return Call;
-  }
-  scalar_fallback:
+        B.SetInsertPoint(ScBodyBB);
+        PHINode *ScIV = B.CreatePHI(B.getInt64Ty(), 2, "scalar.iv");
+        ScIV->addIncoming(EpiStart, ScPHBB);
+        // Load C, A[k], B[k]; fmul; fadd; store.
+        // TiledCPtr / TiledAPtr / TiledBPtr are the M/N-tile-offset pointers
+        // computed above (already reflect the current M and N tile offsets).
+        Value *CVal  = B.CreateLoad(ElemTy, TiledCPtr, "scalar.c");
+        Value *SAOff = B.CreateMul(ScIV, CachedAContractStride, "scalar.a.off");
+        Value *SAPtr = B.CreateGEP(ElemTy, TiledAPtr, SAOff, "scalar.a.ptr");
+        Value *SAVal = B.CreateLoad(ElemTy, SAPtr, "scalar.a");
+        Value *SBOff = B.CreateMul(ScIV, CachedBContractStride, "scalar.b.off");
+        Value *SBPtr = B.CreateGEP(ElemTy, TiledBPtr, SBOff, "scalar.b.ptr");
+        Value *SBVal = B.CreateLoad(ElemTy, SBPtr, "scalar.b");
+        Value *SProd = B.CreateFMul(SAVal, SBVal, "scalar.mul");
+        Value *SSum  = B.CreateFAdd(CVal, SProd, "scalar.sum");
+        B.CreateStore(SSum, TiledCPtr);
+        Value *ScNext = B.CreateAdd(ScIV, B.getInt64(1), "scalar.next");
+        ScIV->addIncoming(ScNext, ScBodyBB);
+        Value *ScDone = B.CreateICmpUGE(ScNext, TcVal, "scalar.done");
+        B.CreateCondBr(ScDone, ScExitBB, ScBodyBB);
+
+        B.SetInsertPoint(ScExitBB);
+        Call = nullptr; // C updated in-place; no SSA value to return.
+      }
+
+      // Close static loops in reverse (innermost first).
+      for (int I = static_cast<int>(Info->StaticLoops.size()) - 1; I >= 0;
+           --I) {
+        B.CreateBr(Info->StaticLoops[I].LatchBB);
+        B.SetInsertPoint(Info->StaticLoops[I].ExitBB);
+      }
+
+      if (OrigSuccessor)
+        B.CreateBr(OrigSuccessor);
+
+      return Call;
+    } // end if (Info && Info->BodyBB)
+  } // end pre-built block
+  // Fall through to existing static / dynamic tiling paths if no pre-built info.
 ```
-
-> **Note:** The exact ActualSize indexing and scalar-block remainder wiring for the dynamic path will need to be filled in during implementation based on how `FixedCountLoopInfo` exposes its exit IV. Reference the existing DynamicTiledPath (lines 970–1171) for the scalar.block pattern.
 
 - [ ] **Step 2: Build**
 
