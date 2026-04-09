@@ -327,6 +327,78 @@ buildDimToLoopForLowering(TPlan &Plan, LoopInfo &LI) {
 // Helper: emit @llvm.tensor.contract for a Contraction reduction
 //===----------------------------------------------------------------------===//
 
+/// State for one fixed-count tiling loop (Option B main loop).
+/// Unlike TilingLoopInfo, tile size is always exactly PrimaryPF (no umin).
+struct FixedCountLoopInfo {
+  BasicBlock *LatchBB;     ///< IV += TileSize, br Header.
+  BasicBlock *ExitBB;      ///< Fall-through after main_limit reached.
+  PHINode    *IV;          ///< i64 induction: 0, PF, 2*PF, ...
+};
+
+/// Emits a fixed-tile counting loop for Option B dynamic tiling:
+///   preheader: main_limit = (TC / TileSize) * TileSize
+///              has_tiles  = TC > TileSize
+///              if !has_tiles goto ExitBB
+///   header:    IV = phi [0, pre], [IV+TileSize, latch]
+///              if IV >= main_limit goto ExitBB else goto BodyBB
+///   body:      [caller inserts tensor.contract with fixed TileSize]
+///              [caller calls B.CreateBr(info.LatchBB)]
+///   latch:     IV += TileSize; br header
+///   exit:      first PHI holds main_limit (or 0 if no tiles)
+///
+/// On return, B's insertion point is in the body BB.
+static FixedCountLoopInfo emitFixedCountingLoop(IRBuilder<> &B,
+                                                 Value *TcVal,
+                                                 unsigned TileSizeConst,
+                                                 const Twine &Name) {
+  Function    *F   = B.GetInsertBlock()->getParent();
+  LLVMContext &Ctx = F->getContext();
+  Type        *I64 = Type::getInt64Ty(Ctx);
+  Value       *PF  = ConstantInt::get(I64, TileSizeConst);
+
+  // Compute main_limit = (TC / PF) * PF  in the preheader.
+  Value *MainTrips = B.CreateUDiv(TcVal, PF, Name + ".trips");
+  Value *MainLimit = B.CreateMul(MainTrips, PF, Name + ".limit");
+
+  // Guard: skip the loop entirely if TC <= PF.
+  Value *HasTiles = B.CreateICmpUGT(TcVal, PF, Name + ".guard");
+
+  BasicBlock *PreBB  = B.GetInsertBlock();
+  BasicBlock *HdrBB  = BasicBlock::Create(Ctx, Name + ".header", F);
+  BasicBlock *BodyBB = BasicBlock::Create(Ctx, Name + ".body",   F);
+  BasicBlock *LchBB  = BasicBlock::Create(Ctx, Name + ".latch",  F);
+  BasicBlock *ExitBB = BasicBlock::Create(Ctx, Name + ".exit",   F);
+
+  // Preheader → Header (if has_tiles) or Exit (if TC <= PF).
+  B.CreateCondBr(HasTiles, HdrBB, ExitBB);
+
+  // Header: phi + exit-check against main_limit.
+  B.SetInsertPoint(HdrBB);
+  PHINode *IV = B.CreatePHI(I64, 2, Name + ".iv");
+  IV->addIncoming(ConstantInt::get(I64, 0), PreBB);
+  Value *Done = B.CreateICmpUGE(IV, MainLimit, Name + ".done");
+  B.CreateCondBr(Done, ExitBB, BodyBB);
+
+  // Latch: advance IV.
+  IRBuilder<> LB(LchBB);
+  Value *NextIV = LB.CreateAdd(IV, PF, Name + ".next");
+  IV->addIncoming(NextIV, LchBB);
+  LB.CreateBr(HdrBB);
+
+  // ExitBB PHI: holds 0 (no-tiles path, from PreBB) or IV==MainLimit
+  // (tiles-done path, from HdrBB when IV >= MainLimit check fires).
+  // Note: LchBB does NOT branch to ExitBB — only PreBB and HdrBB do.
+  B.SetInsertPoint(ExitBB);
+  PHINode *ExitIV = B.CreatePHI(I64, 2, Name + ".exit.iv");
+  ExitIV->addIncoming(ConstantInt::get(I64, 0), PreBB);
+  ExitIV->addIncoming(IV, HdrBB); // IV == MainLimit when exiting header
+
+  // Restore insert point to body.
+  B.SetInsertPoint(BodyBB);
+
+  return FixedCountLoopInfo{LchBB, ExitBB, IV};
+}
+
 /// Describes the structure of one tiling loop emitted by emitTilingLoop().
 struct TilingLoopInfo {
   BasicBlock *LatchBB;    ///< Back-edge block: IV += TileSize, br Header.
@@ -590,19 +662,25 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
       if (RealTC > static_cast<uint64_t>(PF))
         TiledDims.push_back({D, PF, BTC, /*IsDynamic=*/false});
     } else {
-      // Dynamic TC: query TTI for the hardware primary tile size.
-      // If TTI reports a valid PrimaryK, enqueue for dynamic Option-B tiling.
-      // Otherwise skip (single-call fast path as before).
-      if (!State.TTI)
+      // Dynamic TC: only support dynamic tiling for the contraction dim (K).
+      // Output dims (M, N) with dynamic TCs are not yet supported; skip them.
+      if (D != static_cast<unsigned>(ContractDim))
         return;
-      auto TileInfo = State.TTI->getTensorContractTileInfo(
-          ElemTy, RankA, RankB, RankC);
-      if (!TileInfo || TileInfo->PrimaryK == 0)
-        return;
+      // Query TTI for primary tile size; fall back to CLI PF.
+      unsigned DynPF = 0;
+      if (State.TTI) {
+        auto TileInfo = State.TTI->getTensorContractTileInfo(
+            ElemTy, RankA, RankB, RankC);
+        if (TileInfo && TileInfo->PrimaryK > 0)
+          DynPF = TileInfo->PrimaryK;
+      }
+      if (DynPF == 0)
+        DynPF = PF; // CLI override / default PF as fallback
+      if (DynPF == 0)
+        return; // no usable PF, skip
       LLVM_DEBUG(dbgs() << "TPlanLowering: dynamic TC dim " << D
-                        << " → tensor.body PrimaryK=" << TileInfo->PrimaryK
-                        << "\n");
-      TiledDims.push_back({D, TileInfo->PrimaryK, BTC, /*IsDynamic=*/true});
+                        << " → tensor.body PrimaryPF=" << DynPF << "\n");
+      TiledDims.push_back({D, DynPF, BTC, /*IsDynamic=*/true});
     }
   };
 
@@ -612,6 +690,17 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   checkDim(static_cast<unsigned>(ContractDim));
 
   bool NeedsTiling = !TiledDims.empty();
+
+  // Separate static-TC dims from dynamic-TC dims.
+  SmallVector<TileDimInfo, 4> StaticTiledDims, DynamicTiledDims;
+  for (auto &TD : TiledDims) {
+    if (TD.IsDynamic)
+      DynamicTiledDims.push_back(TD);
+    else
+      StaticTiledDims.push_back(TD);
+  }
+  bool NeedsStaticTiling  = !StaticTiledDims.empty();
+  bool NeedsDynamicTiling = !DynamicTiledDims.empty();
 
   // Common setup used by both paths.
   unsigned ContUD = static_cast<unsigned>(ContractDim);
@@ -660,7 +749,7 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   }
 
   // ----------------------------------------------------------------
-  // Tiling path: nested loops around a PF-sized tensor.contract.
+  // Shared setup for both static and dynamic tiling paths.
   //
   // Pre-cache all stride Values needed in STEP C and STEP D while B's
   // insert point is still in the preheader. This prevents stride SCEV
@@ -713,109 +802,297 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   if (OrigTerm->getNumSuccessors() > 0)
     OrigSuccessor = OrigTerm->getSuccessor(0);
 
-  // STEP A: Expand ALL TripCount SCEVs to Value* BEFORE creating any
-  // loop BBs. This keeps expansion code in the current preheader BB,
-  // not inside a loop body (which would cause dominance violations).
-  // ----------------------------------------------------------------
-  SmallVector<Value *> TCValues; // parallel to TiledDims
-  for (auto &TD : TiledDims) {
-    Value *BTC = State.Expander->expandCodeFor(
-        TD.BTCSCEV, B.getInt64Ty(), &*B.GetInsertPoint());
-    TCValues.push_back(B.CreateAdd(BTC, B.getInt64(1), "tc.real"));
-  }
+  if (NeedsStaticTiling && !NeedsDynamicTiling) {
+    // ----------------------------------------------------------------
+    // Static tiling path: nested loops around a PF-sized tensor.contract.
+    // ----------------------------------------------------------------
 
-  // STEP B: Emit tiling loops (outermost first = TiledDims order).
-  // Each call nests inside the previous loop's body.
-  SmallVector<TilingLoopInfo, 4> LoopInfos;
-  for (unsigned I = 0; I < TiledDims.size(); ++I) {
-    std::string Name = (Twine("tile.d") + Twine(TiledDims[I].Dim)).str();
-    Value *TileSize  = B.getInt64(TiledDims[I].PF);
-    LoopInfos.push_back(emitTilingLoop(B, TCValues[I], TileSize, Name));
-    // B's insertion point is now in loop I's body BB.
-  }
-
-  // Erase the preheader's original terminator. emitTilingLoop() already
-  // inserted a new branch (br tile.d*.header) in its place; leaving the
-  // original terminator would make the preheader have two terminators.
-  OrigTerm->eraseFromParent();
-
-  // The original loop's back-edge (br i1 %k.done, label %k.latch, label %k.loop)
-  // has been replaced by the tiling branch. The loop header is no longer a
-  // predecessor of itself. Remove self-referencing incoming values from PHIs
-  // in the loop header to match the new (reduced) predecessor count; otherwise
-  // the IR verifier fires "PHINode should have one entry for each predecessor".
-  if (LoopHeaderBB) {
-    for (PHINode &Phi : LoopHeaderBB->phis()) {
-      int Idx = Phi.getBasicBlockIndex(LoopHeaderBB);
-      if (Idx >= 0)
-        Phi.removeIncomingValue(Idx, /*DeletePHIIfEmpty=*/false);
+    // STEP A: Expand ALL TripCount SCEVs to Value* BEFORE creating any
+    // loop BBs. This keeps expansion code in the current preheader BB,
+    // not inside a loop body (which would cause dominance violations).
+    SmallVector<Value *> TCValues; // parallel to TiledDims
+    for (auto &TD : TiledDims) {
+      Value *BTC = State.Expander->expandCodeFor(
+          TD.BTCSCEV, B.getInt64Ty(), &*B.GetInsertPoint());
+      TCValues.push_back(B.CreateAdd(BTC, B.getInt64(1), "tc.real"));
     }
+
+    // STEP B: Emit tiling loops (outermost first = TiledDims order).
+    // Each call nests inside the previous loop's body.
+    SmallVector<TilingLoopInfo, 4> LoopInfos;
+    for (unsigned I = 0; I < TiledDims.size(); ++I) {
+      std::string Name = (Twine("tile.d") + Twine(TiledDims[I].Dim)).str();
+      Value *TileSize  = B.getInt64(TiledDims[I].PF);
+      LoopInfos.push_back(emitTilingLoop(B, TCValues[I], TileSize, Name));
+      // B's insertion point is now in loop I's body BB.
+    }
+
+    // Erase the preheader's original terminator. emitTilingLoop() already
+    // inserted a new branch (br tile.d*.header) in its place; leaving the
+    // original terminator would make the preheader have two terminators.
+    OrigTerm->eraseFromParent();
+
+    // The original loop's back-edge has been replaced by the tiling branch.
+    // Remove self-referencing incoming values from PHIs in the loop header.
+    if (LoopHeaderBB) {
+      for (PHINode &Phi : LoopHeaderBB->phis()) {
+        int Idx = Phi.getBasicBlockIndex(LoopHeaderBB);
+        if (Idx >= 0)
+          Phi.removeIncomingValue(Idx, /*DeletePHIIfEmpty=*/false);
+      }
+    }
+
+    // STEP C: Compute offset base pointers inside the innermost body.
+    // For each tiled dim: tile_ptr = base_ptr + IV * stride (GEP in elements).
+    Value *TiledCPtr = CPtr, *TiledAPtr = LHSPtr, *TiledBPtr = RHSPtr;
+    DenseMap<unsigned, Value *> ActualSizes; // dim → min(PF, TC-IV)
+    for (unsigned I = 0; I < TiledDims.size(); ++I) {
+      unsigned Dim     = TiledDims[I].Dim;
+      Value   *IV      = LoopInfos[I].IV;
+      ActualSizes[Dim] = LoopInfos[I].ActualSize;
+
+      auto OffsetPtr = [&](Value *Base, Value *Stride) -> Value * {
+        Value *Off = B.CreateMul(IV, Stride, "tile.off");
+        return B.CreateGEP(ElemTy, Base, Off, "tile.ptr");
+      };
+      auto NonZero = [](Value *V) -> bool {
+        auto *CI = dyn_cast<ConstantInt>(V);
+        return !CI || !CI->isZero();
+      };
+      Value *AStr = TiledStrides[I].AStr;
+      Value *BStr = TiledStrides[I].BStr;
+      Value *CStr = TiledStrides[I].CStr;
+      if (NonZero(AStr)) TiledAPtr = OffsetPtr(TiledAPtr, AStr);
+      if (NonZero(BStr)) TiledBPtr = OffsetPtr(TiledBPtr, BStr);
+      if (NonZero(CStr)) TiledCPtr = OffsetPtr(TiledCPtr, CStr);
+    }
+
+    // STEP D: Build tile-sized tensor.contract arguments and call.
+    SmallVector<Value *> Args;
+    Args.push_back(TiledCPtr);
+    for (unsigned SI = 0; SI < OutputStrides.size(); ++SI)
+      Args.push_back(OutputStrides[SI].CStr);
+    Args.push_back(TiledAPtr);
+    for (unsigned SI = 0; SI < OutputStrides.size(); ++SI)
+      Args.push_back(OutputStrides[SI].AStr);
+    Args.push_back(CachedAContractStride);
+    Args.push_back(TiledBPtr);
+    for (unsigned SI = 0; SI < OutputStrides.size(); ++SI)
+      Args.push_back(OutputStrides[SI].BStr);
+    Args.push_back(CachedBContractStride);
+    Args.push_back(ActualSizes.count(ContUD) ? ActualSizes[ContUD]
+                                              : getRealDim(ContUD));
+    for (int D = OutputDimSet.find_first(); D >= 0;
+         D = OutputDimSet.find_next(D)) {
+      unsigned UD = static_cast<unsigned>(D);
+      Args.push_back(ActualSizes.count(UD) ? ActualSizes[UD] : getRealDim(UD));
+    }
+    Value *Call = B.CreateCall(ContractFn, Args);
+
+    // STEP E: Close tiling loops in reverse (innermost first).
+    for (int I = static_cast<int>(LoopInfos.size()) - 1; I >= 0; --I) {
+      B.CreateBr(LoopInfos[I].LatchBB);
+      B.SetInsertPoint(LoopInfos[I].ExitBB);
+    }
+
+    if (OrigSuccessor)
+      B.CreateBr(OrigSuccessor);
+
+    return Call;
   }
 
-  // STEP C: Compute offset base pointers inside the innermost body.
-  // For each tiled dim: tile_ptr = base_ptr + IV * stride (GEP in elements).
-  Value *TiledCPtr = CPtr, *TiledAPtr = LHSPtr, *TiledBPtr = RHSPtr;
-  DenseMap<unsigned, Value *> ActualSizes; // dim → min(PF, TC-IV)
-  for (unsigned I = 0; I < TiledDims.size(); ++I) {
-    unsigned Dim     = TiledDims[I].Dim;
-    Value   *IV      = LoopInfos[I].IV;
-    ActualSizes[Dim] = LoopInfos[I].ActualSize;
+  if (NeedsDynamicTiling) {
+    // ----------------------------------------------------------------
+    // Dynamic tiling path (Option B): tensor.body fixed-tile loop +
+    // optional epilogue tiers + scalar remainder block.
+    // ----------------------------------------------------------------
 
-    auto OffsetPtr = [&](Value *Base, Value *Stride) -> Value * {
-      Value *Off = B.CreateMul(IV, Stride, "tile.off");
-      return B.CreateGEP(ElemTy, Base, Off, "tile.ptr");
-    };
-    auto NonZero = [](Value *V) -> bool {
-      auto *CI = dyn_cast<ConstantInt>(V);
-      return !CI || !CI->isZero();
-    };
-    Value *AStr = TiledStrides[I].AStr;
-    Value *BStr = TiledStrides[I].BStr;
-    Value *CStr = TiledStrides[I].CStr;
-    if (NonZero(AStr)) TiledAPtr = OffsetPtr(TiledAPtr, AStr);
-    if (NonZero(BStr)) TiledBPtr = OffsetPtr(TiledBPtr, BStr);
-    if (NonZero(CStr)) TiledCPtr = OffsetPtr(TiledCPtr, CStr);
+    // Support exactly one dynamic dim (the contraction dim K) for now.
+    assert(DynamicTiledDims.size() == 1 && "only single dynamic dim supported");
+    const TileDimInfo &DD = DynamicTiledDims[0];
+    unsigned PrimaryPF = DD.PF;
+
+    // Retrieve epilogue tier sizes from TTI (may be empty on generic targets).
+    SmallVector<unsigned, 4> EpiPFs;
+    if (State.TTI) {
+      auto TileInfo = State.TTI->getTensorContractTileInfo(
+          ElemTy, RankA, RankB, RankC);
+      if (TileInfo)
+        EpiPFs = SmallVector<unsigned, 4>(TileInfo->EpilogueKSizes);
+    }
+
+    // STEP A': Expand runtime TC for the dynamic dim.
+    Value *BTCVal = State.Expander->expandCodeFor(
+        DD.BTCSCEV, B.getInt64Ty(), &*B.GetInsertPoint());
+    Value *TcVal = B.CreateAdd(BTCVal, B.getInt64(1), "k.tc");
+
+    // Pre-cache strides while still in the preheader.
+    Value *CachedAK = getAStride(static_cast<unsigned>(ContractDim));
+    Value *CachedBK = getBStride(static_cast<unsigned>(ContractDim));
+
+    // STEP B': Erase OrigTerm and PHI self-edges (same as static path).
+    // Note: B is already positioned before OrigTerm from the earlier
+    // B.SetInsertPoint(OrigTerm) call. After erasing, we must reset B.
+    OrigTerm->eraseFromParent();
+    // Reset B to the end of the (now-unterminated) preheader block.
+    B.SetInsertPoint(LoopHeaderBB);
+    if (LoopHeaderBB) {
+      for (PHINode &Phi : LoopHeaderBB->phis()) {
+        int Idx = Phi.getBasicBlockIndex(LoopHeaderBB);
+        if (Idx >= 0)
+          Phi.removeIncomingValue(Idx, /*DeletePHIIfEmpty=*/false);
+      }
+    }
+
+    // Emit the main tensor.body fixed-count loop.
+    FixedCountLoopInfo MainLoop =
+        emitFixedCountingLoop(B, TcVal, PrimaryPF, "tensor.body");
+
+    // STEP C': Pointer offsets in the tensor.body body (B is in body BB).
+    Value *AOffMain = B.CreateMul(MainLoop.IV, CachedAK, "tensor.body.a.off");
+    Value *AMainPtr = B.CreateGEP(ElemTy, LHSPtr, AOffMain, "tensor.body.a.ptr");
+    Value *BOffMain = B.CreateMul(MainLoop.IV, CachedBK, "tensor.body.b.off");
+    Value *BMainPtr = B.CreateGEP(ElemTy, RHSPtr, BOffMain, "tensor.body.b.ptr");
+
+    // STEP D': tensor.contract with fixed PrimaryPF as K dim.
+    {
+      SmallVector<Value *> Args;
+      Args.push_back(CPtr);
+      for (auto &S : OutputStrides) Args.push_back(S.CStr);
+      Args.push_back(AMainPtr);
+      for (auto &S : OutputStrides) Args.push_back(S.AStr);
+      Args.push_back(CachedAK);
+      Args.push_back(BMainPtr);
+      for (auto &S : OutputStrides) Args.push_back(S.BStr);
+      Args.push_back(CachedBK);
+      Args.push_back(B.getInt64(PrimaryPF)); // K = fixed PrimaryPF
+      for (int D = OutputDimSet.find_first(); D >= 0;
+           D = OutputDimSet.find_next(D))
+        Args.push_back(getRealDim(static_cast<unsigned>(D)));
+      B.CreateCall(ContractFn, Args);
+    }
+
+    // Close main loop.
+    B.CreateBr(MainLoop.LatchBB);
+    B.SetInsertPoint(MainLoop.ExitBB);
+
+    // Retrieve epi_start: first PHI of ExitBB holds main_limit (or 0).
+    Value *EpiStart = &MainLoop.ExitBB->front();
+
+    // STEP E': Epilogue tensor tiers (one per EpiPFs entry, often empty).
+    for (unsigned EpiPF : EpiPFs) {
+      Value *RemVal = B.CreateSub(TcVal, EpiStart, "epi.rem");
+      Value *HasEpi = B.CreateICmpUGT(RemVal, B.getInt64(EpiPF), "epi.guard");
+
+      BasicBlock *EpiPHBB  = B.GetInsertBlock();
+      BasicBlock *EpiHdrBB = BasicBlock::Create(
+          B.getContext(),
+          (Twine("tensor.epi.") + Twine(EpiPF) + ".header").str(),
+          B.GetInsertBlock()->getParent());
+      BasicBlock *EpiBodyBB = BasicBlock::Create(
+          B.getContext(),
+          (Twine("tensor.epi.") + Twine(EpiPF) + ".body").str(),
+          B.GetInsertBlock()->getParent());
+      BasicBlock *EpiLchBB = BasicBlock::Create(
+          B.getContext(),
+          (Twine("tensor.epi.") + Twine(EpiPF) + ".latch").str(),
+          B.GetInsertBlock()->getParent());
+      BasicBlock *EpiExitBB = BasicBlock::Create(
+          B.getContext(),
+          (Twine("tensor.epi.") + Twine(EpiPF) + ".exit").str(),
+          B.GetInsertBlock()->getParent());
+
+      B.CreateCondBr(HasEpi, EpiHdrBB, EpiExitBB);
+
+      B.SetInsertPoint(EpiHdrBB);
+      PHINode *EIV = B.CreatePHI(B.getInt64Ty(), 2,
+                                  (Twine("tensor.epi.") + Twine(EpiPF) + ".iv").str());
+      EIV->addIncoming(EpiStart, EpiPHBB);
+      Value *EpiLimit = B.CreateAdd(
+          EpiStart,
+          B.CreateMul(B.CreateUDiv(RemVal, B.getInt64(EpiPF)),
+                      B.getInt64(EpiPF)),
+          (Twine("tensor.epi.") + Twine(EpiPF) + ".limit").str());
+      Value *EDone = B.CreateICmpUGE(EIV, EpiLimit,
+                                      (Twine("tensor.epi.") + Twine(EpiPF) + ".done").str());
+      B.CreateCondBr(EDone, EpiExitBB, EpiBodyBB);
+
+      B.SetInsertPoint(EpiBodyBB);
+      Value *EAOff = B.CreateMul(EIV, CachedAK, "epi.a.off");
+      Value *EAPtr = B.CreateGEP(ElemTy, LHSPtr, EAOff, "epi.a.ptr");
+      Value *EBOff = B.CreateMul(EIV, CachedBK, "epi.b.off");
+      Value *EBPtr = B.CreateGEP(ElemTy, RHSPtr, EBOff, "epi.b.ptr");
+      {
+        SmallVector<Value *> Args;
+        Args.push_back(CPtr);
+        for (auto &S : OutputStrides) Args.push_back(S.CStr);
+        Args.push_back(EAPtr);
+        for (auto &S : OutputStrides) Args.push_back(S.AStr);
+        Args.push_back(CachedAK);
+        Args.push_back(EBPtr);
+        for (auto &S : OutputStrides) Args.push_back(S.BStr);
+        Args.push_back(CachedBK);
+        Args.push_back(B.getInt64(EpiPF));
+        for (int D = OutputDimSet.find_first(); D >= 0;
+             D = OutputDimSet.find_next(D))
+          Args.push_back(getRealDim(static_cast<unsigned>(D)));
+        B.CreateCall(ContractFn, Args);
+      }
+      B.CreateBr(EpiLchBB);
+
+      IRBuilder<> EpiLB(EpiLchBB);
+      Value *ENext = EpiLB.CreateAdd(EIV, B.getInt64(EpiPF),
+                                      (Twine("tensor.epi.") + Twine(EpiPF) + ".next").str());
+      EIV->addIncoming(ENext, EpiLchBB);
+      EpiLB.CreateBr(EpiHdrBB);
+
+      B.SetInsertPoint(EpiExitBB);
+      PHINode *NewEpiStart = B.CreatePHI(B.getInt64Ty(), 2, "epi.start");
+      NewEpiStart->addIncoming(EpiStart, EpiPHBB);
+      NewEpiStart->addIncoming(EpiLimit, EpiHdrBB);
+      EpiStart = NewEpiStart;
+    }
+
+    // STEP F': Scalar block for final remainder.
+    Value *ScRem = B.CreateSub(TcVal, EpiStart, "scalar.rem");
+    Value *HasSc = B.CreateICmpUGT(ScRem, B.getInt64(0), "scalar.guard");
+
+    BasicBlock *ScPHBB   = B.GetInsertBlock();
+    BasicBlock *ScBodyBB = BasicBlock::Create(
+        B.getContext(), "scalar.block", B.GetInsertBlock()->getParent());
+    BasicBlock *ScExitBB = BasicBlock::Create(
+        B.getContext(), "scalar.block.exit", B.GetInsertBlock()->getParent());
+
+    B.CreateCondBr(HasSc, ScBodyBB, ScExitBB);
+
+    B.SetInsertPoint(ScBodyBB);
+    PHINode *ScIV = B.CreatePHI(B.getInt64Ty(), 2, "scalar.iv");
+    ScIV->addIncoming(EpiStart, ScPHBB);
+
+    Value *CVal = B.CreateLoad(ElemTy, CPtr, "scalar.c");
+    Value *SAOff = B.CreateMul(ScIV, CachedAK, "scalar.a.off");
+    Value *SAPtr = B.CreateGEP(ElemTy, LHSPtr, SAOff, "scalar.a.ptr");
+    Value *SAVal = B.CreateLoad(ElemTy, SAPtr, "scalar.a");
+    Value *SBOff = B.CreateMul(ScIV, CachedBK, "scalar.b.off");
+    Value *SBPtr = B.CreateGEP(ElemTy, RHSPtr, SBOff, "scalar.b.ptr");
+    Value *SBVal = B.CreateLoad(ElemTy, SBPtr, "scalar.b");
+    Value *SProd = B.CreateFMul(SAVal, SBVal, "scalar.mul");
+    Value *SSum  = B.CreateFAdd(CVal, SProd, "scalar.sum");
+    B.CreateStore(SSum, CPtr);
+
+    Value *ScNext = B.CreateAdd(ScIV, B.getInt64(1), "scalar.next");
+    ScIV->addIncoming(ScNext, ScBodyBB);
+    Value *ScDone = B.CreateICmpUGE(ScNext, TcVal, "scalar.done");
+    B.CreateCondBr(ScDone, ScExitBB, ScBodyBB);
+
+    B.SetInsertPoint(ScExitBB);
+    if (OrigSuccessor)
+      B.CreateBr(OrigSuccessor);
+
+    return nullptr; // C updated in-place; no SSA Value to return.
   }
 
-  // STEP D: Build tile-sized tensor.contract arguments and call.
-  SmallVector<Value *> Args;
-  Args.push_back(TiledCPtr);
-  for (unsigned SI = 0; SI < OutputStrides.size(); ++SI)
-    Args.push_back(OutputStrides[SI].CStr);
-  Args.push_back(TiledAPtr);
-  for (unsigned SI = 0; SI < OutputStrides.size(); ++SI)
-    Args.push_back(OutputStrides[SI].AStr);
-  Args.push_back(CachedAContractStride);
-  Args.push_back(TiledBPtr);
-  for (unsigned SI = 0; SI < OutputStrides.size(); ++SI)
-    Args.push_back(OutputStrides[SI].BStr);
-  Args.push_back(CachedBContractStride);
-  Args.push_back(ActualSizes.count(ContUD) ? ActualSizes[ContUD]
-                                            : getRealDim(ContUD));
-  for (int D = OutputDimSet.find_first(); D >= 0;
-       D = OutputDimSet.find_next(D)) {
-    unsigned UD = static_cast<unsigned>(D);
-    Args.push_back(ActualSizes.count(UD) ? ActualSizes[UD] : getRealDim(UD));
-  }
-  Value *Call = B.CreateCall(ContractFn, Args);
-
-  // STEP E: Close tiling loops in reverse (innermost first).
-  // Pattern: branch current body to LatchBB, then move insert point to ExitBB.
-  // ExitBB of loop I becomes the effective "body" of loop I-1.
-  for (int I = static_cast<int>(LoopInfos.size()) - 1; I >= 0; --I) {
-    B.CreateBr(LoopInfos[I].LatchBB);
-    B.SetInsertPoint(LoopInfos[I].ExitBB);
-  }
-
-  // Terminate the outermost tiling-loop exit block. After all tiling
-  // iterations, control must fall through to the scalar loop's exit
-  // (OrigSuccessor = k.latch). The TPlan latch block (tensor.latch0)
-  // runs next with InsertionBB = k.loop, repositioning B back into the
-  // scalar loop body — so these latch emissions do NOT land here.
-  if (OrigSuccessor)
-    B.CreateBr(OrigSuccessor);
-
-  return Call;
+  return nullptr; // unreachable
 }
 
 //===----------------------------------------------------------------------===//
@@ -1081,12 +1358,18 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
       BasicBlock           *SaveBB = State.Builder.GetInsertBlock();
       BasicBlock::iterator  SavePt = State.Builder.GetInsertPoint();
       Value *Result = emitContraction(FusedMul, this, State);
+      // Mark as emitted regardless of whether a Value was returned.
+      // The dynamic tiling path returns nullptr (C updated in-place) but
+      // still emits all necessary IR — we must prevent double-emission.
+      State.EmittedContractions.insert(ReductionInst);
+      // Restore insert point for subsequent recipes in this block.
+      // In both static (Result != nullptr) and dynamic (Result == nullptr)
+      // paths, subsequent recipes become harmless dead code in the original
+      // scalar loop block (before the new tiling branch).
+      State.Builder.SetInsertPoint(SaveBB, SavePt);
       if (Result) {
         State.setValue(this, Result);
-        State.EmittedContractions.insert(ReductionInst);
         State.ContractionResults[ReductionInst] = Result;
-        // Restore insert point for subsequent recipes in this block.
-        State.Builder.SetInsertPoint(SaveBB, SavePt);
       }
     }
     // else: this is the fmul itself (FusedMulRecipe==nullptr here) — no-op.
