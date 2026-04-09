@@ -1410,6 +1410,60 @@ private:
   TPValue *getTPValue(Value *V);
 };
 
+//===----------------------------------------------------------------------===//
+// EmissionPolicy — per-dim lowering intent built from TPlan before execute()
+//===----------------------------------------------------------------------===//
+
+/// How a tensor dimension should be emitted during lowering.
+enum class DimEmitMode {
+  Inline,       ///< TC <= PF for this dim: no tiling loop needed.
+  StaticTiled,  ///< TC > PF (known at compile time) or dynamic output dim:
+                ///< emit umin-bounded tiling loop via emitTilingLoop().
+  DynamicTiled, ///< Reduction dim with runtime TC: emit fixed-tile loop
+                ///< (tensor.body) + epilogue tiers + scalar remainder.
+};
+
+/// Per-dimension emission specification built by buildEmissionPolicy().
+/// Dim indices use the DimIdx convention (innermost=0, outermost=Depth-1).
+struct DimEmissionSpec {
+  unsigned    Dim;                     ///< Dimension index.
+  unsigned    PF;                      ///< Tile size from Plan.getPFForDim(Dim).
+  DimEmitMode Mode = DimEmitMode::Inline;
+};
+
+/// Upfront per-lowering emission plan: classifies every tensor dim before
+/// execute() runs. Built by buildEmissionPolicy() in TPlanLowering_lower().
+///
+/// Separates the "what to emit" decision (here, driven by TPlan's PF/TC data)
+/// from the "how to emit" mechanics (inside emitContraction()).
+struct EmissionPolicy {
+  SmallVector<DimEmissionSpec, 4> Specs;
+
+  /// True iff any dim uses DynamicTiled mode.
+  /// When true, TPlanLowering_lower() must call createTensorizedLoopSkeleton()
+  /// before execute() to insert a runtime profitability guard.
+  bool needsGuard() const {
+    return llvm::any_of(Specs, [](const DimEmissionSpec &S) {
+      return S.Mode == DimEmitMode::DynamicTiled;
+    });
+  }
+
+  /// Returns the spec for dim \p Dim, or nullptr if not present.
+  const DimEmissionSpec *getSpec(unsigned Dim) const {
+    for (const auto &S : Specs)
+      if (S.Dim == Dim)
+        return &S;
+    return nullptr;
+  }
+
+  /// True if any dim requires a tiling loop (Static or Dynamic).
+  bool needsTiling() const {
+    return llvm::any_of(Specs, [](const DimEmissionSpec &S) {
+      return S.Mode != DimEmitMode::Inline;
+    });
+  }
+};
+
 /// State passed to execute() during TPlan lowering.
 struct TPTransformState {
   IRBuilder<> &Builder;
@@ -1437,6 +1491,9 @@ struct TPTransformState {
   /// Set by TPlanLowering_lower() before execute() loop. Required by
   /// createTensorizedLoopSkeleton() to maintain dominator tree correctness.
   DominatorTree *DT = nullptr;
+  /// Upfront emission policy built by buildEmissionPolicy() before execute().
+  /// Consumed by emitContraction() to classify dims without re-running checkDim().
+  EmissionPolicy Policy;
 
   /// Tracks which IR instructions (the fadd/reduction-update) have already been
   /// lowered to tensor.contract calls (possibly with tiling loops). Depth-3 GEMMs
