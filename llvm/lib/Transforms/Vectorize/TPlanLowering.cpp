@@ -1780,8 +1780,23 @@ bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
   State.TTI = TTI;
   State.LI = &LI;
   State.DT = &DT;
-  // Build DimToLoop for use in decomposePtrForDims().
+  // Build DimToLoop for use in decomposePtrForDims() and buildEmissionPolicy().
   State.DimToLoop = buildDimToLoopForLowering(Plan, LI);
+
+  // Build the EmissionPolicy upfront — before execute() — so that both the
+  // skeleton guard insertion and emitContraction() share the same dim
+  // classification derived from TPlan's PF/TC data.
+  State.Policy = buildEmissionPolicy(Plan, State.DimToLoop);
+  LLVM_DEBUG({
+    dbgs() << "TPlanLowering: EmissionPolicy (" << State.Policy.Specs.size()
+           << " specs):\n";
+    for (const auto &S : State.Policy.Specs) {
+      StringRef Mode = S.Mode == DimEmitMode::Inline       ? "Inline"
+                     : S.Mode == DimEmitMode::StaticTiled  ? "StaticTiled"
+                                                           : "DynamicTiled";
+      dbgs() << "  dim=" << S.Dim << " PF=" << S.PF << " mode=" << Mode << "\n";
+    }
+  });
 
   if (Plan.getEntry()) {
     // Collect and execute all blocks in top-level construction order.
