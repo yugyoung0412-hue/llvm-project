@@ -462,6 +462,61 @@ static TilingLoopInfo emitTilingLoop(IRBuilder<> &B, Value *TripCount,
   return TilingLoopInfo{LatchBB, ExitBB, IV, ActualSize};
 }
 
+/// Builds an EmissionPolicy by classifying every dimension known to the plan.
+///
+/// Classification rules (per dim in \p DimToLoop):
+///   - TC unknown                   → skip (Inline, not added to Specs).
+///   - TC constant, RealTC <= PF    → skip (Inline, not added).
+///   - TC constant, RealTC >  PF    → StaticTiled.
+///   - TC dynamic, output dim       → StaticTiled (umin-bounded tiling loop).
+///   - TC dynamic, reduction dim    → DynamicTiled (fixed-tile body loop).
+///
+/// "Output" vs. "reduction" is determined by Plan.getReductionDims() — no
+/// hard-coding of specific dim indices or tensor operation types.
+///
+/// For DynamicTiled dims the PF stored in the Policy is the Plan PF (from
+/// Plan.getPFForDim()). emitContraction() may query TTI at recipe time to
+/// refine the actual tile size used inside the tensor.body loop; the Policy
+/// PF is used as the guard threshold in createTensorizedLoopSkeleton().
+static EmissionPolicy
+buildEmissionPolicy(const TPlan &Plan,
+                    const DenseMap<unsigned, Loop *> &DimToLoop) {
+  EmissionPolicy Policy;
+  const SmallBitVector &ReductionDims = Plan.getReductionDims();
+
+  for (const auto &[D, _] : DimToLoop) {
+    const SCEV *BTC = Plan.getTCForDim(D);
+    if (!BTC)
+      continue; // Unknown TC — emit inline.
+
+    unsigned PF = Plan.getPFForDim(D);
+
+    if (const auto *C = dyn_cast<SCEVConstant>(BTC)) {
+      uint64_t RealTC = C->getValue()->getZExtValue() + 1;
+      if (RealTC <= static_cast<uint64_t>(PF))
+        continue; // TC fits in one tile — inline.
+      Policy.Specs.push_back({D, PF, DimEmitMode::StaticTiled});
+    } else {
+      // Dynamic TC.
+      bool IsReduction = D < ReductionDims.size() && ReductionDims.test(D);
+      if (!IsReduction) {
+        // Output dim with runtime TC: use umin-bounded static tiling so the
+        // tiling loop remains well-formed regardless of the runtime value.
+        if (PF == 0)
+          continue;
+        Policy.Specs.push_back({D, PF, DimEmitMode::StaticTiled});
+      } else {
+        // Reduction dim with runtime TC: emit fixed-tile tensor.body loop.
+        // Use Plan PF as the tile size; emitContraction() may refine via TTI.
+        if (PF == 0)
+          continue;
+        Policy.Specs.push_back({D, PF, DimEmitMode::DynamicTiled});
+      }
+    }
+  }
+  return Policy;
+}
+
 static Value *emitContraction(const TPRecipeBase *FusedMul,
                                const TPRecipeBase *ReductionUpdate,
                                TPTransformState &State) {
