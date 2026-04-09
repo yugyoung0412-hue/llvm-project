@@ -338,7 +338,7 @@ struct FixedCountLoopInfo {
 
 /// Emits a fixed-tile counting loop for Option B dynamic tiling:
 ///   preheader: main_limit = (TC / TileSize) * TileSize
-///              has_tiles  = TC > TileSize
+///              has_tiles  = TC >= TileSize
 ///              if !has_tiles goto ExitBB
 ///   header:    IV = phi [0, pre], [IV+TileSize, latch]
 ///              if IV >= main_limit goto ExitBB else goto BodyBB
@@ -936,8 +936,8 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     // B.SetInsertPoint(OrigTerm) call. After erasing, we must reset B.
     OrigTerm->eraseFromParent();
     // Reset B to the end of the (now-unterminated) preheader block.
-    B.SetInsertPoint(LoopHeaderBB, LoopHeaderBB->end());
     if (LoopHeaderBB) {
+      B.SetInsertPoint(LoopHeaderBB, LoopHeaderBB->end());
       for (PHINode &Phi : LoopHeaderBB->phis()) {
         int Idx = Phi.getBasicBlockIndex(LoopHeaderBB);
         if (Idx >= 0)

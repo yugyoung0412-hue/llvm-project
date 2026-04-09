@@ -38,14 +38,11 @@ struct TensorContractTileInfo {
   /// Empty → fall straight to scalar.block after the main loop.
   SmallVector<unsigned, 4> EpilogueKSizes;
 
-  /// If true, TC must be a multiple of PrimaryK for the main loop to fire
-  /// (e.g. AMX cannot partially load a tile without reconfiguration).
-  bool RequiresAlignedK = true;
-
-  /// If true, the target supports predicated/masked partial tiles, so the
-  /// epilogue can call tensor.contract with K < PrimaryK directly.
-  /// When set, EpilogueKSizes is ignored and only scalar.block is needed.
-  bool SupportsMasking = false;
+  // Note: RequiresAlignedK and SupportsMasking are reserved for future use.
+  // The current emitter always uses main_limit = (TC/PF)*PF (aligned) and
+  // always emits scalar.block for the remainder, so these flags are not yet
+  // consumed. They will be added when predicated/masked epilogue emission is
+  // implemented.
 };
 
 } // namespace llvm

@@ -7001,17 +7001,11 @@ AArch64TTIImpl::getTensorContractTileInfo(Type *ElemTy, unsigned /*RankA*/,
   // NEON FMMLA FP32: accumulates 8 FP32 pairs per call (K=8, M=8, N=8).
   // Half-tile (K=4) is achievable without reconfiguration.
   if (ST->hasMatMulFP32() && ElemTy->isFloatTy())
-    return TensorContractTileInfo{/*PrimaryK=*/8,
-                                  /*EpilogueKSizes=*/{4},
-                                  /*RequiresAlignedK=*/true,
-                                  /*SupportsMasking=*/false};
+    return TensorContractTileInfo{/*PrimaryK=*/8, /*EpilogueKSizes=*/{4}};
 
   // SVE2 MATMUL: predicated, any K is fine — no epilogue loops needed.
   if (ST->hasSVE2() && ElemTy->isFloatTy())
-    return TensorContractTileInfo{/*PrimaryK=*/4,
-                                  /*EpilogueKSizes=*/{},
-                                  /*RequiresAlignedK=*/false,
-                                  /*SupportsMasking=*/true};
+    return TensorContractTileInfo{/*PrimaryK=*/4, /*EpilogueKSizes=*/{}};
 
   return std::nullopt;
 }
