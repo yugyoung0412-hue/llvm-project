@@ -68,7 +68,7 @@ PreservedAnalyses LoopTensorizePass::run(Function &F,
       for (unsigned D = 0; D < InfoOpt->Depth; ++D)
         Plan.setDimPF(D, OverridePF);
 
-    TPlanLowering_lower(Plan, F, LI, SE, DT);
+    TPlanLowering_lower(Plan, F, LI, SE, DT, &TTI);
 
     PatternHint Hint = classifyPattern(*InfoOpt);
     LLVM_DEBUG(dbgs() << "PatternHint: "

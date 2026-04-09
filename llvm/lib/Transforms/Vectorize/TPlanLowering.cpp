@@ -21,6 +21,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
@@ -1329,7 +1330,8 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
 //===----------------------------------------------------------------------===//
 
 bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
-                                ScalarEvolution &SE, DominatorTree &DT) {
+                                ScalarEvolution &SE, DominatorTree &DT,
+                                const TargetTransformInfo *TTI) {
   // 1. Propagate DimSets via BFS.
   TPlanWidener_widen(Plan);
   LLVM_DEBUG({
@@ -1356,6 +1358,7 @@ bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
   SCEVExpander Expander(SE, "tplan.stride");
   State.SE = &SE;
   State.Expander = &Expander;
+  State.TTI = TTI;
   // Build DimToLoop for use in decomposePtrForDims().
   State.DimToLoop = buildDimToLoopForLowering(Plan, LI);
 

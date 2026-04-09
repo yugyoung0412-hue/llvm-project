@@ -54,6 +54,7 @@ class TPRecipeValue;
 class TPSlotTracker;
 class TPSymbolicValue;
 class TPlan;
+class TargetTransformInfo;
 class Value;
 struct TPTransformState;
 
@@ -1427,6 +1428,9 @@ struct TPTransformState {
   /// Populated by TPlanLowering_lower(); maps TPlan dim index -> Loop*.
   /// Used by decomposePtrForDims() in emitContraction().
   DenseMap<unsigned, Loop *> DimToLoop;
+  /// Available for dynamic-TC tiling queries in emitContraction().
+  /// Null when no TTI is provided (e.g. unit tests).
+  const TargetTransformInfo *TTI = nullptr;
 
   /// Tracks which IR instructions (the fadd/reduction-update) have already been
   /// lowered to tensor.contract calls (possibly with tiling loops). Depth-3 GEMMs
@@ -1481,7 +1485,8 @@ void TPlanWidener_widen(TPlan &Plan);
 /// Lower all recipes in Plan to LLVM IR using the DimSet-driven dispatch.
 /// Calls TPlanWidener_widen() and TPRecipePatternMatcher_match() internally.
 bool TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
-                          ScalarEvolution &SE, DominatorTree &DT);
+                          ScalarEvolution &SE, DominatorTree &DT,
+                          const TargetTransformInfo *TTI = nullptr);
 
 } // namespace llvm
 #endif // LLVM_TRANSFORMS_VECTORIZE_TPLAN_H
