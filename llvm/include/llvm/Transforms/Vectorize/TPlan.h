@@ -1504,6 +1504,10 @@ struct TPTransformState {
   /// emitContraction() call, so subsequent executions can reuse it.
   DenseMap<Instruction *, Value *> ContractionResults;
 
+  /// Opaque pointer to a PrebuiltTilingInfo allocated by preBuildTilingBlocks()
+  /// (defined in TPlanLowering.cpp). Null when not pre-built.
+  void *PrebuiltTilingPtr = nullptr;
+
   TPTransformState(IRBuilder<> &B, const TPlan &P) : Builder(B), Plan(P) {}
 
   Value *getValue(const TPRecipeValue *V) const { return ValueMap.lookup(V); }
