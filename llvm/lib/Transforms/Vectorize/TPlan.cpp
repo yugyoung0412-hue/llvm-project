@@ -1302,7 +1302,91 @@ void TPTilingRegion::execute(TPTransformState &State) {
     LLVM_DEBUG(dbgs() << "TPTilingRegion[static]: tile loop created, PF="
                       << TilingPF << "\n");
   } else {
-    llvm_unreachable("TPTilingRegion: DynamicTiled path not yet implemented");
+    // ── Dynamic tiling path ─────────────────────────────────────────────────
+    Value *TCVal = State.TilingTCVal;
+    assert(TCVal && "TPTilingRegion: TilingTCVal not set for DynamicTiled dim");
+
+    Type *IVTy = OrigKIVPhi->getType();
+    Value *TCNorm = B.CreateZExtOrTrunc(TCVal, IVTy, "tc.norm");
+    Value *PFVal  = ConstantInt::get(IVTy, TilingPF);
+    Value *Trips  = B.CreateUDiv(TCNorm, PFVal, "tensor.body.trips");
+    Value *Limit  = B.CreateMul(Trips, PFVal, "tensor.body.limit");
+    Value *Guard  = B.CreateICmpUGE(TCNorm, PFVal, "tensor.body.guard");
+
+    BasicBlock *TBHeader = BasicBlock::Create(Ctx, "tensor.body.header", F);
+    BasicBlock *TBBody   = BasicBlock::Create(Ctx, "tensor.body.body",   F);
+    BasicBlock *TBLatch  = BasicBlock::Create(Ctx, "tensor.body.latch",  F);
+    BasicBlock *TBExit   = BasicBlock::Create(Ctx, "tensor.body.exit",   F);
+
+    // KLoopBB → (tensor.body.header if TC >= PF, else tensor.body.exit).
+    B.CreateCondBr(Guard, TBHeader, TBExit);
+
+    // tensor.body.header: IV + bounds check.
+    B.SetInsertPoint(TBHeader);
+    PHINode *TBIV = B.CreatePHI(IVTy, 2, "tensor.body.iv");
+    TBIV->addIncoming(ConstantInt::get(IVTy, 0), KLoopBB);
+    Value *TBDone = B.CreateICmpUGE(TBIV, Limit, "tensor.body.done");
+    B.CreateCondBr(TBDone, TBExit, TBBody);
+
+    // Register TBIV in EmittedMap so WIDEN-GEP recipes get tile-corner GEPs.
+    State.EmittedMap[OrigKIVPhi] = TBIV;
+
+    // tensor.body.body: run body recipes.
+    B.SetInsertPoint(TBBody);
+    Body->execute(State);
+    assert(B.GetInsertBlock() == TBBody &&
+           "TPTilingRegion: Body::execute() left builder in unexpected block");
+    B.CreateBr(TBLatch);
+
+    // tensor.body.latch: IV += PF.
+    B.SetInsertPoint(TBLatch);
+    Value *TBNext = B.CreateAdd(TBIV, PFVal, "tensor.body.next");
+    TBIV->addIncoming(TBNext, TBLatch);
+    B.CreateBr(TBHeader);
+
+    // tensor.body.exit: ExitIV = PHI(0 from KLoopBB, TBIV from TBHeader).
+    // (If guard was false, ExitIV = 0; otherwise ExitIV = Limit.)
+    B.SetInsertPoint(TBExit);
+    PHINode *ExitIV = B.CreatePHI(IVTy, 2, "tensor.body.exit.iv");
+    ExitIV->addIncoming(ConstantInt::get(IVTy, 0), KLoopBB);
+    ExitIV->addIncoming(TBIV, TBHeader);
+
+    // scalar.block: iterate [ExitIV, TC) one element at a time.
+    Value *ScRem  = B.CreateSub(TCNorm, ExitIV, "scalar.rem");
+    Value *HasSc  = B.CreateICmpUGT(ScRem, ConstantInt::get(IVTy, 0),
+                                    "scalar.guard");
+
+    BasicBlock *ScPHBB  = TBExit;
+    BasicBlock *ScBody  = BasicBlock::Create(Ctx, "scalar.block",      F);
+    BasicBlock *ScExit  = BasicBlock::Create(Ctx, "scalar.block.exit", F);
+    B.CreateCondBr(HasSc, ScBody, ScExit);
+
+    // scalar.block body: ScIV iterates one element at a time.
+    B.SetInsertPoint(ScBody);
+    PHINode *ScIV = B.CreatePHI(IVTy, 2, "scalar.iv");
+    ScIV->addIncoming(ExitIV, ScPHBB);
+
+    // Register ScIV so ScalarEpilogue WIDEN-GEP emits scalar GEPs.
+    State.EmittedMap[OrigKIVPhi] = ScIV;
+    if (ScalarEpilogue)
+      ScalarEpilogue->execute(State);
+
+    Value *ScNext = B.CreateAdd(ScIV, ConstantInt::get(IVTy, 1), "scalar.next");
+    ScIV->addIncoming(ScNext, ScBody);
+    Value *ScDone = B.CreateICmpUGE(ScNext, TCNorm, "scalar.done");
+    B.CreateCondBr(ScDone, ScExit, ScBody);
+
+    // scalar.block.exit: continue to original successor.
+    assert(OrigSuccessor &&
+           "TPTilingRegion: KLoopBB must have a non-self successor");
+    B.SetInsertPoint(ScExit);
+    B.CreateBr(OrigSuccessor);
+
+    // Clear EmittedMap.
+    State.EmittedMap.erase(OrigKIVPhi);
+
+    LLVM_DEBUG(dbgs() << "TPTilingRegion[dynamic]: tensor.body + scalar.block created, PF="
+                      << TilingPF << "\n");
   }
 }
 void TPTilingRegion::print(raw_ostream &OS, const Twine &Indent,
