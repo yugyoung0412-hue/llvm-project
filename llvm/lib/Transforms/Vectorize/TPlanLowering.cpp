@@ -767,16 +767,39 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
     }
   }
 
+  // Original GEP instructions used as keys into EmittedMap.
+  Value *LHSGEPOrig =
+      cast<LoadInst>(LHSLoad->getInstruction())->getPointerOperand();
+  Value *RHSGEPOrig =
+      cast<LoadInst>(RHSLoad->getInstruction())->getPointerOperand();
+
+  // When TPTilingRegion::execute() ran the body recipes, WIDEN-GEP recipes
+  // emitted tile-corner GEPs (with TileIV substituted for OrigKIV via
+  // remapClone()) and stored them in EmittedMap[OrigGEP] = TileGEP.
+  // Use those directly so the tensor.contract call starts at the correct
+  // tile offset rather than re-deriving the base from decomposePtrForDims.
+  // Guard on TilingTCVal so non-tiling code paths continue to use the base.
+  auto lookupEmittedPtr = [&](Value *OrigGEP) -> Value * {
+    if (!State.TilingTCVal)
+      return nullptr;
+    auto It = State.EmittedMap.find(OrigGEP);
+    return It != State.EmittedMap.end() ? It->second : nullptr;
+  };
+
   // Decompose A and B pointer chains into base + per-dim affine strides.
+  // Strides always come from the original GEP analysis (ADecomp/BDecomp).
+  // The base pointer is overridden by the tile-corner when available.
   PtrDecomposition ADecomp = decomposePtrForDims(
-      cast<LoadInst>(LHSLoad->getInstruction())->getPointerOperand(),
+      LHSGEPOrig,
       LHSDR->DimSet, State.DimToLoop, OutermostGEMMLoop, *State.SE);
   PtrDecomposition BDecomp = decomposePtrForDims(
-      cast<LoadInst>(RHSLoad->getInstruction())->getPointerOperand(),
+      RHSGEPOrig,
       RHSDR->DimSet, State.DimToLoop, OutermostGEMMLoop, *State.SE);
 
-  Value *LHSPtr = ADecomp.Base;
-  Value *RHSPtr = BDecomp.Base;
+  Value *LHSPtr = lookupEmittedPtr(LHSGEPOrig);
+  if (!LHSPtr) LHSPtr = ADecomp.Base;
+  Value *RHSPtr = lookupEmittedPtr(RHSGEPOrig);
+  if (!RHSPtr) RHSPtr = BDecomp.Base;
   if (!LHSPtr || !RHSPtr)
     return nullptr;
 
