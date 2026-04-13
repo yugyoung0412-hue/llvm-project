@@ -1097,9 +1097,7 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
   // close pre-built loops, emit scalar.block remainder if dynamic K.
   // ----------------------------------------------------------------
   {
-    auto *Info = NeedsTiling
-                     ? static_cast<PrebuiltTilingInfo *>(State.PrebuiltTilingPtr)
-                     : nullptr;
+    PrebuiltTilingInfo *Info = nullptr; // Pre-built path disabled; TPTilingRegion handles tiling.
     if (Info && Info->BodyBB) {
       // Erase the scalar loop terminator (same as existing tiling paths).
       OrigTerm->eraseFromParent();
@@ -2234,7 +2232,7 @@ static void preBuildTilingBlocks(BasicBlock *InsertBB,
   }
 
   Info->BodyBB = TileB.GetInsertBlock();
-  State.PrebuiltTilingPtr = Info;
+  (void)Info; // preBuildTilingBlocks() is dead code; will be removed in Task 9.
 }
 
 //===----------------------------------------------------------------------===//
@@ -2291,74 +2289,12 @@ bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
     }
   });
 
-  // Find the outermost loop (highest dim index in DimToLoop).
-  Loop *OutermostLoop = nullptr;
-  unsigned MaxDim = 0;
-  for (const auto &[D, L] : State.DimToLoop) {
-    if (!OutermostLoop || D > MaxDim) { MaxDim = D; OutermostLoop = L; }
-  }
-
-  // If any dim needs a runtime profitability guard, insert the skeleton ONCE
-  // before the outermost tensor loop — here, before execute(), not inside
-  // emitContraction(). Mirrors VPlan's createVectorizedLoopSkeleton() call
-  // site: the guard fires once, not once per M×N iteration.
-  if (State.Policy.needsGuard()) {
-    // For each DynamicTiled dim, the PF in the Policy (from Plan.getPFForDim)
-    // serves as the guard threshold: TC >=u PF means at least one full tile
-    // can run on the tensor path.
-    for (const DimEmissionSpec &Spec : State.Policy.Specs) {
-      if (Spec.Mode != DimEmitMode::DynamicTiled)
-        continue;
-
-      if (!OutermostLoop)
-        break;
-
-      BasicBlock *OuterPH   = OutermostLoop->getLoopPreheader();
-      BasicBlock *OuterPred = OuterPH ? OuterPH->getSinglePredecessor() : nullptr;
-      if (!OuterPred || !OutermostLoop->getExitBlock())
-        break;
-
-      const SCEV *BTCSCEV = Plan.getTCForDim(Spec.Dim);
-      if (!BTCSCEV)
-        break;
-
-      // Expand the dim's backedge-taken count in OuterPred so it dominates
-      // the guard block that createTensorizedLoopSkeleton() will insert.
-      Instruction *ExpandAt = OuterPred->getTerminator();
-      Value *GuardBTC = Expander.expandCodeFor(
-          BTCSCEV, Builder.getInt64Ty(), ExpandAt);
-      IRBuilder<> PredB(ExpandAt);
-      Value *GuardTC =
-          PredB.CreateAdd(GuardBTC, PredB.getInt64(1), "tc.guard");
-
-      ValueToValueMapTy SkelVMap;
-      TensorizedLoopSkeleton Skel = createTensorizedLoopSkeleton(
-          OutermostLoop, GuardTC, Spec.PF, LI, DT, SkelVMap);
-      LLVM_DEBUG({
-        if (Skel.Valid)
-          dbgs() << "TPlanLowering: profitability guard inserted before "
-                 << OutermostLoop->getName() << " (dim=" << Spec.Dim
-                 << " PF=" << Spec.PF << ")\n";
-        else
-          dbgs() << "TPlanLowering: skeleton creation failed for dim "
-                 << Spec.Dim << "; proceeding without guard\n";
-      });
-      // Currently only one DynamicTiled dim is supported per lowering.
-      break;
-    }
-  }
-
-  // Section 2: Pre-build floating tiling loop skeletons before execute().
-  // State.Expander is already initialized; InsertBB is the tensor path
-  // preheader (OutermostLoop->getLoopPreheader()). SCEV expansions land
-  // in InsertBB (before its terminator); loop blocks float off AnchorBB
-  // until emitContraction() wires them into the live CFG.
-  if (State.Policy.needsGuard()) {
-    if (OutermostLoop) {
-      BasicBlock *TensorPH = OutermostLoop->getLoopPreheader();
-      preBuildTilingBlocks(TensorPH, State, Plan, CM);
-    }
-  }
+  // Transform TPlan structure (no IR mutation here).
+  // TPlanTransformer inserts TPGuardBlock + TPTilingRegion nodes,
+  // sets State.TilingTCVal, and marks IsSubsumed on absorbed recipes.
+  TPlanTransformer Transformer(Plan, State.Policy, Expander, Builder,
+                               CM, State.DimToLoop);
+  Transformer.transform(State);
 
   if (Plan.getEntry()) {
     // Collect and execute all blocks in top-level construction order.
@@ -2366,9 +2302,6 @@ bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
     for (TPBlockBase *B : constructionOrder(Plan.getEntry()))
       B->execute(State);
   }
-
-  // Clean up pre-built tiling info if allocated.
-  delete static_cast<PrebuiltTilingInfo *>(State.PrebuiltTilingPtr);
 
   return true;
 }

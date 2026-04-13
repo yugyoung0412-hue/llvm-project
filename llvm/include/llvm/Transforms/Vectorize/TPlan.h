@@ -1604,10 +1604,6 @@ struct TPTransformState {
   /// emitContraction() call, so subsequent executions can reuse it.
   DenseMap<Instruction *, Value *> ContractionResults;
 
-  /// Opaque pointer to a PrebuiltTilingInfo allocated by preBuildTilingBlocks()
-  /// (defined in TPlanLowering.cpp). Null when not pre-built.
-  void *PrebuiltTilingPtr = nullptr;
-
   /// Set by TPlanTransformer before execute() for the tiling dim's trip-count.
   /// TPTilingRegion::execute() reads this to compute tile loop bounds.
   Value *TilingTCVal = nullptr;
