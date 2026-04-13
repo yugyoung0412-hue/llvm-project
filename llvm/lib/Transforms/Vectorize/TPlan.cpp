@@ -1100,3 +1100,26 @@ void TPlan::print(raw_ostream &OS) const {
 
   OS << "}\n";
 }
+
+//===----------------------------------------------------------------------===//
+// TPGuardBlock — stub implementations
+//===----------------------------------------------------------------------===//
+void TPGuardBlock::execute(TPTransformState &State) {
+  llvm_unreachable("TPGuardBlock::execute() not yet implemented");
+}
+void TPGuardBlock::print(raw_ostream &OS, const Twine &Indent,
+                         TPSlotTracker &) const {
+  OS << Indent << "TPGuardBlock (TC >= " << GuardPF << ")\n";
+}
+
+//===----------------------------------------------------------------------===//
+// TPTilingRegion — stub implementations
+//===----------------------------------------------------------------------===//
+void TPTilingRegion::execute(TPTransformState &State) {
+  llvm_unreachable("TPTilingRegion::execute() not yet implemented");
+}
+void TPTilingRegion::print(raw_ostream &OS, const Twine &Indent,
+                           TPSlotTracker &) const {
+  OS << Indent << "TPTilingRegion dim=" << TilingDim << " PF=" << TilingPF
+     << "\n";
+}

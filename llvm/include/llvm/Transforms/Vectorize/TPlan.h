@@ -58,6 +58,9 @@ class TargetTransformInfo;
 class Value;
 struct TPTransformState;
 
+// Forward declaration — full definition is near TPTransformState below.
+enum class DimEmitMode : int;
+
 //===----------------------------------------------------------------------===//
 // TPValue — base SSA value node with use tracking (mirrors VPValue)
 //===----------------------------------------------------------------------===//
@@ -281,7 +284,13 @@ class TPBlockBase {
   friend class TPBlockUtils;
 
 public:
-  using TPBlockTy = enum { TPRegionBlockSC, TPBasicBlockSC, TPIRBasicBlockSC };
+  using TPBlockTy = enum {
+    TPRegionBlockSC,
+    TPBasicBlockSC,
+    TPIRBasicBlockSC,
+    TPGuardBlockSC,
+    TPTilingRegionSC,
+  };
   using TPBlocksTy = SmallVectorImpl<TPBlockBase *>;
 
 protected:
@@ -506,6 +515,69 @@ private:
   DenseMap<Loop *, TPBlockBase *> Loop2HeaderTPB;
   DenseMap<Loop *, TPBlockBase *> Loop2LatchTPB;
   bool IsReplicator = false;
+};
+
+//===----------------------------------------------------------------------===//
+// TPGuardBlock — runtime profitability guard (TC >=u PF ? tensor : scalar)
+//===----------------------------------------------------------------------===//
+class TPGuardBlock : public TPBlockBase {
+  Loop *OutermostLoop;
+  Value *RuntimeTC;
+  unsigned GuardPF;
+  TPBlockBase *TensorPath;
+
+public:
+  TPGuardBlock(Loop *L, Value *TC, unsigned PF, TPBlockBase *Tensor)
+      : TPBlockBase(TPGuardBlockSC, "guard"), OutermostLoop(L), RuntimeTC(TC),
+        GuardPF(PF), TensorPath(Tensor) {}
+
+  Loop        *getOutermostLoop() const { return OutermostLoop; }
+  Value       *getRuntimeTC()     const { return RuntimeTC; }
+  unsigned     getPF()            const { return GuardPF; }
+  TPBlockBase *getTensorPath()    const { return TensorPath; }
+
+  void execute(TPTransformState &State) override;
+  void print(raw_ostream &OS, const Twine &Indent,
+             TPSlotTracker &Tracker) const override;
+
+  static bool classof(const TPBlockBase *B) {
+    return B->getTPBlockID() == TPGuardBlockSC;
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// TPTilingRegion — tiling loop structure replacing innermost TPRegionBlock
+//===----------------------------------------------------------------------===//
+class TPTilingRegion : public TPBlockBase {
+  unsigned TilingDim;
+  unsigned TilingPF;
+  DimEmitMode Mode;
+  TPBasicBlock *Body;
+  TPBasicBlock *ScalarEpilogue;
+  PHINode *OrigKIVPhi;
+
+public:
+  TPTilingRegion(unsigned Dim, unsigned PF, DimEmitMode Mode,
+                 TPBasicBlock *Body, TPBasicBlock *ScalarEpilogue,
+                 PHINode *OrigKIVPhi)
+      : TPBlockBase(TPTilingRegionSC, "tiling-region"), TilingDim(Dim),
+        TilingPF(PF), Mode(Mode), Body(Body), ScalarEpilogue(ScalarEpilogue),
+        OrigKIVPhi(OrigKIVPhi) {}
+
+  unsigned      getDim()            const { return TilingDim; }
+  unsigned      getPF()             const { return TilingPF; }
+  DimEmitMode   getMode()           const { return Mode; }
+  TPBasicBlock *getBody()           const { return Body; }
+  TPBasicBlock *getScalarEpilogue() const { return ScalarEpilogue; }
+  PHINode      *getOrigKIVPhi()     const { return OrigKIVPhi; }
+
+  void execute(TPTransformState &State) override;
+  void print(raw_ostream &OS, const Twine &Indent,
+             TPSlotTracker &Tracker) const override;
+
+  static bool classof(const TPBlockBase *B) {
+    return B->getTPBlockID() == TPTilingRegionSC;
+  }
 };
 
 //===----------------------------------------------------------------------===//
@@ -1423,7 +1495,7 @@ private:
 //===----------------------------------------------------------------------===//
 
 /// How a tensor dimension should be emitted during lowering.
-enum class DimEmitMode {
+enum class DimEmitMode : int {
   Inline,       ///< TC <= PF for this dim: no tiling loop needed.
   StaticTiled,  ///< TC > PF (known at compile time) or dynamic output dim:
                 ///< emit umin-bounded tiling loop via emitTilingLoop().
@@ -1515,6 +1587,10 @@ struct TPTransformState {
   /// Opaque pointer to a PrebuiltTilingInfo allocated by preBuildTilingBlocks()
   /// (defined in TPlanLowering.cpp). Null when not pre-built.
   void *PrebuiltTilingPtr = nullptr;
+
+  /// Set by TPlanTransformer before execute() for the tiling dim's trip-count.
+  /// TPTilingRegion::execute() reads this to compute tile loop bounds.
+  Value *TilingTCVal = nullptr;
 
   TPTransformState(IRBuilder<> &B, const TPlan &P) : Builder(B), Plan(P) {}
 
