@@ -17,10 +17,13 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Value.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <string>  // for std::to_string
+
+#define DEBUG_TYPE "tplan"
 
 using namespace llvm;
 
@@ -1120,8 +1123,8 @@ void TPGuardBlock::execute(TPTransformState &State) {
   BasicBlock *OrigPreheader = OutermostLoop->getLoopPreheader();
   assert(OrigPreheader && "OutermostLoop must have a unique preheader");
 
-  BasicBlock *ExitBB = OutermostLoop->getExitBlock();
-  assert(ExitBB && "OutermostLoop must have a single exit block");
+  assert(OutermostLoop->getExitBlock() &&
+         "OutermostLoop must have a single exit block");
 
   BasicBlock *OrigPred = OrigPreheader->getSinglePredecessor();
   assert(OrigPred && "Loop preheader must have a single predecessor");
@@ -1133,7 +1136,7 @@ void TPGuardBlock::execute(TPTransformState &State) {
 
   ValueToValueMapTy SkelVMap;
   SmallVector<BasicBlock *, 16> ClonedBlocks;
-  Loop *ScalarLoop = cloneLoopWithPreheader(
+  [[maybe_unused]] Loop *ScalarLoop = cloneLoopWithPreheader(
       OrigPreheader, // Insert cloned blocks before this block.
       OrigPred,      // Dominator of the region being cloned into.
       OutermostLoop, SkelVMap, ".scalar", &LI, &DT, ClonedBlocks);
@@ -1190,6 +1193,11 @@ void TPGuardBlock::execute(TPTransformState &State) {
   DT.addNewBlock(GuardBB, OrigPred);
   DT.changeImmediateDominator(OrigPreheader, GuardBB);
   DT.changeImmediateDominator(ScalarPreheader, GuardBB);
+
+  LLVM_DEBUG(dbgs() << "TPGuardBlock: guard inserted\n"
+                    << "  GuardBB:    " << GuardBB->getName() << "\n"
+                    << "  TensorPH:   " << OrigPreheader->getName() << "\n"
+                    << "  ScalarPH:   " << ScalarPreheader->getName() << "\n");
 
   // ---- Execute the tensor path (original TPlan subtree) -------------------
 
