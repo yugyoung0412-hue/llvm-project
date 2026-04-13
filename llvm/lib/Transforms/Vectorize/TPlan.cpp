@@ -1307,7 +1307,9 @@ void TPTilingRegion::execute(TPTransformState &State) {
     assert(TCVal && "TPTilingRegion: TilingTCVal not set for DynamicTiled dim");
 
     Type *IVTy = OrigKIVPhi->getType();
-    Value *TCNorm = B.CreateZExtOrTrunc(TCVal, IVTy, "tc.norm");
+    Value *TCNorm = (TCVal->getType() != IVTy)
+                       ? B.CreateZExtOrTrunc(TCVal, IVTy, "tc.norm")
+                       : TCVal;
     Value *PFVal  = ConstantInt::get(IVTy, TilingPF);
     Value *Trips  = B.CreateUDiv(TCNorm, PFVal, "tensor.body.trips");
     Value *Limit  = B.CreateMul(Trips, PFVal, "tensor.body.limit");
@@ -1370,6 +1372,9 @@ void TPTilingRegion::execute(TPTransformState &State) {
     State.EmittedMap[OrigKIVPhi] = ScIV;
     if (ScalarEpilogue)
       ScalarEpilogue->execute(State);
+    // ScalarEpilogue::execute() may reposition the builder; restore to ScBody
+    // before emitting the latch increment and back-branch.
+    B.SetInsertPoint(ScBody);
 
     Value *ScNext = B.CreateAdd(ScIV, ConstantInt::get(IVTy, 1), "scalar.next");
     ScIV->addIncoming(ScNext, ScBody);
