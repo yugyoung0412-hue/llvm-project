@@ -1536,10 +1536,16 @@ void TPWidenIntOrFpInductionRecipe::execute(TPTransformState &State) const {
 }
 
 void TPWidenPointerInductionRecipe::execute(TPTransformState &State) const {
+  // Intentionally not guarded by IsSubsumed: this recipe only registers an
+  // existing PHINode in the ValueMap. It must always run so that downstream
+  // recipes that look up this IV do not receive a null value.
   State.setValue(this, IVPhi);
 }
 
 void TPReductionPHIRecipe::execute(TPTransformState &State) const {
+  // Intentionally not guarded by IsSubsumed: registers the reduction PHI in
+  // the ValueMap. Subsumption of reduction PHIs is not in scope; the PHI must
+  // always be registered for accumulator look-ups in Contraction recipes.
   State.setValue(this, RedPhi);
 }
 
