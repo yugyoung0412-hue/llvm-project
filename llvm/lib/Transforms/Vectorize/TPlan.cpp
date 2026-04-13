@@ -618,6 +618,17 @@ void TPIRBasicBlock::execute(TPTransformState &State) {
 }
 
 void TPRegionBlock::execute(TPTransformState &State) {
+  // If a TPlanTransformer installed a tiling override (e.g. TPTilingRegion),
+  // first run Entry to position the builder at the K-loop entry block (e.g.
+  // ir-bb<k.loop>), then delegate to the tiling override which takes KLoopBB
+  // from Builder.GetInsertBlock(). Entry's recipes are IsSubsumed=true so no
+  // IR is emitted — it's purely a builder-repositioning step.
+  if (TilingOverride) {
+    if (Entry)
+      Entry->execute(State);
+    TilingOverride->execute(State);
+    return;
+  }
   if (!Entry)
     return;
   for (TPBlockBase *B : intraRegionOrder(Entry)) {

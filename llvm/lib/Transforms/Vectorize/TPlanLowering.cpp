@@ -507,7 +507,7 @@ struct PrebuiltTilingInfo {
 /// are known). The Policy PF is used as the guard threshold in
 /// createTensorizedLoopSkeleton().
 static EmissionPolicy
-buildEmissionPolicy(const TPlan &Plan,
+TPlanPolicyAnalysis_analyze(const TPlan &Plan,
                     const DenseMap<unsigned, Loop *> &DimToLoop,
                     const RecipeClassMap &CM) {
   // Collect contraction dims from all contraction recipes in the ClassMap.
@@ -556,6 +556,180 @@ buildEmissionPolicy(const TPlan &Plan,
     }
   }
   return Policy;
+}
+
+//===----------------------------------------------------------------------===//
+// TPlanTransformer — rewrites the TPlan tree before execute()
+//===----------------------------------------------------------------------===//
+
+/// Rewrites the TPlan tree to replace IR-level surgery with explicit TPlan
+/// nodes. After transform():
+///  - The innermost TPRegionBlock (K-loop) has TilingOverride set to a
+///    TPTilingRegion that owns the tiling loop structure.
+///  - If Policy has a DynamicTiled dim: a TPGuardBlock wraps the root.
+///  - Body recipes that are absorbed by tensor.contract have IsSubsumed=true.
+///  - State.TilingTCVal is populated with the expanded trip-count Value*.
+///
+/// IR is NOT modified by transform(); only the TPlan tree changes.
+class TPlanTransformer {
+  TPlan &Plan;
+  const EmissionPolicy &Policy;
+  SCEVExpander &Expander;
+  IRBuilder<> &Builder;
+  const RecipeClassMap &CM;
+  Loop *OutermostLoop;
+
+public:
+  TPlanTransformer(TPlan &P, const EmissionPolicy &Pol,
+                   SCEVExpander &Exp, IRBuilder<> &B,
+                   const RecipeClassMap &CM,
+                   const DenseMap<unsigned, Loop *> &DimToLoop)
+      : Plan(P), Policy(Pol), Expander(Exp), Builder(B), CM(CM) {
+    OutermostLoop = nullptr;
+    unsigned MaxDim = 0;
+    for (const auto &[D, L] : DimToLoop)
+      if (!OutermostLoop || D > MaxDim) { MaxDim = D; OutermostLoop = L; }
+  }
+
+  /// Entry point: rewrite Plan according to Policy. Populates State.TilingTCVal.
+  void transform(TPTransformState &State);
+
+private:
+  /// Return the innermost TPRegionBlock (Regions[0] = innermost per buildInitial).
+  TPRegionBlock *findInnermostRegion() {
+    auto Rs = Plan.getRegions();
+    return Rs.empty() ? nullptr : Rs[0];
+  }
+
+  /// Mark body recipes absorbed by tensor.contract as IsSubsumed=true.
+  /// WIDEN-LOAD, WIDEN-STORE, fmul/fadd (non-Contraction), WIDEN-INDUCTION
+  /// are subsumed. WIDEN-GEP (tile-pointer computation) and Contraction are not.
+  void markSubsumedRecipes(TPBasicBlock *Body);
+
+  /// Build a scalar epilogue block (K%PF iteration). Placeholder — returns
+  /// nullptr until Task 8 implements the recipe clone mechanism.
+  TPBasicBlock *buildScalarEpilogue(TPBasicBlock *Body) { return nullptr; }
+
+  /// Replace the innermost K-loop with a TPTilingRegion by installing a
+  /// TilingOverride on the innermost TPRegionBlock.
+  TPTilingRegion *replaceWithTilingRegion(TPRegionBlock *Innermost,
+                                           const DimEmissionSpec &Spec);
+
+  /// Wrap Plan's root in a TPGuardBlock (TC >=u PF ? tensor : scalar).
+  void insertGuardBlock(const DimEmissionSpec &Spec, Value *TCVal);
+};
+
+void TPlanTransformer::transform(TPTransformState &State) {
+  // Pick the first tiling spec (StaticTiled or DynamicTiled).
+  const DimEmissionSpec *TilingSpec = nullptr;
+  for (const auto &S : Policy.Specs)
+    if (S.Mode != DimEmitMode::Inline)
+      TilingSpec = &S;
+  if (!TilingSpec)
+    return; // Inline only — no tiling needed.
+
+  const SCEV *TCSCEV = Plan.getTCForDim(TilingSpec->Dim);
+  if (!TCSCEV)
+    return;
+
+  // Expand the backedge-taken count SCEV before the outermost loop so it
+  // dominates all newly created tiling blocks.
+  BasicBlock *InsertBB = nullptr;
+  if (OutermostLoop)
+    if (BasicBlock *PH = OutermostLoop->getLoopPreheader())
+      InsertBB = PH->getSinglePredecessor();
+  if (!InsertBB)
+    return;
+
+  // TC = BTC + 1 (SCEV stores backedge-taken count, not trip count).
+  Value *BTC =
+      Expander.expandCodeFor(TCSCEV, Builder.getInt64Ty(),
+                             InsertBB->getTerminator());
+  IRBuilder<> PredB(InsertBB->getTerminator());
+  Value *TCVal = PredB.CreateAdd(BTC, PredB.getInt64(1), "tc.tiling");
+  State.TilingTCVal = TCVal;
+
+  // Replace innermost region with a TPTilingRegion.
+  TPRegionBlock *Innermost = findInnermostRegion();
+  if (!Innermost)
+    return;
+  replaceWithTilingRegion(Innermost, *TilingSpec);
+
+  // For DynamicTiled dims, insert a runtime profitability guard.
+  if (TilingSpec->Mode == DimEmitMode::DynamicTiled)
+    insertGuardBlock(*TilingSpec, TCVal);
+
+  LLVM_DEBUG(dbgs() << "TPlanTransformer: transformed Plan for dim="
+                    << TilingSpec->Dim << " PF=" << TilingSpec->PF << "\n");
+}
+
+void TPlanTransformer::markSubsumedRecipes(TPBasicBlock *Body) {
+  for (TPRecipeBase &R : *Body) {
+    auto It = CM.find(&R);
+    TensorOpKind Kind =
+        (It != CM.end()) ? It->second.Kind : TensorOpKind::Scalar;
+    switch (R.getTPRecipeID()) {
+    case TPRecipeBase::TPWidenLoadSC:
+    case TPRecipeBase::TPWidenStoreSC:
+      R.setSubsumed(true);
+      break;
+    case TPRecipeBase::TPWidenSC:
+      // Subsumed unless this IS the Contraction recipe (fadd reduction update).
+      if (Kind != TensorOpKind::Contraction)
+        R.setSubsumed(true);
+      break;
+    case TPRecipeBase::TPWidenIntOrFpInductionSC:
+    case TPRecipeBase::TPWidenPointerInductionSC:
+      // K IV is subsumed — TileIV registered in EmittedMap replaces it.
+      R.setSubsumed(true);
+      break;
+    default:
+      // WIDEN-GEP (tile-corner pointer), Contraction, Reduction-PHI: keep.
+      break;
+    }
+  }
+}
+
+TPTilingRegion *TPlanTransformer::replaceWithTilingRegion(
+    TPRegionBlock *Innermost, const DimEmissionSpec &Spec) {
+  // The Entry block (ir-bb<K.header>) holds all body recipes for loops
+  // where header = latch = body (the common single-block K-loop in GEMM).
+  auto *Body = cast<TPBasicBlock>(Innermost->getEntry());
+
+  markSubsumedRecipes(Body);
+
+  TPBasicBlock *Epilogue =
+      (Spec.Mode == DimEmitMode::DynamicTiled) ? buildScalarEpilogue(Body)
+                                                : nullptr;
+
+  // Locate the K-loop IV PHINode for EmittedMap registration in execute().
+  PHINode *KIVPhi = nullptr;
+  for (TPRecipeBase &R : *Body) {
+    if (auto *IV = dyn_cast<TPWidenInductionRecipe>(&R)) {
+      if (IV->getDimIndex() == Spec.Dim) {
+        KIVPhi = IV->getIVPhi();
+        break;
+      }
+    }
+  }
+  assert(KIVPhi && "TPlanTransformer: no IV recipe found for tiling dim");
+
+  auto *TR = new TPTilingRegion(Spec.Dim, Spec.PF, Spec.Mode, Body, Epilogue,
+                                 KIVPhi);
+
+  // Install the tiling override — TPRegionBlock::execute() will delegate to TR.
+  Innermost->setTilingOverride(TR);
+  return TR;
+}
+
+void TPlanTransformer::insertGuardBlock(const DimEmissionSpec &Spec,
+                                         Value *TCVal) {
+  if (!OutermostLoop)
+    return;
+  TPBlockBase *Root = Plan.getEntry();
+  auto *Guard =
+      new TPGuardBlock(OutermostLoop, TCVal, Spec.PF, Root);
+  Plan.setEntry(Guard);
 }
 
 static Value *emitContraction(const TPRecipeBase *FusedMul,
@@ -2076,13 +2250,13 @@ bool llvm::TPlanLowering_lower(TPlan &Plan, Function &F, LoopInfo &LI,
   State.TTI = TTI;
   State.LI = &LI;
   State.DT = &DT;
-  // Build DimToLoop for use in decomposePtrForDims() and buildEmissionPolicy().
+  // Build DimToLoop for use in decomposePtrForDims() and TPlanPolicyAnalysis_analyze().
   State.DimToLoop = buildDimToLoopForLowering(Plan, LI);
 
   // Build the EmissionPolicy upfront — before execute() — so that both the
   // skeleton guard insertion and emitContraction() share the same dim
   // classification derived from TPlan's PF/TC data.
-  State.Policy = buildEmissionPolicy(Plan, State.DimToLoop, CM);
+  State.Policy = TPlanPolicyAnalysis_analyze(Plan, State.DimToLoop, CM);
   LLVM_DEBUG({
     dbgs() << "TPlanLowering: EmissionPolicy (" << State.Policy.Specs.size()
            << " specs):\n";

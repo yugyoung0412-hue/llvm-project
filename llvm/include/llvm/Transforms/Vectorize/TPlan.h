@@ -487,6 +487,12 @@ public:
   TPRegionBlock *getInner() const               { return Inner; }
   void           setInner(TPRegionBlock *R)     { Inner = R; }
 
+  /// When set, execute() delegates entirely to TilingOverride instead of
+  /// traversing the normal Entry/Body/Latch recipe sequence. Used by
+  /// TPlanTransformer to replace the innermost K-loop with a TPTilingRegion.
+  TPBlockBase   *getTilingOverride() const      { return TilingOverride; }
+  void           setTilingOverride(TPBlockBase *B) { TilingOverride = B; }
+
   /// Returns the header block for loop \p L. Cast to TPIRBasicBlock* to access
   /// the underlying BasicBlock*.
   TPBlockBase *getHeaderForLoop(Loop *L) const { return Loop2HeaderTPB.lookup(L); }
@@ -510,6 +516,9 @@ private:
   TPBlockBase *Middle   = nullptr;  ///< Epilogue-check block; null for innermost.
   TPBlockBase *Scalar   = nullptr;  ///< Scalar preheader; null for innermost.
   TPRegionBlock *Inner  = nullptr;  ///< Next-inner nested region; null if leaf.
+  /// When non-null, execute() delegates to this block instead of the normal
+  /// K-loop recipe traversal. Set by TPlanTransformer for tiled dims.
+  TPBlockBase *TilingOverride = nullptr;
   DenseMap<Loop *, TPBlockBase *> Loop2HeaderTPB;
   DenseMap<Loop *, TPBlockBase *> Loop2LatchTPB;
   bool IsReplicator = false;
