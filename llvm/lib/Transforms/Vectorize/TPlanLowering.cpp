@@ -929,7 +929,9 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
         Info->DynamicLoop->IV->replaceIncomingBlockWith(Info->AnchorBB,
                                                          LoopHeaderBB);
       }
-      Info->AnchorBB->eraseFromParent(); // safe: no predecessors remain
+      assert(pred_empty(Info->AnchorBB) &&
+             "AnchorBB must have no predecessors after replaceIncomingBlockWith");
+      Info->AnchorBB->eraseFromParent();
 
       // Position B in the pre-built innermost body block.
       B.SetInsertPoint(Info->BodyBB);
@@ -995,6 +997,13 @@ static Value *emitContraction(const TPRecipeBase *FusedMul,
 
       // Close dynamic K loop and emit scalar.block remainder.
       if (Info->DynamicLoop) {
+        // Invariant: the dynamic loop must tile the contraction dim (K) so that
+        // the scalar.block epilogue can advance A/B by CachedAContractStride /
+        // CachedBContractStride. A dynamic output dim would require different
+        // stride logic and is not supported by this fast path.
+        assert(Info->DynDim == static_cast<unsigned>(ContractDim) &&
+               "scalar.block in pre-built path assumes DynamicLoop tiles the "
+               "contraction dim, not an output dim");
         B.CreateBr(Info->DynamicLoop->LatchBB);
         B.SetInsertPoint(Info->DynamicLoop->ExitBB);
 
