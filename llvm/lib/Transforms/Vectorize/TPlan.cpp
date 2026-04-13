@@ -1273,6 +1273,10 @@ void TPTilingRegion::execute(TPTransformState &State) {
     // TileBody: run all body recipes.
     B.SetInsertPoint(TileBody);
     Body->execute(State);
+    // Body->execute() must leave the builder inside TileBody (K-body is flat —
+    // no nested control flow). A nested block would make the branch below wrong.
+    assert(B.GetInsertBlock() == TileBody &&
+           "TPTilingRegion: Body::execute() left builder in unexpected block");
     B.CreateBr(TileLatch);
 
     // TileLatch: increment IV and loop back.
@@ -1282,9 +1286,15 @@ void TPTilingRegion::execute(TPTransformState &State) {
     B.CreateBr(TileHeader);
 
     // TileExit: continue to the original successor.
+    // OrigSuccessor must be non-null: KLoopBB is a loop body block; its
+    // non-self successor is always the outer latch/exit block.
+    // PHI nodes in OrigSuccessor that list KLoopBB as predecessor must use
+    // KLoopBB (not TileExit) because KLoopBB still directly precedes TileHeader,
+    // which precedes TileExit — the CFG path from KLoopBB → TileHeader → TileExit
+    // means KLoopBB dominates TileExit, so OrigSuccessor PHIs are still valid.
+    assert(OrigSuccessor && "TPTilingRegion: KLoopBB must have a non-self successor");
     B.SetInsertPoint(TileExit);
-    if (OrigSuccessor)
-      B.CreateBr(OrigSuccessor);
+    B.CreateBr(OrigSuccessor);
 
     // Clear the EmittedMap entry to avoid polluting other tiling regions.
     State.EmittedMap.erase(OrigKIVPhi);
