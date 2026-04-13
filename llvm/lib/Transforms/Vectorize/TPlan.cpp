@@ -1120,6 +1120,9 @@ void TPTilingRegion::execute(TPTransformState &State) {
 }
 void TPTilingRegion::print(raw_ostream &OS, const Twine &Indent,
                            TPSlotTracker &) const {
+  StringRef ModeStr = Mode == DimEmitMode::StaticTiled  ? "StaticTiled"
+                    : Mode == DimEmitMode::DynamicTiled ? "DynamicTiled"
+                                                        : "Inline";
   OS << Indent << "TPTilingRegion dim=" << TilingDim << " PF=" << TilingPF
-     << "\n";
+     << " mode=" << ModeStr << "\n";
 }
