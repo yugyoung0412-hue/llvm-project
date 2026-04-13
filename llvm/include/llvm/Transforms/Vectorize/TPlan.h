@@ -647,7 +647,15 @@ class TPRecipeBase
   const unsigned char SubclassID;  // holds a TPRecipeTy value
   TPBasicBlock *Parent = nullptr;  // required by ilist_node_with_parent
 
+  /// When true, execute() is a no-op. Set by TPlanTransformer on recipes
+  /// that are absorbed into a tensor op (e.g. loads/fmul/fadd subsumed by
+  /// tensor.contract). ScalarEpilogue copies always have IsSubsumed=false.
+  bool IsSubsumed = false;
+
 public:
+  bool isSubsumed() const { return IsSubsumed; }
+  void setSubsumed(bool V = true) { IsSubsumed = V; }
+
   // TPRecipeTy: mirrors VPRecipeTy. Access as TPRecipeBase::TPWidenSC.
   using TPRecipeTy = enum {
     // Non-PHI recipes

@@ -1530,6 +1530,7 @@ void TPCanonicalIVExitCmpRecipe::execute(TPTransformState &) const {
 }
 
 void TPWidenIntOrFpInductionRecipe::execute(TPTransformState &State) const {
+  if (isSubsumed()) return;
   // IV values are loop PHIs already present in IR; register them in ValueMap.
   State.setValue(this, IVPhi);
 }
@@ -1562,6 +1563,7 @@ void TPPhi::execute(TPTransformState &) const {
 }
 
 void TPWidenCastRecipe::execute(TPTransformState &State) const {
+  if (isSubsumed()) return;
   auto *SrcDR = dyn_cast<TPSingleDefRecipe>(getOperand(0));
   Value *Src = SrcDR ? State.getValue(SrcDR) : nullptr;
   if (!Src) return;
@@ -1574,6 +1576,7 @@ void TPWidenCastRecipe::execute(TPTransformState &State) const {
 }
 
 void TPWidenGEPRecipe::execute(TPTransformState &State) const {
+  if (isSubsumed()) return;
   auto *Clone = GEPInst->clone();
   State.remapClone(Clone);
   Value *Result = State.Builder.Insert(Clone);
@@ -1583,6 +1586,7 @@ void TPWidenGEPRecipe::execute(TPTransformState &State) const {
 }
 
 void TPWidenLoadRecipe::execute(TPTransformState &State) const {
+  if (isSubsumed()) return;
   auto *Clone = LoadInst->clone();
   State.remapClone(Clone);
   Value *Result = State.Builder.Insert(Clone);
@@ -1591,6 +1595,7 @@ void TPWidenLoadRecipe::execute(TPTransformState &State) const {
 }
 
 void TPWidenStoreRecipe::execute(TPTransformState &State) const {
+  if (isSubsumed()) return;
   auto *Clone = StoreInst->clone();
   State.remapClone(Clone);
   State.Builder.Insert(Clone);
@@ -1598,6 +1603,7 @@ void TPWidenStoreRecipe::execute(TPTransformState &State) const {
 }
 
 void TPWidenRecipe::execute(TPTransformState &State) const {
+  if (isSubsumed()) return;
   TensorOpKind Kind = State.getKind(this);
 
   switch (Kind) {
