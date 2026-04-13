@@ -1209,10 +1209,91 @@ void TPGuardBlock::print(raw_ostream &OS, const Twine &Indent,
 }
 
 //===----------------------------------------------------------------------===//
-// TPTilingRegion — stub implementations
+// TPTilingRegion — implementations
 //===----------------------------------------------------------------------===//
 void TPTilingRegion::execute(TPTransformState &State) {
-  llvm_unreachable("TPTilingRegion::execute() not yet implemented");
+  IRBuilder<> &B = State.Builder;
+  LLVMContext &Ctx = B.getContext();
+  Function *F = B.GetInsertBlock()->getParent();
+
+  // Current insert block is the K-loop body BB set by the parent TPRegionBlock.
+  BasicBlock *KLoopBB = B.GetInsertBlock();
+
+  // Find the non-self successor of the K-loop body (the BB after the loop).
+  Instruction *OrigTerm = KLoopBB->getTerminator();
+  BasicBlock *OrigSuccessor = nullptr;
+  for (BasicBlock *Succ : successors(KLoopBB))
+    if (Succ != KLoopBB) { OrigSuccessor = Succ; break; }
+
+  // Remove K-loop self-edges from PHI nodes; the tiling loop drives iteration.
+  for (PHINode &Phi : KLoopBB->phis()) {
+    int SelfIdx = Phi.getBasicBlockIndex(KLoopBB);
+    if (SelfIdx >= 0)
+      Phi.removeIncomingValue(static_cast<unsigned>(SelfIdx),
+                              /*DeletePHIIfEmpty=*/false);
+  }
+
+  // Erase the original K-loop terminator.
+  OrigTerm->eraseFromParent();
+
+  if (Mode == DimEmitMode::StaticTiled) {
+    Value *TCVal = State.TilingTCVal;
+    assert(TCVal && "TPTilingRegion: TilingTCVal not set for StaticTiled dim");
+
+    // Use OrigKIVPhi's type for all arithmetic to remain type-agnostic.
+    Type *IVTy = OrigKIVPhi->getType();
+
+    // Normalize TCVal to IVTy (in case TilingTCVal was produced as i64).
+    if (TCVal->getType() != IVTy)
+      TCVal = B.CreateZExtOrTrunc(TCVal, IVTy, "tc.cast");
+
+    Value *PFVal   = ConstantInt::get(IVTy, TilingPF);
+    Value *Trips   = B.CreateUDiv(TCVal, PFVal, "tile.trips");
+    Value *Limit   = B.CreateMul(Trips, PFVal, "tile.limit");
+
+    BasicBlock *TileHeader = BasicBlock::Create(Ctx, "tile.header", F);
+    BasicBlock *TileBody   = BasicBlock::Create(Ctx, "tile.body",   F);
+    BasicBlock *TileLatch  = BasicBlock::Create(Ctx, "tile.latch",  F);
+    BasicBlock *TileExit   = BasicBlock::Create(Ctx, "tile.exit",   F);
+
+    // KLoopBB falls through to TileHeader.
+    B.CreateBr(TileHeader);
+
+    // TileHeader: PHI + bounds check.
+    B.SetInsertPoint(TileHeader);
+    PHINode *TileIV = B.CreatePHI(IVTy, 2, "tile.iv");
+    TileIV->addIncoming(ConstantInt::get(IVTy, 0), KLoopBB);
+    Value *Done = B.CreateICmpUGE(TileIV, Limit, "tile.done");
+    B.CreateCondBr(Done, TileExit, TileBody);
+
+    // Register TileIV so WIDEN-GEP recipes' remapClone() produces
+    // tile-corner GEPs by substituting OrigKIVPhi → TileIV.
+    State.EmittedMap[OrigKIVPhi] = TileIV;
+
+    // TileBody: run all body recipes.
+    B.SetInsertPoint(TileBody);
+    Body->execute(State);
+    B.CreateBr(TileLatch);
+
+    // TileLatch: increment IV and loop back.
+    B.SetInsertPoint(TileLatch);
+    Value *TileNext = B.CreateAdd(TileIV, PFVal, "tile.next");
+    TileIV->addIncoming(TileNext, TileLatch);
+    B.CreateBr(TileHeader);
+
+    // TileExit: continue to the original successor.
+    B.SetInsertPoint(TileExit);
+    if (OrigSuccessor)
+      B.CreateBr(OrigSuccessor);
+
+    // Clear the EmittedMap entry to avoid polluting other tiling regions.
+    State.EmittedMap.erase(OrigKIVPhi);
+
+    LLVM_DEBUG(dbgs() << "TPTilingRegion[static]: tile loop created, PF="
+                      << TilingPF << "\n");
+  } else {
+    llvm_unreachable("TPTilingRegion: DynamicTiled path not yet implemented");
+  }
 }
 void TPTilingRegion::print(raw_ostream &OS, const Twine &Indent,
                            TPSlotTracker &) const {
