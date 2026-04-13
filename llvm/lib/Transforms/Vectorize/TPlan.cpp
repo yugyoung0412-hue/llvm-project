@@ -13,9 +13,13 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/ValueMapper.h"
 #include <string>  // for std::to_string
 
 using namespace llvm;
@@ -1102,10 +1106,94 @@ void TPlan::print(raw_ostream &OS) const {
 }
 
 //===----------------------------------------------------------------------===//
-// TPGuardBlock — stub implementations
+// TPGuardBlock — execute(): emit runtime profitability guard + scalar clone
 //===----------------------------------------------------------------------===//
 void TPGuardBlock::execute(TPTransformState &State) {
-  llvm_unreachable("TPGuardBlock::execute() not yet implemented");
+  assert(State.LI && "TPGuardBlock::execute() requires LoopInfo in State");
+  assert(State.DT && "TPGuardBlock::execute() requires DominatorTree in State");
+
+  LoopInfo &LI = *State.LI;
+  DominatorTree &DT = *State.DT;
+
+  // ---- Precondition checks ------------------------------------------------
+
+  BasicBlock *OrigPreheader = OutermostLoop->getLoopPreheader();
+  assert(OrigPreheader && "OutermostLoop must have a unique preheader");
+
+  BasicBlock *ExitBB = OutermostLoop->getExitBlock();
+  assert(ExitBB && "OutermostLoop must have a single exit block");
+
+  BasicBlock *OrigPred = OrigPreheader->getSinglePredecessor();
+  assert(OrigPred && "Loop preheader must have a single predecessor");
+
+  // ---- Step 1: Clone the loop as the scalar fallback ----------------------
+  //
+  // cloneLoopWithPreheader() inserts the clone before OrigPreheader and wires
+  // its exit edges to ExitBB. LI and DT are updated by the call.
+
+  ValueToValueMapTy SkelVMap;
+  SmallVector<BasicBlock *, 16> ClonedBlocks;
+  Loop *ScalarLoop = cloneLoopWithPreheader(
+      OrigPreheader, // Insert cloned blocks before this block.
+      OrigPred,      // Dominator of the region being cloned into.
+      OutermostLoop, SkelVMap, ".scalar", &LI, &DT, ClonedBlocks);
+  assert(ScalarLoop && "cloneLoopWithPreheader() failed");
+
+  // Remap all cloned instruction operands to point to cloned values.
+  remapInstructionsInBlocks(ClonedBlocks, SkelVMap);
+
+  // The clone's preheader is the VMap image of OrigPreheader.
+  BasicBlock *ScalarPreheader = cast<BasicBlock>(SkelVMap[OrigPreheader]);
+
+  // ---- Step 2: Create GuardBB and wire it between OrigPred and OrigPreheader
+
+  LLVMContext &Ctx = OrigPreheader->getContext();
+  Function *F = OrigPreheader->getParent();
+
+  // New empty block, placed in the function layout before OrigPreheader.
+  BasicBlock *GuardBB =
+      BasicBlock::Create(Ctx, "tensor.guard", F, OrigPreheader);
+
+  // Redirect OrigPred's successor from OrigPreheader to GuardBB.
+  Instruction *PredTerm = OrigPred->getTerminator();
+  for (unsigned I = 0, E = PredTerm->getNumSuccessors(); I < E; ++I) {
+    if (PredTerm->getSuccessor(I) == OrigPreheader) {
+      PredTerm->setSuccessor(I, GuardBB);
+      break;
+    }
+  }
+
+  // PHI nodes in OrigPreheader: predecessor changed from OrigPred to GuardBB.
+  for (PHINode &Phi : OrigPreheader->phis()) {
+    int Idx = Phi.getBasicBlockIndex(OrigPred);
+    if (Idx >= 0)
+      Phi.setIncomingBlock(static_cast<unsigned>(Idx), GuardBB);
+  }
+
+  // PHI nodes in ScalarPreheader: cloned from OrigPreheader, same fixup.
+  for (PHINode &Phi : ScalarPreheader->phis()) {
+    int Idx = Phi.getBasicBlockIndex(OrigPred);
+    if (Idx >= 0)
+      Phi.setIncomingBlock(static_cast<unsigned>(Idx), GuardBB);
+  }
+
+  // Emit runtime guard: TC >=u PF → tensor path; else → scalar clone.
+  {
+    IRBuilder<> GB(GuardBB);
+    Value *PFVal = ConstantInt::get(RuntimeTC->getType(), GuardPF);
+    Value *Cond = GB.CreateICmpUGE(RuntimeTC, PFVal, "tensor.profitable");
+    GB.CreateCondBr(Cond, OrigPreheader, ScalarPreheader);
+  }
+
+  // ---- Step 3: Update DominatorTree ---------------------------------------
+
+  DT.addNewBlock(GuardBB, OrigPred);
+  DT.changeImmediateDominator(OrigPreheader, GuardBB);
+  DT.changeImmediateDominator(ScalarPreheader, GuardBB);
+
+  // ---- Execute the tensor path (original TPlan subtree) -------------------
+
+  TensorPath->execute(State);
 }
 void TPGuardBlock::print(raw_ostream &OS, const Twine &Indent,
                          TPSlotTracker &) const {
