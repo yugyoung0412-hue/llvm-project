@@ -10,8 +10,14 @@
 ; CHECK: call void @llvm.tensor.contract.2d.2d.2d.f32(
 ; CHECK-NOT: llvm.umin
 ; CHECK: scalar.block:
-; CHECK: fmul float
-; CHECK: fadd float
+; CHECK:   %scalar.iv = phi i64
+; CHECK:   getelementptr float, ptr %A
+; CHECK:   load float, ptr
+; CHECK:   getelementptr float, ptr %B
+; CHECK:   load float, ptr
+; CHECK:   fmul float
+; CHECK:   fadd float
+; CHECK:   store float
 
 target datalayout = "e-m:e-i64:64-n32:64"
 target triple = "aarch64"
