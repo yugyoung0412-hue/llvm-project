@@ -1540,6 +1540,10 @@ public:
     return B;
   }
 
+  /// Register an externally-allocated block for ownership. The TPlan destructor
+  /// will delete it. Used by TPlanTransformer for TPGuardBlock/TPTilingRegion.
+  void addCreatedBlock(TPBlockBase *B) { CreatedBlocks.push_back(B); }
+
 private:
   SmallVector<std::unique_ptr<TPSymbolicValue>> DimPFs; ///< Per-dim PFs; DimPFs[0]=innermost (DimIdx convention).
   std::string FuncName;

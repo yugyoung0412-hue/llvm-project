@@ -518,8 +518,9 @@ void TPlanTransformer::markSubsumedRecipes(TPBasicBlock *Body) {
         R.setSubsumed(true);
       break;
     case TPRecipeBase::TPWidenIntOrFpInductionSC:
-    case TPRecipeBase::TPWidenPointerInductionSC:
       // K IV is subsumed — TileIV registered in EmittedMap replaces it.
+      // TPWidenPointerInductionSC is excluded: its execute() unconditionally
+      // registers the PHINode in ValueMap (ignoring IsSubsumed).
       R.setSubsumed(true);
       break;
     default:
@@ -555,6 +556,7 @@ TPTilingRegion *TPlanTransformer::replaceWithTilingRegion(
 
   auto *TR = new TPTilingRegion(Spec.Dim, Spec.PF, Spec.Mode, Body, Epilogue,
                                  KIVPhi);
+  Plan.addCreatedBlock(TR);
 
   // Install the tiling override — TPRegionBlock::execute() will delegate to TR.
   Innermost->setTilingOverride(TR);
@@ -568,6 +570,7 @@ void TPlanTransformer::insertGuardBlock(const DimEmissionSpec &Spec,
   TPBlockBase *Root = Plan.getEntry();
   auto *Guard =
       new TPGuardBlock(OutermostLoop, TCVal, Spec.PF, Root);
+  Plan.addCreatedBlock(Guard);
   Plan.setEntry(Guard);
 }
 
