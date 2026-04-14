@@ -1422,61 +1422,53 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
 // operands via EmittedMap so each clone emits fresh scalar IR.
 
 TPRecipeBase *TPWidenIntOrFpInductionRecipe::clone() const {
-  auto *C = new TPWidenIntOrFpInductionRecipe(
-      IVPhi,
-      operands().size() > 0 ? getOperand(0) : nullptr,
-      operands().size() > 1 ? getOperand(1) : nullptr,
-      DimIndex);
+  assert(operands().size() == 2 && "TPWidenIntOrFpInductionRecipe always has 2 operands");
+  auto *C = new TPWidenIntOrFpInductionRecipe(IVPhi, getOperand(0), getOperand(1), DimIndex);
   C->DimSet = DimSet;
   return C;
 }
 
 TPRecipeBase *TPWidenPointerInductionRecipe::clone() const {
-  auto *C = new TPWidenPointerInductionRecipe(
-      IVPhi,
-      operands().size() > 0 ? getOperand(0) : nullptr,
-      operands().size() > 1 ? getOperand(1) : nullptr,
-      DimIndex);
+  assert(operands().size() == 2 && "TPWidenPointerInductionRecipe always has 2 operands");
+  auto *C = new TPWidenPointerInductionRecipe(IVPhi, getOperand(0), getOperand(1), DimIndex);
   C->DimSet = DimSet;
   return C;
 }
 
 TPRecipeBase *TPReductionPHIRecipe::clone() const {
-  return new TPReductionPHIRecipe(
-      RedPhi,
-      operands().size() > 0 ? getOperand(0) : nullptr,
-      operands().size() > 1 ? getOperand(1) : nullptr);
+  assert(operands().size() == 2 && "TPReductionPHIRecipe always has 2 operands");
+  return new TPReductionPHIRecipe(RedPhi, getOperand(0), getOperand(1));
 }
 
 TPRecipeBase *TPWidenGEPRecipe::clone() const {
   SmallVector<TPValue *> Ops(operands());
   auto *C = new TPWidenGEPRecipe(GEPInst, Ops);
+  static_cast<TPIRFlags &>(*C) = static_cast<const TPIRFlags &>(*this);
   C->DimSet = DimSet;
   C->MemStrides = MemStrides;
   return C;
 }
 
 TPRecipeBase *TPWidenLoadRecipe::clone() const {
-  auto *C = new TPWidenLoadRecipe(
-      LoadInst, operands().empty() ? nullptr : getOperand(0));
+  assert(operands().size() == 1 && "TPWidenLoadRecipe always has 1 operand (ptr)");
+  auto *C = new TPWidenLoadRecipe(LoadInst, getOperand(0));
   C->DimSet = DimSet;
   C->MemStrides = MemStrides;
   return C;
 }
 
 TPRecipeBase *TPWidenStoreRecipe::clone() const {
-  auto *C = new TPWidenStoreRecipe(
-      StoreInst,
-      operands().size() > 0 ? getOperand(0) : nullptr,
-      operands().size() > 1 ? getOperand(1) : nullptr);
+  assert(operands().size() == 2 && "TPWidenStoreRecipe always has 2 operands (ptr, val)");
+  auto *C = new TPWidenStoreRecipe(StoreInst, getOperand(0), getOperand(1));
   C->DimSet = DimSet;
   C->MemStrides = MemStrides;
   return C;
 }
 
 TPRecipeBase *TPWidenCastRecipe::clone() const {
-  auto *C = new TPWidenCastRecipe(
-      CastInst, operands().empty() ? nullptr : getOperand(0));
+  assert(operands().size() == 1 && "TPWidenCastRecipe always has 1 operand (src)");
+  auto *C = new TPWidenCastRecipe(CastInst, getOperand(0));
+  static_cast<TPIRFlags &>(*C) = static_cast<const TPIRFlags &>(*this);
   C->DimSet = DimSet;
   return C;
 }
@@ -1484,6 +1476,7 @@ TPRecipeBase *TPWidenCastRecipe::clone() const {
 TPRecipeBase *TPWidenRecipe::clone() const {
   SmallVector<TPValue *> Ops(operands());
   auto *C = new TPWidenRecipe(Inst, Ops);
+  static_cast<TPIRFlags &>(*C) = static_cast<const TPIRFlags &>(*this);
   C->DimSet = DimSet;
   return C;
 }
