@@ -863,6 +863,12 @@ public:
   virtual void execute(TPTransformState &State) const = 0;
   virtual ~TPRecipeBase() = default;
 
+  /// Clone this recipe, producing a shallow copy that shares the same
+  /// underlying IR instruction pointer(s) and operand pointers as the
+  /// original. The clone is freshly constructed (IsSubsumed defaults to
+  /// false). Used by buildScalarEpilogue().
+  virtual TPRecipeBase *clone() const = 0;
+
   static bool classof(const TPUser *) { return true; }
 
 protected:
@@ -1126,6 +1132,7 @@ public:
   void execute(TPTransformState &State) const override;
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  TPRecipeBase *clone() const override;
 };
 
 //===----------------------------------------------------------------------===//
@@ -1143,6 +1150,7 @@ public:
   void execute(TPTransformState &State) const override;
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  TPRecipeBase *clone() const override;
 };
 
 //===----------------------------------------------------------------------===//
@@ -1160,6 +1168,7 @@ public:
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
   void execute(TPTransformState &State) const override;
+  TPRecipeBase *clone() const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getTPRecipeID() == TPReductionPHISC;
@@ -1182,6 +1191,7 @@ public:
   void execute(TPTransformState &State) const override;
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  TPRecipeBase *clone() const override { llvm_unreachable("not cloneable"); }
 };
 
 //===----------------------------------------------------------------------===//
@@ -1197,6 +1207,7 @@ public:
   void execute(TPTransformState &State) const override;
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  TPRecipeBase *clone() const override { llvm_unreachable("not cloneable"); }
 };
 
 //===----------------------------------------------------------------------===//
@@ -1212,6 +1223,7 @@ public:
   void execute(TPTransformState &State) const override;
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  TPRecipeBase *clone() const override { llvm_unreachable("not cloneable"); }
 };
 
 //===----------------------------------------------------------------------===//
@@ -1229,6 +1241,7 @@ public:
   void execute(TPTransformState &State) const override;
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  TPRecipeBase *clone() const override { llvm_unreachable("not cloneable"); }
 };
 
 //===----------------------------------------------------------------------===//
@@ -1244,6 +1257,7 @@ public:
   void execute(TPTransformState &State) const override;
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  TPRecipeBase *clone() const override { llvm_unreachable("not cloneable"); }
 };
 
 //===----------------------------------------------------------------------===//
@@ -1261,6 +1275,7 @@ public:
   void execute(TPTransformState &State) const override;
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
+  TPRecipeBase *clone() const override { llvm_unreachable("not cloneable"); }
 };
 
 //===----------------------------------------------------------------------===//
@@ -1276,6 +1291,7 @@ public:
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
   void execute(TPTransformState &State) const override;
+  TPRecipeBase *clone() const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getTPRecipeID() == TPWidenSC;
@@ -1298,6 +1314,7 @@ public:
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
   void execute(TPTransformState &State) const override;
+  TPRecipeBase *clone() const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getTPRecipeID() == TPWidenGEPSC;
@@ -1320,6 +1337,7 @@ public:
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
   void execute(TPTransformState &State) const override;
+  TPRecipeBase *clone() const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getTPRecipeID() == TPWidenLoadSC;
@@ -1354,6 +1372,7 @@ public:
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
   void execute(TPTransformState &State) const override;
+  TPRecipeBase *clone() const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getTPRecipeID() == TPWidenStoreSC;
@@ -1376,6 +1395,7 @@ public:
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
   void execute(TPTransformState &State) const override;
+  TPRecipeBase *clone() const override;
 
   static bool classof(const TPRecipeBase *R) {
     return R->getTPRecipeID() == TPWidenCastSC;
@@ -1398,6 +1418,7 @@ public:
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
   void execute(TPTransformState &State) const override;
+  TPRecipeBase *clone() const override { llvm_unreachable("not cloneable"); }
 
   static bool classof(const TPRecipeBase *R) {
     return R->getTPRecipeID() == TPCanonicalIVSC;
@@ -1416,6 +1437,7 @@ public:
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
   void execute(TPTransformState &State) const override;
+  TPRecipeBase *clone() const override { llvm_unreachable("not cloneable"); }
 
   static bool classof(const TPRecipeBase *R) {
     return R->getTPRecipeID() == TPCanonicalIVIncrSC;
@@ -1434,6 +1456,7 @@ public:
   void print(raw_ostream &OS, unsigned Indent,
              TPSlotTracker &Tracker) const override;
   void execute(TPTransformState &State) const override;
+  TPRecipeBase *clone() const override { llvm_unreachable("not cloneable"); }
 
   static bool classof(const TPRecipeBase *R) {
     return R->getTPRecipeID() == TPCanonicalIVExitCmpSC;
