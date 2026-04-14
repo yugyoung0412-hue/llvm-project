@@ -14,7 +14,6 @@ add_llvm_component_library(LLVMVectorize
   TPlanWidener.cpp
   TPRecipeMatcher.cpp
   TPlanLowering.cpp
-  TPlanSkeleton.cpp
   SandboxVectorizer/DependencyGraph.cpp
   SandboxVectorizer/InstrMaps.cpp
   SandboxVectorizer/Interval.cpp

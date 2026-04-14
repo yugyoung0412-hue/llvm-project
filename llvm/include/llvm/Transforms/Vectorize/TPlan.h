@@ -534,7 +534,7 @@ private:
 enum class DimEmitMode : int {
   Inline,       ///< TC <= PF for this dim: no tiling loop needed.
   StaticTiled,  ///< TC > PF (known at compile time) or dynamic output dim:
-                ///< emit umin-bounded tiling loop via emitTilingLoop().
+                ///< emit umin-bounded tiling loop via TPTilingRegion.
   DynamicTiled, ///< Reduction dim with runtime TC: emit fixed-tile loop
                 ///< (tensor.body) + epilogue tiers + scalar remainder.
 };
@@ -556,8 +556,7 @@ struct EmissionPolicy {
   SmallVector<DimEmissionSpec, 4> Specs;
 
   /// True iff any dim uses DynamicTiled mode.
-  /// When true, TPlanLowering_lower() must call createTensorizedLoopSkeleton()
-  /// before execute() to insert a runtime profitability guard.
+  /// When true, TPlanTransformer wraps the root in a TPGuardBlock.
   bool needsGuard() const {
     return llvm::any_of(Specs, [](const DimEmissionSpec &S) {
       return S.Mode == DimEmitMode::DynamicTiled;
@@ -1585,11 +1584,9 @@ struct TPTransformState {
   /// Available for dynamic-TC tiling queries in emitContraction().
   /// Null when no TTI is provided (e.g. unit tests).
   const TargetTransformInfo *TTI = nullptr;
-  /// Set by TPlanLowering_lower() before execute() loop. Required by
-  /// createTensorizedLoopSkeleton() to update loop nest structure.
+  /// Set by TPlanLowering_lower() before execute() loop.
   LoopInfo *LI = nullptr;
-  /// Set by TPlanLowering_lower() before execute() loop. Required by
-  /// createTensorizedLoopSkeleton() to maintain dominator tree correctness.
+  /// Set by TPlanLowering_lower() before execute() loop.
   DominatorTree *DT = nullptr;
   /// Upfront emission policy built by buildEmissionPolicy() before execute().
   /// Consumed by emitContraction() to classify dims without re-running checkDim().
