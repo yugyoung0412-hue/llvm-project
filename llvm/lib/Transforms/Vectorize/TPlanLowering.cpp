@@ -445,9 +445,7 @@ private:
   /// are subsumed. WIDEN-GEP (tile-pointer computation) and Contraction are not.
   void markSubsumedRecipes(TPBasicBlock *Body);
 
-  /// Build a scalar epilogue block (K%PF iteration). Placeholder — returns
-  /// nullptr until Task 8 implements the recipe clone mechanism.
-  TPBasicBlock *buildScalarEpilogue(TPBasicBlock *Body) { return nullptr; }
+  TPBasicBlock *buildScalarEpilogue(TPBasicBlock *Body);
 
   /// Replace the innermost K-loop with a TPTilingRegion by installing a
   /// TilingOverride on the innermost TPRegionBlock.
@@ -500,6 +498,23 @@ void TPlanTransformer::transform(TPTransformState &State) {
 
   LLVM_DEBUG(dbgs() << "TPlanTransformer: transformed Plan for dim="
                     << TilingSpec->Dim << " PF=" << TilingSpec->PF << "\n");
+}
+
+TPBasicBlock *TPlanTransformer::buildScalarEpilogue(TPBasicBlock *Body) {
+  // Clone the K-loop body for scalar K%PF remainder iterations.
+  // Each cloned recipe has IsSubsumed=false so execute() always emits IR.
+  // The clones share the same IR Instruction pointers as the originals;
+  // remapClone() + EmittedMap[OrigKIVPhi]=ScIV fixes up operands at
+  // execute()-time to use the scalar induction variable instead of the
+  // original K-loop PHI.
+  auto *Epi = new TPBasicBlock("scalar.epilogue");
+  for (TPRecipeBase &R : *Body) {
+    TPRecipeBase *C = R.clone();
+    assert(!C->isSubsumed() && "clone() must not propagate IsSubsumed=true");
+    Epi->appendRecipe(C);
+  }
+  Plan.addCreatedBlock(Epi);
+  return Epi;
 }
 
 void TPlanTransformer::markSubsumedRecipes(TPBasicBlock *Body) {
