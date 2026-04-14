@@ -1415,6 +1415,80 @@ void TPWidenRecipe::execute(TPTransformState &State) const {
 }
 
 //===----------------------------------------------------------------------===//
+// TPRecipeBase::clone() — shallow recipe copies for ScalarEpilogue
+//===----------------------------------------------------------------------===//
+// All clones share the same underlying IR Instruction pointer(s) and operand
+// TPValue pointers as the originals. At execute()-time, remapClone() fixes
+// operands via EmittedMap so each clone emits fresh scalar IR.
+
+TPRecipeBase *TPWidenIntOrFpInductionRecipe::clone() const {
+  auto *C = new TPWidenIntOrFpInductionRecipe(
+      IVPhi,
+      operands().size() > 0 ? getOperand(0) : nullptr,
+      operands().size() > 1 ? getOperand(1) : nullptr,
+      DimIndex);
+  C->DimSet = DimSet;
+  return C;
+}
+
+TPRecipeBase *TPWidenPointerInductionRecipe::clone() const {
+  auto *C = new TPWidenPointerInductionRecipe(
+      IVPhi,
+      operands().size() > 0 ? getOperand(0) : nullptr,
+      operands().size() > 1 ? getOperand(1) : nullptr,
+      DimIndex);
+  C->DimSet = DimSet;
+  return C;
+}
+
+TPRecipeBase *TPReductionPHIRecipe::clone() const {
+  return new TPReductionPHIRecipe(
+      RedPhi,
+      operands().size() > 0 ? getOperand(0) : nullptr,
+      operands().size() > 1 ? getOperand(1) : nullptr);
+}
+
+TPRecipeBase *TPWidenGEPRecipe::clone() const {
+  SmallVector<TPValue *> Ops(operands());
+  auto *C = new TPWidenGEPRecipe(GEPInst, Ops);
+  C->DimSet = DimSet;
+  C->MemStrides = MemStrides;
+  return C;
+}
+
+TPRecipeBase *TPWidenLoadRecipe::clone() const {
+  auto *C = new TPWidenLoadRecipe(
+      LoadInst, operands().empty() ? nullptr : getOperand(0));
+  C->DimSet = DimSet;
+  C->MemStrides = MemStrides;
+  return C;
+}
+
+TPRecipeBase *TPWidenStoreRecipe::clone() const {
+  auto *C = new TPWidenStoreRecipe(
+      StoreInst,
+      operands().size() > 0 ? getOperand(0) : nullptr,
+      operands().size() > 1 ? getOperand(1) : nullptr);
+  C->DimSet = DimSet;
+  C->MemStrides = MemStrides;
+  return C;
+}
+
+TPRecipeBase *TPWidenCastRecipe::clone() const {
+  auto *C = new TPWidenCastRecipe(
+      CastInst, operands().empty() ? nullptr : getOperand(0));
+  C->DimSet = DimSet;
+  return C;
+}
+
+TPRecipeBase *TPWidenRecipe::clone() const {
+  SmallVector<TPValue *> Ops(operands());
+  auto *C = new TPWidenRecipe(Inst, Ops);
+  C->DimSet = DimSet;
+  return C;
+}
+
+//===----------------------------------------------------------------------===//
 // Public entry point
 //===----------------------------------------------------------------------===//
 
