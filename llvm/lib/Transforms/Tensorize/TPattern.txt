@@ -1,0 +1,350 @@
+    // TPBB->appendRecipe(TransposeRecipe);
+    // Res = TransposeRecipe->getTPSingleValue();
+    
+    // 4. Store output tensor
+    Res = ConvRecipe;
+    
+    //Intrinsic::ID StoreID = Intrinsic::matrix_column_major_store_addr_space_ext;
+    // Intrinsic::ID StoreID = Intrinsic::matrix_column_major_store;
+    Intrinsic::ID StoreID = Intrinsic::tensor_new_store;
+    SmallVector<TPValue *, 4> StoreOperands{
+        Res, CurGEP,
+        Const_OC_IC, // Plan->getOrCreateBackedgeTakenCount()[MiddleL],
+        Const_IH_IW, Const_IH_IW};
+    // TFxUF[MiddleL], TFxUF[OutermostL]};
+    auto *StoreRecipe = new TPMatrixCallRecipe(
+        CI.InstStore, make_range(StoreOperands.begin(), StoreOperands.end()),
+        StoreID, CI.InstStore->getDebugLoc());
+    // RecipeBuilder->setRecipe(Instr, StoreRecipe);
+    LatchTPBB->appendRecipe(StoreRecipe);
+    // YYG::REMOVE
+    errs() << "Calling intrinsic end!\n";
+    Plan->dump();
+    success = true;
+  }
+  // tensor intrinsic else
+  // ...
+
+  tplan = std::move(Plan);
+  return success;
+}
+
+
+
+// bool ConvolutionTensorizePattern::tryToBuildTPlanWithTPRecipes(const TPlanPtr &tplan,
+//                                                TPRecipeBuilder *RecipeBuilder,
+//                                                TPBasicBlock *TPBB,
+//                                                bool UseTensorType) {
+//   // -----------------------------------------------------------------
+//   // 1️⃣  Grab the three relevant loops (outer‑most → innermost)
+//   // -----------------------------------------------------------------
+//   // The original TPlan that you posted had 7 nested loops, but the
+//   // *convolution* we want to emit only needs the three outer loops that
+//   // correspond to the output tensor dimensions:
+//   //   N  (batch)        → OutermostL
+//   //   OC (output chan) → MiddleL
+//   //   OH,OW (spatial)  → InnermostL   (inner‑most of the three)
+//   Loop *OutermostL = Info.Loops[2];   // N‑loop
+//   Loop *MiddleL    = Info.Loops[1];   // OC‑loop
+//   Loop *InnermostL = Info.Loops[0];   // (H,W)‑loop (the innermost of the three)
+
+//   // -----------------------------------------------------------------
+//   // 2️⃣  Grab the phi‑nodes that represent the canonical induction
+//   // -----------------------------------------------------------------
+//   // They are already materialised by the TPlan (see the “CANONICAL‑INDUCTION”
+//   // lines in the IR you posted).  We turn them into TP‑values that can be
+//   // used as indices for the tensor intrinsics.
+//   auto *OuterPhi   = Info.Loop2PHI[OutermostL];   // %tp<%21> in the IR
+//   auto *MiddlePhi  = Info.Loop2PHI[MiddleL];      // %tp<%22>
+//   auto *InnerPhi   = Info.Loop2PHI[InnermostL];   // %tp<%26>
+
+//   // -----------------------------------------------------------------
+//   // 3️⃣  Build the three “index” recipes (AIdx, CIdx, BIdx) that are
+//   //     required later when we build the GEPs for the three tensors.
+//   // -----------------------------------------------------------------
+//   // In the GEMM code these were called AIdx, CIdx, … – we keep the same
+//   // naming because the convolution intrinsic expects *three* runtime
+//   // indices that are multiplied by the corresponding *tensor‑factor*
+//   // (TFxUF) values.
+//   //   AIdx = OuterPhi * UF[Innermost]          // batch dimension
+//   //   BIdx = OuterPhi * UF[Middle]            // output‑channel dimension
+//   //   CIdx = MiddlePhi + OuterPhi * UF[Middle]  // spatial base index
+//   //
+//   // (The exact arithmetic is not important for the intrinsic – it only
+//   //  needs a *single* tensor value, but we keep the same recipes so that
+//   //  the generated schedule remains identical to the original TPlan.)
+
+//   // 3.1 AIdx  (batch index)
+//   TPRecipeBase *AIdxRecipe = new TPNewInstrRecipe(
+//       Instruction::Mul,
+//       {RecipeBuilder->mapToTPValue(OuterPhi),
+//        tplan->getTFxUF()[InnermostL]});                 // TFxUF[Innermost]
+//   TPBB->appendRecipe(AIdxRecipe);
+
+//   // 3.2 BIdx  (output‑channel index, i.e. "CIdx" in GEMM)
+//   TPRecipeBase *BIdxRecipeSub = new TPNewInstrRecipe(
+//       Instruction::Mul,
+//       {RecipeBuilder->mapToTPValue(OuterPhi),
+//        tplan->getOrCreateBackedgeTakenCount()[MiddleL]}); // back‑edge count = trip‑count
+//   TPBB->appendRecipe(BIdxRecipeSub);
+
+//   TPRecipeBase *CIdxRecipe = new TPNewInstrRecipe(
+//       Instruction::Add,
+//       {CIdxRecipe->getTPSingleValue(),
+//        RecipeBuilder->mapToTPValue(MiddlePhi)});        // + middle‑phi
+//   TPBB->appendRecipe(CIdxRecipe);
+
+//   // -----------------------------------------------------------------
+//   // 4️⃣  Build GEP recipes for the three tensor live‑ins
+//   // -----------------------------------------------------------------
+//   // The live‑ins that the original TPlan created are:
+//   //   %Ifm   – the input feature map tensor
+//   //   %Weight – the convolution kernel tensor
+//   //   %Ofm   – the output tensor (where we store the result)
+//   //
+//   // The map (GEP → index) is identical to the GEMM case: the first GEP
+//   // (input tensor) uses AIdx, the second (weight) uses MiddlePhi, the third
+//   // (output) uses CIdx.
+//   DenseMap<GetElementPtrInst *, TPValue *> GEPIdx{
+//       {CI.GEPs[0], AIdxRecipe->getTPSingleValue()},      // Ifm GEP
+//       {CI.GEPs[1], RecipeBuilder->mapToTPValue(MiddlePhi)}, // Weight GEP
+//       {CI.GEPs[2], CIdxRecipe->getTPSingleValue()},     // Ofm GEP
+//   };
+
+//   // -----------------------------------------------------------------
+//   // 5️⃣  Walk the innermost loop body and replace the whole
+//   //     load‑multiply‑store sequence with a single conv2d intrinsic.
+//   // -----------------------------------------------------------------
+//   // The code mirrors the structure of the GEMM builder, but *instead*
+//   // of emitting three separate matrix‑load / matrix‑multiply /
+//   // matrix‑store recipes we emit just one call to
+//   //   llvm.tensor.conv2d
+//   // which itself takes the two input tensors (Ifm, Weight) and the
+//   // convolution meta‑data.
+//   //
+//   // -----------------------------------------------------------------
+//   // 5‑a  Gather the two input tensors (Ifm and Weight) as TP‑values.
+//   // -----------------------------------------------------------------
+//   TPValue *IfmTensor = nullptr;
+//   TPValue *WeightTensor = nullptr;
+//   SmallVector<TPValue *> CurGEPs;               // temporary holder for each GEP
+//   SmallVector<TPValue *> MatrixLoads;          // we keep the two loads only
+//   TPValue *Res = nullptr;                      // the result of the conv2d call
+//   TPValue *CurGEP = nullptr;                   // the most‑recent GEP value
+
+//   // -----------------------------------------------------------------
+//   // 5‑b  Walk the instructions that belong to the innermost loop latch.
+//   // -----------------------------------------------------------------
+//   // The loop latch contains the *last* iteration of the inner loop – that is
+//   // exactly the block that the TPlan IR prints as “… latch6”, “… latch5”, …
+//   // for the original GEMM.  We use the same helper (`drop_end`) that the GEMM
+//   // version uses to skip the terminator and debug‑info.
+//   // -----------------------------------------------------------------
+//   for (Instruction &I :
+//        drop_end(InnermostL->getLoopLatch()->instructionsWithoutDebug(false))) {
+//     Instruction *Inst = &I;
+
+//     // -------------------------------------------------------------
+//     // 5‑c  GetElementPtr => create a GEP recipe and remember it.
+//     // -------------------------------------------------------------
+//     if (auto *GEPI = dyn_cast<GetElementPtrInst>(Inst)) {
+//       if (!GEPIdx.count(GEPI))
+//         continue;                                   // not one of the three tensors
+
+//       auto *GEPRecipe = new TPNewInstrRecipe(
+//           Instruction::GetElementPtr,
+//           {tplan->getOrAddLiveIn(GEPI->getOperand(0)),   // base tensor
+//            GEPIdx[GEPI]});                              // runtime index
+//       RecipeBuilder->setRecipe(GEPI, GEPRecipe);
+//       TPBB->appendRecipe(GEPRecipe);
+//       CurGEP = GEPRecipe->getTPSingleValue();
+//       CurGEPs.push_back(CurGEP);
+//       continue;
+//     }
+
+//     // -------------------------------------------------------------
+//     // 5‑d  LoadInst => create a tensor‑load recipe.
+//     // -------------------------------------------------------------
+//     if (auto *LoadI = dyn_cast<LoadInst>(Inst)) {
+//       // The convolution intrinsic expects tensors, not raw scalars.
+//       // We therefore use the *tensor_new_load* intrinsic that is already
+//       // defined for the tensor‑type path.
+//       Intrinsic::ID LoadID = Intrinsic::tensor_new_load;
+//       SmallVector<TPValue *> Operands;
+
+//       // Decide whether this load is the input feature map or the kernel.
+//       if (LoadI == CI.LoadIfm) {
+//         // %Ifm pointer + back‑edge count of the innermost loop
+//         Operands.append({CurGEP,
+//                          tplan->getOrCreateBackedgeTakenCount()[InnermostL],
+//                          tplan->getTFxUF()[OutermostL],
+//                          tplan->getTFxUF()[InnermostL]});
+//         // Remember the tensor value – we will feed it to the conv2d call.
+//         IfmTensor = new TPMatrixCallRecipe(
+//             LoadI, make_range(Operands.begin(), Operands.end()), LoadID,
+//             LoadI->getDebugLoc())->getTPSingleValue();
+//         // Also push it onto MatrixLoads so that the same vector can be used
+//         // later (the GEMM code expects a vector of loads).
+//         MatrixLoads.push_back(IfmTensor);
+//       } else if (LoadI == CI.LoadWeight) {
+//         Operands.append({CurGEP,
+//                          tplan->getOrCreateBackedgeTakenCount()[MiddleL],
+//                          tplan->getTFxUF()[InnermostL],
+//                          tplan->getTFxUF()[MiddleL]});
+//         WeightTensor = new TPMatrixCallRecipe(
+//             LoadI, make_range(Operands.begin(), Operands.end()), LoadID,
+//             LoadI->getDebugLoc())->getTPSingleValue();
+//         MatrixLoads.push_back(WeightTensor);
+//       } else {
+//         // Any other load (e.g. a scalar constant) is not part of the conv2d.
+//         // We simply forward it as a normal LLVM load (the existing TPlan
+//         // already inserted a recipe for it if needed).  For simplicity we
+//         // ignore that case here because the convolution IR you posted does
+//         // not contain any extra scalar loads.
+//         continue;
+//       }
+
+//       // Store the recipe so that later stages (debug, verification) can see
+//       // it.
+//       auto *LoadRecipe = new TPMatrixCallRecipe(
+//           LoadI, make_range(Operands.begin(), Operands.end()), LoadID,
+//           LoadI->getDebugLoc());
+//       RecipeBuilder->setRecipe(LoadI, LoadRecipe);
+//       TPBB->appendRecipe(LoadRecipe);
+//       continue;
+//     }
+
+//     // -------------------------------------------------------------
+//     // 5‑e  StoreInst => we will NOT emit a store here.  The actual
+//     //                write‑back to the output tensor is done *after*
+//     //                the conv2d intrinsic, using the tensor_new_store
+//     //                intrinsic.
+//     // -------------------------------------------------------------
+//     if (auto *StoreI = dyn_cast<StoreInst>(Inst)) {
+//       // Remember the destination GEP so that we can use it after the
+//       // conv2d call.
+//       // The GEP that computes the destination address is the *third*
+//       // entry in `ConvInfo.GEPs` (the one that used CIdxRecipe in the GEMM
+//       // version).
+//       if (StoreI->getPointerOperand() == CI.GEPs[2]) {
+//         // The pointer operand is a GEP that we already emitted a recipe for.
+//         // The TPValue for that GEP is the last element we pushed in CurGEPs.
+//         // Save it for the store that follows the conv2d.
+//         CurGEP = CurGEPs.back();
+//       }
+//       // We do **not** create a store recipe here – it will be emitted
+//       // after the conv2d intrinsic as shown later.
+//       continue;
+//     }
+
+//     // -------------------------------------------------------------
+//     // 5‑f  Any other opcode (e.g. a redundant FMul) is ignored,
+//     //      because the whole computation is performed by the intrinsic.
+//     // -------------------------------------------------------------
+//   } // end for‑loop over latch instructions
+
+//   // -----------------------------------------------------------------
+//   // 6️⃣  If we have both tensors, emit the conv2d intrinsic.
+//   // -----------------------------------------------------------------
+//   if (!IfmTensor || !WeightTensor) {
+//     // Something went wrong – the expected loads were not found.
+//     dbgs() << "ConvPattern: missing Ifm or Weight tensor load.\n";
+//     return false;
+//   }
+
+//   // -----------------------------------------------------------------
+//   // 6‑a  Prepare the meta‑data operands (stride, pad, dilation, padTy)
+//   // -----------------------------------------------------------------
+//   // All of them are constant tensors of shape <2, <x x i32>> (as shown
+//   // in the intrinsic prototype).  We create them once with the
+//   // TP‑builder’s helper `createConstantTensor` (the helper exists in the
+//   // LLVM‑TVM/MLIR stack; if it does not exist in your code‑base you can
+//   // replace it with a normal `ConstantInt` + GEP pair – the exact API is
+//   // out of scope for this snippet).
+//   //
+//   // The concrete values are:
+//   //   stride   = {1, 1}
+//   //   padSize  = {0, 0}
+//   //   dilation = {1, 1}
+//   //   padTy    = 0   (no “explicit” padding mode)
+//   // -----------------------------------------------------------------
+//   // Helper that builds a <2, <x x i32>> constant tensor.
+//   auto makeI32Vec2 = [&](int a, int b) -> TPValue * {
+//     // Create a constant struct <2 x i32> = <i32 a, i32 b>
+//     Constant *C = ConstantStruct::get(
+//         StructType::get(Type::getInt32Ty(Inst->getContext()),
+//                         Type::getInt32Ty(Inst->getContext())),
+//         {ConstantInt::get(Type::getInt32Ty(Inst->getContext()), a),
+//          ConstantInt::get(Type::getInt32Ty(Inst->getContext()), b)});
+//     // Wrap it into a tensor value that the recipe system understands.
+//     return RecipeBuilder->createTensorConstant(C);
+//   };
+
+//   TPValue *Stride   = makeI32Vec2(1, 1);
+//   TPValue *PadSize  = makeI32Vec2(0, 0);
+//   TPValue *Dilation = makeI32Vec2(1, 1);
+//   TPValue *PadTy    = ConstantInt::get(Type::getInt32Ty(Inst->getContext()), 0);
+
+//   // -----------------------------------------------------------------
+//   // 6‑b  Assemble the operand list for llvm.tensor.conv2d
+//   // -----------------------------------------------------------------
+//   // The prototype you posted is:
+//   //   %tensor_conv2d = call <4, <3 x 5 x 5 x 6 x half>>, [2,3,4,5],
+//   //                    NCHW, SRAM, 2222> @llvm.tensor.conv2d.t3x5x5x6xf16x2222...
+//   //   (   %Ifm, %Weight, %Stride, %PadSize, %DilationRate, %PadTy )
+//   // In the TP‑builder world we only need to pass the **TPValues** that
+//   // represent those tensors.
+//   // -----------------------------------------------------------------
+//   SmallVector<TPValue *> Conv2dOperands{
+//       IfmTensor,          // Input feature map
+//       WeightTensor,       // Kernel
+//       Stride,             // stride      (const tensor <2 x i32>)
+//       PadSize,            // pad size    (const tensor <2 x i32>)
+//       Dilation,           // dilation    (const tensor <2 x i32>)
+//       PadTy               // pad type    (scalar i32)
+//   };
+
+//   // -----------------------------------------------------------------
+//   // 6‑c  Emit the conv2d call recipe.
+//   // -----------------------------------------------------------------
+//   Intrinsic::ID Conv2dID = Intrinsic::tensor_conv2d; // <-- the name you gave
+//   auto *Conv2dRecipe = new TPMatrixCallRecipe(
+//       /*Inst=*/nullptr,                     // no underlying LLVM instruction
+//       make_range(Conv2dOperands.begin(), Conv2dOperands.end()),
+//       Conv2dID,
+//       /*DebugLoc=*/DebugLoc());             // no debug info needed here
+//   // The recipe itself produces a TensorValue that we store in `Res`.
+//   Res = Conv2dRecipe->getTPSingleValue();
+
+//   // Register the recipe with the builder so that later passes can see it.
+//   TPBB->appendRecipe(Conv2dRecipe);
+//   RecipeBuilder->registerTensorIntrinsic(Conv2dID, Conv2dRecipe);
+
+//   // -----------------------------------------------------------------
+//   // 7️⃣  Store the result back to the output tensor (`Ofm`).
+//   // -----------------------------------------------------------------
+//   // The output tensor lives in `ConvInfo.GEPs[2]`.  Its GEP recipe was
+//   // already emitted when we processed the GEP instructions above, and the
+//   // TPValue for that GEP is held in `CurGEP` (the last value we saw that
+//   // matched that GEP).
+//   Intrinsic::ID StoreID = Intrinsic::tensor_new_store;
+//   SmallVector<TPValue *, 4> StoreOps{
+//       Res,                                 // value to store
+//       CurGEP,                              // destination GEP
+//       tplan->getOrCreateBackedgeTakenCount()[MiddleL],
+//       tplan->getTFxUF()[MiddleL],
+//       tplan->getTFxUF()[OutermostL]};
+
+//   auto *StoreRecipe = new TPMatrixCallRecipe(
+//       /*Inst=*/nullptr, make_range(StoreOps.begin(), StoreOps.end()),
+//       StoreID, DebugLoc());
+//   TPBB->appendRecipe(StoreRecipe);
+//   RecipeBuilder->setRecipe(CI.StoreOfm, StoreRecipe); // optional bookkeeping
+
+//   // -----------------------------------------------------------------
+//   8️⃣  Done – return success.
+//   -----------------------------------------------------------------
+//   return true;
+// }
+
+} // namespace llvm
