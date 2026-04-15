@@ -1,0 +1,248 @@
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+/// VPlanPrinter prints a given VPlan to a given output stream. The printing is
+/// indented and follows the dot format.
+class TPlanPrinter {
+  // TODO(yuxin.an)
+  raw_ostream &OS;
+  const TPlan &Plan;
+  unsigned Depth = 0;
+  unsigned TabWidth = 2;
+  std::string Indent;
+  unsigned BID = 0;
+  SmallDenseMap<const TPBlockBase *, unsigned> BlockID;
+
+  TPSlotTracker SlotTracker;
+
+  /// Handle indentation.
+  void bumpIndent(int b) { Indent = std::string((Depth += b) * TabWidth, ' '); }
+
+  /// Print a given \p Block of the Plan.
+  void dumpBlock(const TPBlockBase *Block);
+
+  /// Print the information related to the CFG edges going out of a given
+  /// \p Block, followed by printing the successor blocks themselves.
+  void dumpEdges(const TPBlockBase *Block);
+
+  /// Print a given \p BasicBlock, including its VPRecipes, followed by printing
+  /// its successor blocks.
+  void dumpBasicBlock(const TPBasicBlock *BasicBlock);
+
+  /// Print a given \p Region of the Plan.
+  void dumpRegion(const TPRegionBlock *Region);
+
+  unsigned getOrCreateBID(const TPBlockBase *Block) {
+    return BlockID.count(Block) ? BlockID[Block] : BlockID[Block] = BID++;
+  }
+
+  Twine getOrCreateName(const TPBlockBase *Block);
+
+  Twine getUID(const TPBlockBase *Block);
+
+  /// Print the information related to a CFG edge between two VPBlockBases.
+  void drawEdge(const TPBlockBase *From, const TPBlockBase *To, bool Hidden,
+                const Twine &Label);
+
+public:
+  TPlanPrinter(raw_ostream &O, const TPlan &P)
+      : OS(O), Plan(P), SlotTracker(&P) {}
+
+  LLVM_DUMP_METHOD void dump();
+};
+
+struct TPlanIngredient {
+  const Value *V;
+
+  TPlanIngredient(const Value *V) : V(V) {}
+
+  void print(raw_ostream &O) const;
+};
+
+inline raw_ostream &operator<<(raw_ostream &OS, const TPlanIngredient &I) {
+  I.print(OS);
+  return OS;
+}
+
+inline raw_ostream &operator<<(raw_ostream &OS, const TPlan &Plan) {
+  Plan.print(OS);
+  return OS;
+}
+#endif
+
+//===----------------------------------------------------------------------===//
+// TPTilingRegion — tiling loop structure replacing innermost TPRegionBlock
+//===----------------------------------------------------------------------===//
+class TPTilingRegion : public TPBlockBase {
+  unsigned TilingDim;
+  unsigned TilingPF;
+  DimEmitMode Mode;
+  TPBasicBlock *Body;
+  TPBasicBlock *ScalarEpilogue;
+  PHINode *OrigKIVPhi;
+
+public:
+  TPTilingRegion(unsigned Dim, unsigned PF, DimEmitMode Mode,
+                 TPBasicBlock *Body, TPBasicBlock *ScalarEpilogue,
+                 PHINode *OrigKIVPhi)
+      : TPBlockBase(TPTilingRegionSC, "tiling-region"), TilingDim(Dim),
+        TilingPF(PF), Mode(Mode), Body(Body), ScalarEpilogue(ScalarEpilogue),
+        OrigKIVPhi(OrigKIVPhi) {}
+
+  unsigned      getDim()            const { return TilingDim; }
+  unsigned      getPF()             const { return TilingPF; }
+  DimEmitMode   getMode()           const { return Mode; }
+  TPBasicBlock *getBody()           const { return Body; }
+  TPBasicBlock *getScalarEpilogue() const { return ScalarEpilogue; }
+  PHINode      *getOrigKIVPhi()     const { return OrigKIVPhi; }
+
+  void execute(TPTransformState *State) override;
+  void print(raw_ostream &OS, const Twine &Indent,
+             TPSlotTracker &Tracker) const override;
+
+  static bool classof(const TPBlockBase *B) {
+    return B->getTPBlockID() == TPTilingRegionSC;
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// TPlan Utilities
+//===----------------------------------------------------------------------===//
+
+/// Class that provides utilities for VPBlockBases in VPlan.
+
+class TPBlockUtils {
+public:
+  TPBlockUtils() = delete;
+
+  /// Insert disconnected VPBlockBase \p NewBlock after \p BlockPtr. Add \p
+  /// NewBlock as successor of \p BlockPtr and \p BlockPtr as predecessor of \p
+  /// NewBlock, and propagate \p BlockPtr parent to \p NewBlock. \p BlockPtr's
+  /// successors are moved from \p BlockPtr to \p NewBlock. \p NewBlock must
+  /// have neither successors nor predecessors.
+  static void insertBlockAfter(TPBlockBase *NewBlock, TPBlockBase *BlockPtr) {
+    // assert(NewBlock->getSuccessors().empty() &&
+    //        NewBlock->getPredecessors().empty() &&
+    //        "Can't insert new block with predecessors or successors.");
+    NewBlock->setParent(BlockPtr->getParent());
+    SmallVector<TPBlockBase *> Succs(BlockPtr->successors());
+    for (TPBlockBase *Succ : Succs) {
+      disconnectBlocks(BlockPtr, Succ);
+      connectBlocks(NewBlock, Succ);
+    }
+    connectBlocks(BlockPtr, NewBlock);
+  }
+
+  /// Insert disconnected VPBlockBases \p IfTrue and \p IfFalse after \p
+  /// BlockPtr. Add \p IfTrue and \p IfFalse as succesors of \p BlockPtr and \p
+  /// BlockPtr as predecessor of \p IfTrue and \p IfFalse. Propagate \p BlockPtr
+  /// parent to \p IfTrue and \p IfFalse. \p BlockPtr must have no successors
+  /// and \p IfTrue and \p IfFalse must have neither successors nor
+  /// predecessors.
+  static void insertTwoBlocksAfter(TPBlockBase *IfTrue, TPBlockBase *IfFalse,
+                                   TPBlockBase *BlockPtr) {
+    assert(IfTrue->getSuccessors().empty() &&
+           "Can't insert IfTrue with successors.");
+    assert(IfFalse->getSuccessors().empty() &&
+           "Can't insert IfFalse with successors.");
+    BlockPtr->setTwoSuccessors(IfTrue, IfFalse);
+    IfTrue->setPredecessors({BlockPtr});
+    IfFalse->setPredecessors({BlockPtr});
+    IfTrue->setParent(BlockPtr->getParent());
+    IfFalse->setParent(BlockPtr->getParent());
+  }
+
+  /// Connect VPBlockBases \p From and \p To bi-directionally. Append \p To to
+  /// the successors of \p From and \p From to the predecessors of \p To. Both
+  /// VPBlockBases must have the same parent, which can be null. Both
+  /// VPBlockBases can be already connected to other VPBlockBases.
+  static void connectBlocks(TPBlockBase *From, TPBlockBase *To) {
+    // assert((From->getParent() == To->getParent()) &&
+    //        "Can't connect two block with different parents");
+    // assert(From->getNumSuccessors() < 2 &&
+    //        "Blocks can't have more than two successors.");
+    From->appendSuccessor(To);
+    To->appendPredecessor(From);
+  }
+
+  /// Disconnect VPBlockBases \p From and \p To bi-directionally. Remove \p To
+  /// from the successors of \p From and \p From from the predecessors of \p To.
+  static void disconnectBlocks(TPBlockBase *From, TPBlockBase *To) {
+    assert(To && "Successor to disconnect is null.");
+    From->removeSuccessor(To);
+    To->removePredecessor(From);
+  }
+
+  /// Return an iterator range over \p Range which only includes \p BlockTy
+  /// blocks. The accesses are casted to \p BlockTy.
+  template <typename BlockTy, typename T>
+  static auto blocksOnly(const T &Range) {
+    // Create BaseTy with correct const-ness based on BlockTy.
+    using BaseTy = std::conditional_t<std::is_const<BlockTy>::value,
+                                      const TPBlockBase, TPBlockBase>;
+
+    // We need to first create an iterator range over (const) BlocktTy & instead
+    // of (const) BlockTy * for filter_range to work properly.
+    auto Mapped =
+        map_range(Range, [](BaseTy *Block) -> BaseTy & { return *Block; });
+    auto Filter = make_filter_range(
+        Mapped, [](BaseTy &Block) { return isa<BlockTy>(&Block); });
+    return map_range(Filter, [](BaseTy &Block) -> BlockTy * {
+      return cast<BlockTy>(&Block);
+    });
+  }
+};
+
+namespace tputils {
+
+/// Returns true if only the first lane of \p Def is used.
+bool onlyFirstLaneUsed(const TPValue *Def);
+
+/// Returns true if only the first part of \p Def is used.
+bool onlyFirstPartUsed(const TPValue *Def);
+
+/// Get or create a VPValue that corresponds to the expansion of \p Expr. If \p
+/// Expr is a SCEVConstant or SCEVUnknown, return a VPValue wrapping the live-in
+/// value. Otherwise return a VPExpandSCEVRecipe to expand \p Expr. If \p Plan's
+/// pre-header already contains a recipe expanding \p Expr, return it. If not,
+/// create a new one.
+TPValue *getOrCreateTPValueForSCEVExpr(TPlan &Plan, const SCEV *Expr,
+                                       ScalarEvolution &SE);
+
+/// Returns true if \p VPV is uniform after vectorization.
+inline bool isUniformAfterTensorization(TPValue *TPV) {
+  // TODO(yuxin.an)
+  llvm_unreachable("");
+}
+
+/// Get or create a TPValue that corresponds to the expansion of \p Expr. If \p
+/// Expr is a SCEVConstant or SCEVUnknown, return a TPValue wrapping the live-in
+/// value. Otherwise return a TPExpandSCEVRecipe to expand \p Expr. If \p Plan's
+/// pre-header already contains a recipe expanding \p Expr, return it. If not,
+/// create a new one.
+TPValue *getOrCreateTPValueForSCEVExpr(TPlan &Plan, const SCEV *Expr,
+                                       ScalarEvolution &SE);
+
+/// Returns true if \p TPV is uniform after vectorization.
+inline bool isUniformAfterVectorization(TPValue *TPV) {
+  // A value defined outside the vector region must be uniform after
+  // vectorization inside a vector region.
+  if (TPV->isDefinedOutsideVectorRegions())
+    return true;
+  TPRecipeBase *Def = TPV->getDefiningRecipe();
+  assert(Def && "Must have definition for value defined inside vector region");
+  if (auto Rep = dyn_cast<TPReplicateRecipe>(Def))
+    return Rep->isUniform();
+  if (auto *GEP = dyn_cast<TPWidenGEPRecipe>(Def))
+    return all_of(GEP->operands(), isUniformAfterVectorization);
+  if (auto *VPI = dyn_cast<TPInstruction>(Def))
+    return VPI->isSingleScalar() || VPI->isTensorToScalar();
+  return false;
+}
+
+/// Return true if \p V is a header mask in \p Plan.
+bool isHeaderMask(TPValue *V, TPlan &Plan);
+} // namespace tputils
+
+} // end of namespace llvm
+
+#endif // LLVM_TRANSFORMS_TENSORIZE_TPLAN_H
