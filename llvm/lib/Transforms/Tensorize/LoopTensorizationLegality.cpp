@@ -472,7 +472,7 @@ bool LoopTensorizationLegality::canTensorizeInstrs() {
           auto *SE = Loop2PSE[Loop]->getSE();
           Intrinsic::ID IntrinID = getVectorIntrinsicIDForCall(CI, TLI);
           for (unsigned i = 0, e = CI->arg_size(); i != e; ++i)
-            if (isVectorIntrinsicWithScalarOpAtArg(IntrinID, i, TTI)) {
+            if (isVectorIntrinsicWithScalarOpAtArg(IntrinID, i)) {
               if (!SE->isLoopInvariant(Loop2PSE[Loop]->getSCEV(CI->getOperand(i)), Loop)) {
                 reportTensorizationFailure("Found unvectorizable intrinsic",
                     "intrinsic instruction cannot be vectorized",

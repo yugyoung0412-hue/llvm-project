@@ -147,8 +147,9 @@ void LoopTensorizeCostModel::collectElementTypesForWidening() {
           const RecurrenceDescriptor &RdxDesc =
               Legal->getReductionVars().find(PN)->second;
           if (TPPreferInLoopReductions || useOrderedReductions(RdxDesc) ||
-              TTI.preferInLoopReduction(RdxDesc.getRecurrenceKind(),
-                                        RdxDesc.getRecurrenceType()))
+              TTI.preferInLoopReduction(RdxDesc.getOpcode(),
+                                        RdxDesc.getRecurrenceType(),
+                                        TargetTransformInfo::ReductionFlags()))
             continue;
           T = RdxDesc.getRecurrenceType();
         }
@@ -300,7 +301,7 @@ InstructionCost LoopTensorizeCostModel::getScalarizationOverhead(
     return 0;
 
   InstructionCost Cost = 0;
-  Type *RetTy = toVectorTy(I->getType(), VF);
+  Type *RetTy = ToVectorTy(I->getType(), VF);
   if (!RetTy->isVoidTy() &&
       (!isa<LoadInst>(I) || !TTI.supportsEfficientVectorElementLoadStore()))
     Cost += TTI.getScalarizationOverhead(
@@ -325,7 +326,8 @@ InstructionCost LoopTensorizeCostModel::getScalarizationOverhead(
   SmallVector<Type *> Tys;
   for (auto *V : filterExtractingOperands(Ops, VF))
     Tys.push_back(MaybeVectorizeType(V->getType(), VF));
-  return Cost + TTI.getOperandsScalarizationOverhead(Tys, CostKind);
+  return Cost + TTI.getOperandsScalarizationOverhead(
+                    filterExtractingOperands(Ops, VF), Tys, CostKind);
 }
 
 std::pair<InstructionCost, InstructionCost>
@@ -369,13 +371,13 @@ LoopTensorizeCostModel::getDivRemSpeculationCost(Instruction *I,
   }
   InstructionCost SafeDivisorCost = 0;
 
-  auto *VecTy = toVectorTy(I->getType(), VF);
+  auto *VecTy = ToVectorTy(I->getType(), VF);
 
   // The cost of the select guard to ensure all lanes are well defined
   // after we speculate above any internal control flow.
   SafeDivisorCost += TTI.getCmpSelInstrCost(
     Instruction::Select, VecTy,
-    toVectorTy(Type::getInt1Ty(I->getContext()), VF),
+    ToVectorTy(Type::getInt1Ty(I->getContext()), VF),
     CmpInst::BAD_ICMP_PREDICATE, CostKind);
 
   // Certain instructions can be cheaper to vectorize if they have a constant
@@ -545,7 +547,7 @@ void LoopTensorizeCostModel::setTailFoldingStyles(bool IsScalableVF,
   // FIXME: use actual opcode/data type for analysis here.
   // FIXME: Investigate opportunity for fixed vector factor.
   bool EVLIsLegal = IsScalableVF && UserIC <= 1 &&
-                    TTI.hasActiveVectorLength() &&
+                    TTI.hasActiveVectorLength(0, nullptr, Align()) &&
                     Legal->isSafeForAnyVectorWidth(Loops.back());
   if (!EVLIsLegal) {
     // If for some reason EVL mode is unsupported, fallback to
