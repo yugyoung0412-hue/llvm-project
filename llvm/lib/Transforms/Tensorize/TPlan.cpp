@@ -989,3 +989,311 @@ void TPlan::printLiveIns(raw_ostream &O) const {
   }
   O << "\n";
 }
+
+LLVM_DUMP_METHOD
+void TPlan::print(raw_ostream &O) const {
+  TPSlotTracker SlotTracker(this);
+
+  O << "TPlan '" << getName() << "' {";
+
+  printLiveIns(O);
+
+  if (!getPreheader()->empty()) {
+    O << "\n";
+    getPreheader()->print(O, "", SlotTracker);
+  }
+
+  for (const TPBlockBase *Block : tp_depth_first_shallow(getEntry())) {
+    O << '\n';
+    Block->print(O, "", SlotTracker);
+  }
+
+  if (!LiveOuts.empty())
+    O << "\n";
+  for (const auto &KV : LiveOuts) {
+    KV.second->print(O, SlotTracker);
+  }
+
+  O << "}\n";
+}
+
+std::string TPlan::getName() const {
+  auto PrintTF = [](raw_ostream &OS, TFTy TF) {
+    if (!TF.empty()) {
+      OS << "{";
+      OS << &TF.begin()->second;
+      for (auto TFElem : drop_begin(TF)) {
+        OS << ",";
+        OS << TFElem.second;
+      }
+      OS << "}";
+    }
+  };
+  auto PrintTUF = [](raw_ostream &OS, TUFTy UF) {
+    if (!UF.empty()) {
+      OS << "{";
+      OS << &UF.begin()->second;
+      for (auto UFElem : drop_begin(UF)) {
+        OS << ",";
+        OS << UFElem.second;
+      }
+      OS << "}";
+    }
+  };
+
+  std::string Out;
+  raw_string_ostream RSO(Out);
+  RSO << Name << " for ";
+  // if (!TFs.empty()) {
+  //   RSO << "TF={";
+  //   PrintTF(RSO, TFs[0]);
+  //   for (auto TF : drop_begin(TFs)) {
+  //     RSO << ",";
+  //     PrintTF(RSO, TF);
+  //   }
+  //   RSO << "},";
+  // }
+
+  // if (UFs.empty()) {
+  //   RSO << "UF>=1";
+  // } else {
+  //   RSO << "UF={";
+  //   PrintTUF(RSO, UFs[0]);
+  //   for (auto UF : drop_begin(UFs)) {
+  //     RSO << ",";
+  //     PrintTUF(RSO, UF);
+  //   }
+  //   RSO << "}";
+  // }
+
+  return Out;
+}
+
+LLVM_DUMP_METHOD
+void TPlan::printDOT(raw_ostream &O) const {
+  // TODO(yuxin.an)
+  llvm_unreachable("");
+}
+
+LLVM_DUMP_METHOD
+void TPlan::dump() const { print(dbgs()); }
+#endif
+
+void TPlan::addLiveOut(PHINode *PN, TPValue *V) {
+  // TODO(yuxin.an)
+  llvm_unreachable("");
+}
+
+TPlan *TPlan::duplicate() {
+  // TODO(yuxin.an)
+  llvm_unreachable("");
+}
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+
+Twine TPlanPrinter::getUID(const TPBlockBase *Block) {
+  return (isa<TPRegionBlock>(Block) ? "cluster_N" : "N") +
+         Twine(getOrCreateBID(Block));
+}
+
+Twine TPlanPrinter::getOrCreateName(const TPBlockBase *Block) {
+  const std::string &Name = Block->getName();
+  if (!Name.empty())
+    return Name;
+  return "TPB" + Twine(getOrCreateBID(Block));
+}
+
+void TPlanPrinter::dump() {
+  Depth = 1;
+  bumpIndent(0);
+  OS << "digraph TPlan {\n";
+  OS << "graph [labelloc=t, fontsize=30; label=\"Tensorization Plan";
+  if (!Plan.getName().empty())
+    OS << "\\n" << DOT::EscapeString(Plan.getName());
+
+  {
+    // Print live-ins.
+    std::string Str;
+    raw_string_ostream SS(Str);
+    Plan.printLiveIns(SS);
+    SmallVector<StringRef, 0> Lines;
+    StringRef(Str).rtrim('\n').split(Lines, "\n");
+    for (auto Line : Lines)
+      OS << DOT::EscapeString(Line.str()) << "\\n";
+  }
+
+  OS << "\"]\n";
+  OS << "node [shape=rect, fontname=Courier, fontsize=30]\n";
+  OS << "edge [fontname=Courier, fontsize=30]\n";
+  OS << "compound=true\n";
+
+  dumpBlock(Plan.getPreheader());
+
+  for (const TPBlockBase *Block : tp_depth_first_shallow(Plan.getEntry()))
+    dumpBlock(Block);
+
+  OS << "}\n";
+}
+
+
+void TPReductionPHIRecipe::execute(TPTransformState &State) {
+  const RecurrenceDescriptor &RdxDesc = getRecurrenceDescriptor();
+  Value *Start = getStartValue()->getLiveInIRValue();
+  Type *ScalarTy = Start->getType();
+  
+  int Dim = getDimIndex();
+  unsigned PF = (Dim >= 0) ? State.Plan->getPFForDim(static_cast<unsigned>(Dim)) : 1;
+  
+  IRBuilder<> Builder(State.CurBB->getTerminator());
+  
+  Type *PhiTy = ScalarTy;
+  if (PF > 1 && DimSet.any()) {
+    PhiTy = VectorType::get(ScalarTy, PF, false);
+  }
+  
+  PHINode *RdxPhi = PHINode::Create(PhiTy, 2, "rdx.phi");
+  RdxPhi->insertBefore(State.CurBB->getTerminator());
+  
+  BasicBlock *Preheader = State.CurBB->getSinglePredecessor();
+  Value *InitVal = Start;
+  
+  if (PF > 1 && isa<Constant>(Start)) {
+    InitVal = Builder.CreateVectorSplat(PF, cast<Constant>(Start));
+  }
+  
+  RdxPhi->addIncoming(InitVal, Preheader ? Preheader : State.TBS.TPH);
+  
+  State.TPValue2Value[this] = RdxPhi;
+}
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+void TPReductionPHIRecipe::print(raw_ostream &O, const Twine &Indent,
+                                 TPSlotTracker &SlotTracker) const {
+  O << Indent << "WIDEN-REDUCTION-PHI ";
+
+  printAsOperand(O, SlotTracker);
+  O << " = phi ";
+  printOperands(O, SlotTracker);
+}
+#endif
+
+//--------------------------------------------------------------------
+// execute : 현재는 스텁(stub) 구현. 실제 로직은 나중에 채워도 된다.
+//--------------------------------------------------------------------
+void TPFirstOrderRecurrencePHIRecipe::execute(TPTransformState &State) {
+  // FIXME(yg0412.yun)
+  llvm_unreachable("");
+}
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+void TPFirstOrderRecurrencePHIRecipe::print(raw_ostream &O, const Twine &Indent,
+                                            TPSlotTracker &SlotTracker) const {
+  O << Indent << "FIRST-ORDER-RECURRENCE-PHI ";
+  printAsOperand(O, SlotTracker);
+  O << " = phi ";
+  printOperands(O, SlotTracker);
+}
+#endif
+
+void TPlanPrinter::dumpBlock(const TPBlockBase *Block) {
+  if (const TPBasicBlock *BasicBlock = dyn_cast<TPBasicBlock>(Block))
+    dumpBasicBlock(BasicBlock);
+  else if (const TPRegionBlock *Region = dyn_cast<TPRegionBlock>(Block))
+    dumpRegion(Region);
+  else
+    llvm_unreachable("Unsupported kind of VPBlock.");
+}
+
+void TPlanPrinter::drawEdge(const TPBlockBase *From, const TPBlockBase *To,
+                            bool Hidden, const Twine &Label) {
+  // Due to "dot" we print an edge between two regions as an edge between the
+  // exiting basic block and the entry basic of the respective regions.
+  const TPBlockBase *Tail = From->getExitingBasicBlock();
+  const TPBlockBase *Head = To->getEntryBasicBlock();
+  OS << Indent << getUID(Tail) << " -> " << getUID(Head);
+  OS << " [ label=\"" << Label << '\"';
+  if (Tail != From)
+    OS << " ltail=" << getUID(From);
+  if (Head != To)
+    OS << " lhead=" << getUID(To);
+  if (Hidden)
+    OS << "; splines=none";
+  OS << "]\n";
+}
+
+void TPlanPrinter::dumpEdges(const TPBlockBase *Block) {
+  auto &Successors = Block->getSuccessors();
+  if (Successors.size() == 1)
+    drawEdge(Block, Successors.front(), false, "");
+  else if (Successors.size() == 2) {
+    drawEdge(Block, Successors.front(), false, "T");
+    drawEdge(Block, Successors.back(), false, "F");
+  } else {
+    unsigned SuccessorNumber = 0;
+    for (auto *Successor : Successors)
+      drawEdge(Block, Successor, false, Twine(SuccessorNumber++));
+  }
+}
+
+void TPlanPrinter::dumpBasicBlock(const TPBasicBlock *BasicBlock) {
+  // Implement dot-formatted dump by performing plain-text dump into the
+  // temporary storage followed by some post-processing.
+  OS << Indent << getUID(BasicBlock) << " [label =\n";
+  bumpIndent(1);
+  std::string Str;
+  raw_string_ostream SS(Str);
+  // Use no indentation as we need to wrap the lines into quotes ourselves.
+  BasicBlock->print(SS, "", SlotTracker);
+
+  // We need to process each line of the output separately, so split
+  // single-string plain-text dump.
+  SmallVector<StringRef, 0> Lines;
+  StringRef(Str).rtrim('\n').split(Lines, "\n");
+
+  auto EmitLine = [&](StringRef Line, StringRef Suffix) {
+    OS << Indent << '"' << DOT::EscapeString(Line.str()) << "\\l\"" << Suffix;
+  };
+
+  // Don't need the "+" after the last line.
+  for (auto Line : make_range(Lines.begin(), Lines.end() - 1))
+    EmitLine(Line, " +\n");
+  EmitLine(Lines.back(), "\n");
+
+  bumpIndent(-1);
+  OS << Indent << "]\n";
+
+  dumpEdges(BasicBlock);
+}
+
+void TPlanPrinter::dumpRegion(const TPRegionBlock *Region) {
+  OS << Indent << "subgraph " << getUID(Region) << " {\n";
+  bumpIndent(1);
+  OS << Indent << "fontname=Courier\n"
+     << Indent << "label=\""
+     << DOT::EscapeString(Region->isReplicator() ? "<xVFxUF> " : "<x1> ")
+     << DOT::EscapeString(Region->getName()) << "\"\n";
+  // Dump the blocks of the region.
+  assert(Region->getEntry() && "Region contains no inner blocks.");
+  for (const TPBlockBase *Block : tp_depth_first_shallow(Region->getEntry()))
+    dumpBlock(Block);
+  bumpIndent(-1);
+  OS << Indent << "}\n";
+  dumpEdges(Region);
+}
+
+void TPlanIngredient::print(raw_ostream &O) const {
+  if (auto *Inst = dyn_cast<Instruction>(V)) {
+    if (!Inst->getType()->isVoidTy()) {
+      Inst->printAsOperand(O, false);
+      O << " = ";
+    }
+    O << Inst->getOpcodeName() << " ";
+    unsigned E = Inst->getNumOperands();
+    if (E > 0) {
+      Inst->getOperand(0)->printAsOperand(O, false);
+      for (unsigned I = 1; I < E; ++I)
+        Inst->getOperand(I)->printAsOperand(O << ", ", false);
+    }
+  } else // !Inst
+    V->printAsOperand(O, false);
+}
