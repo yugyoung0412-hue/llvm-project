@@ -375,4 +375,199 @@ TPBasicBlock *TPBasicBlock::splitAt(iterator SplitAt) {
   llvm_unreachable("");
 }
 
-TPRegionBlock *TPBasicBlock::getEnclosingLoopRegion() 
+TPRegionBlock *TPBasicBlock::getEnclosingLoopRegion() {
+  TPRegionBlock *P = getParent();
+  if (P && P->isReplicator()) {
+    P = P->getParent();
+    assert(!cast<TPRegionBlock>(P)->isReplicator() &&
+           "unexpected nested replicate regions");
+  }
+  return P;
+}
+
+static bool hasConditionalTerminator(const TPBasicBlock *TPBB) {
+  if (TPBB->empty()) {
+    assert(
+        TPBB->getNumSuccessors() < 2 &&
+        "block with multiple successors doesn't have a recipe as terminator");
+    return false;
+  }
+
+  const TPRecipeBase *R = &TPBB->back();
+  bool IsCondBranch = isa<TPBranchOnMaskRecipe>(R) ||
+                      match(R, m_BranchOnCond(m_TPValue())) ||
+                      match(R, m_BranchOnCount(m_TPValue(), m_TPValue()));
+  (void)IsCondBranch;
+
+  if (TPBB->getNumSuccessors() >= 2 ||
+      (TPBB->isExiting() && !TPBB->getParent()->isReplicator())) {
+    assert(IsCondBranch && "block with multiple successors not terminated by "
+                           "conditional branch recipe");
+
+    return true;
+  }
+
+  assert(
+      !IsCondBranch &&
+      "block with 0 or 1 successors terminated by conditional branch recipe");
+  return false;
+}
+
+TPRecipeBase *TPBasicBlock::getTerminator() {
+  if (hasConditionalTerminator(this))
+    return &back();
+  return nullptr;
+}
+
+const TPRecipeBase *TPBasicBlock::getTerminator() const {
+  if (hasConditionalTerminator(this))
+    return &back();
+  return nullptr;
+}
+
+bool TPBasicBlock::isExiting() const {
+  return getParent() && getParent()->getExitingBasicBlock() == this;
+}
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+void TPBlockBase::printSuccessors(raw_ostream &O, const Twine &Indent) const {
+  if (getSuccessors().empty()) {
+    O << Indent << "No successors\n";
+  } else {
+    O << Indent << "Successor(s): ";
+    ListSeparator LS;
+    for (auto *Succ : getSuccessors())
+      O << LS << Succ->getName();
+    O << '\n';
+  }
+}
+
+static StringRef kindToStr(const TensorOpKind K) {
+  switch (K) {
+    case TensorOpKind::Scalar:          return "Scalar";
+    case TensorOpKind::ElementWise:     return "ElementWise";
+    case TensorOpKind::BroadcastBinary: return "BroadcastBinary";
+    case TensorOpKind::OuterProduct:    return "OuterProduct";
+    case TensorOpKind::Contraction:     return "Contraction";
+    case TensorOpKind::PlainReduction:  return "PlainReduction";
+  }
+}
+
+static void printTensorOpKindAnnotation(raw_ostream &OS, const TPRecipeBase &R) {
+  const TensorOpKind TK = R.getTensorOpKind();
+  if (TK != TensorOpKind::Scalar)
+    OS << "; [TensorOpKind::" << kindToStr(TK) << "];";
+}
+
+/// Append DimSet annotation for a TPSingleDefRecipe (only when non-empty).
+/// Shown at Stage 2+ after TPlanWidener_widen() has populated DimSet fields.
+static void printDimSetAnnotation(raw_ostream &OS, const TPRecipeBase &R) {
+  // const auto *SDR = dyn_cast<TPSingleDefRecipe>(&R);
+  // if (!SDR || SDR->DimSet.none())
+  if (R.DimSet.none())
+    return;
+  OS << "; DimSet={";
+  bool First = true;
+  for (int D = R.DimSet.find_first(); D >= 0; D = R.DimSet.find_next(D)) {
+    if (!First)
+      OS << ",";
+    OS << D;
+    First = false;
+  }
+  OS << "}";
+}
+
+void TPBasicBlock::print(raw_ostream &O, const Twine &Indent,
+                         TPSlotTracker &SlotTracker) const {
+  O << Indent << getName() << ":\n";
+
+  auto RecipeIndent = Indent + "  ";
+  for (const TPRecipeBase &Recipe : *this) {
+    Recipe.print(O, RecipeIndent, SlotTracker);
+    printDimSetAnnotation(O, Recipe);
+    printTensorOpKindAnnotation(O, Recipe);
+    O << " [PF= " << Recipe.getPF() << "];";
+    O << '\n';
+  }
+
+  printSuccessors(O, Indent);
+}
+#endif
+
+static std::pair<TPBlockBase *, TPBlockBase *>
+cloneFrom(TPBlockBase *Entry,
+          DenseMap<TPBlockBase *, TPBlockBase *> &Old2NewTPBlocks);
+
+// Clone the CFG for all nodes reachable from \p Entry, this includes cloning
+// the blocks and their recipes. Operands of cloned recipes will NOT be updated.
+// Remapping of operands must be done separately. Returns a pair with the new
+// entry and exiting blocks of the cloned region. If \p Entry isn't part of a
+// region, return nullptr for the exiting block.
+static std::pair<TPBlockBase *, TPBlockBase *>
+cloneFrom(TPBlockBase *Entry,
+          DenseMap<TPBlockBase *, TPBlockBase *> &Old2NewTPBlocks) {
+  TPBlockBase *Exiting = nullptr;
+  bool InRegion = Entry->getParent();
+  // First, clone blocks reachable from Entry.
+  for (TPBlockBase *BB : tp_depth_first_shallow(Entry)) {
+    TPBlockBase *NewBB = BB->clone();
+    Old2NewTPBlocks[BB] = NewBB;
+    if (InRegion && BB->getNumSuccessors() == 0) {
+      assert(!Exiting && "Multiple exiting blocks?");
+      Exiting = BB;
+    }
+  }
+  assert((!InRegion || Exiting) && "regions must have a single exiting block");
+
+  // Second, update the predecessors & successors of the cloned blocks.
+  for (TPBlockBase *BB : tp_depth_first_shallow(Entry)) {
+    TPBlockBase *NewBB = Old2NewTPBlocks[BB];
+    SmallVector<TPBlockBase *> NewPreds;
+    for (TPBlockBase *Pred : BB->getPredecessors()) {
+      NewPreds.push_back(Old2NewTPBlocks[Pred]);
+    }
+    NewBB->setPredecessors(NewPreds);
+    SmallVector<TPBlockBase *> NewSuccs;
+    for (TPBlockBase *Succ : BB->successors()) {
+      NewSuccs.push_back(Old2NewTPBlocks[Succ]);
+    }
+    NewBB->setSuccessors(NewSuccs);
+  }
+
+#if !defined(NDEBUG)
+  // Verify that the order of predecessors and successors matches in the cloned
+  // version.
+  for (const auto &[OldBB, NewBB] :
+       zip(tp_depth_first_shallow(Entry),
+           tp_depth_first_shallow(Old2NewTPBlocks[Entry]))) {
+    for (const auto &[OldPred, NewPred] :
+         zip(OldBB->getPredecessors(), NewBB->getPredecessors()))
+      assert(NewPred == Old2NewTPBlocks[OldPred] && "Different predecessors");
+
+    for (const auto &[OldSucc, NewSucc] :
+         zip(OldBB->successors(), NewBB->successors()))
+      assert(NewSucc == Old2NewTPBlocks[OldSucc] && "Different successors");
+  }
+#endif
+
+  return std::make_pair(Old2NewTPBlocks[Entry],
+                        Exiting ? Old2NewTPBlocks[Exiting] : nullptr);
+}
+
+TPRegionBlock::TPRegionBlock(TPBlockBase *Entry, TPBlockBase *Exiting,
+                             DenseMap<Loop *, TPBlockBase *> Loop2HeaderTPB,
+                             DenseMap<Loop *, TPBlockBase *> Loop2LatchTPB,
+                             const std::string &Name, bool IsReplicator)
+    : TPBlockBase(TPRegionBlockSC, Name), Entry(Entry), Exiting(Exiting),
+      Loop2HeaderTPB(Loop2HeaderTPB), Loop2LatchTPB(Loop2LatchTPB),
+      IsReplicator(IsReplicator) {
+  assert(Entry->getPredecessors().empty() && "Entry block has predecessors.");
+  assert(Exiting->getSuccessors().empty() && "Exit block has successors.");
+  for (auto Elem : Loop2HeaderTPB)
+    HeaderTPB2Loop.insert({Elem.second, Elem.first});
+  for (auto Elem : Loop2LatchTPB)
+    LatchTPB2Loop.insert({Elem.second, Elem.first});
+
+  for (TPBlockBase *Block : tp_depth_first_shallow(Entry))
+    Block->setParent(this);
+}
