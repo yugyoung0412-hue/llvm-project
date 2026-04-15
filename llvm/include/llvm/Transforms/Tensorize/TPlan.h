@@ -1,0 +1,472 @@
+//===- TPlan.h - Represent A Vectorizer Plan --------------------*- C++ -*-===//
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LLVM_TRANSFORMS_TENSORIZE_TPLAN_H
+#define LLVM_TRANSFORMS_TENSORIZE_TPLAN_H
+
+#include "TPattern.h"
+#include "TPlanAnalysis.h"
+#include "TPlanValue.h"
+#include "TensorizeCommon.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SmallBitVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Twine.h"
+#include "llvm/ADT/ilist.h"
+#include "llvm/ADT/ilist_node.h"
+#include "llvm/Analysis/DomTreeUpdater.h"
+#include "llvm/Analysis/IVDescriptors.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/TensorUtils.h"
+#include "llvm/IR/DebugLoc.h"
+#include "llvm/IR/FMF.h"
+#include "llvm/IR/Operator.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/InstructionCost.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
+#include "llvm/Transforms/Tensorize/TPRecipeMatcher.h"
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <string>
+
+namespace llvm {
+
+class BasicBlock;
+class DominatorTree;
+class TargetTransformInfo;
+class SCEVExpander;
+class LoopTensorizer;
+class IRBuilderBase;
+class LoopInfo;
+class raw_ostream;
+class RecurrenceDescriptor;
+class SCEV;
+class Type;
+class TPBasicBlock;
+class TPRegionBlock;
+class TPlan;
+class TPReplicateRecipe;
+class TPlanSlp;
+class Talue;
+class LoopTensorizeCostModel;
+class LoopVersioning;
+
+struct TPCostContext;
+
+namespace Intrinsic {
+typedef unsigned ID;
+}
+
+/// Returns a calculation for the total number of elements for a given \p VF.
+/// For fixed width vectors this value is a constant, whereas for scalable
+/// vectors it is an expression determined at runtime.
+Value *getRuntimeTF(IRBuilderBase &B, Type *Ty, ElementCount VF);
+
+/// Return a value for Step multiplied by VF.
+Value *createStepForTFElem(IRBuilderBase &B, Type *Ty, ElementCount TFElem,
+                           int64_t Step);
+
+/// A helper function that returns the reciprocal of the block probability of
+/// predicated blocks. If we return X, we are assuming the predicated block
+/// will execute once for every X iterations of the loop header.
+///
+/// TODO: We should use actual block probability here, if available. Currently,
+///       we always assume predicated blocks have a 50% chance of executing.
+inline unsigned getReciprocalPredBlockProb() { return 2; }
+
+MapVector<Loop *, SCEV *> createTripCountSCEV(Type *IdxTy, ScalarEvolution &SE,
+                                              SmallVector<Loop *> Loops);
+
+/// A range of powers-of-2 vectorization factors with fixed start and
+/// adjustable end. The range includes start and excludes end, e.g.,:
+/// [1, 16) = {1, 2, 4, 8}
+struct TFRange {
+  // A power of 2. 
+  // using TFTy = MapVector<Loop *, ElementCount>
+  const TFTy Start;
+  ElementCount tmp_start;
+  ElementCount tmp_end;
+
+  // A power of 2. If End <= Start range is empty.
+  TFTy End;
+
+  bool isEmpty() const {
+    if (Start.empty() || End.empty())
+      return true;
+    for (auto [StartElem, EndElem] : zip(Start, End)) {
+      if (EndElem.second.getKnownMinValue() <=
+          StartElem.second.getKnownMinValue())
+        return true;
+    }
+    return false;
+  }
+
+  TFRange(ElementCount Start, ElementCount End) : tmp_start(Start), tmp_end(End) {
+    assert(Start.isScalable() == End.isScalable() &&
+           "Both Start and End should have the same scalable flag");
+    assert(isPowerOf2_32(Start.getKnownMinValue()) &&
+           "Expected Start to be a power of 2");
+    assert(isPowerOf2_32(End.getKnownMinValue()) &&
+           "Expected End to be a power of 2");
+  }
+
+  TFRange(TFTy Start, TFTy End) : Start(Start), End(End) {
+    for (auto [StartElem, EndElem] : zip(Start, End)) {
+      // assert(StartElem.second.isScalable() == EndElem.second.isScalable() &&
+      //        "Both Start and End should have the same scalable flag");
+      // assert(isPowerOf2_32(StartElem.second.getKnownMinValue()) &&
+      //        "Expected Start to be a power of 2");
+      // assert(isPowerOf2_32(EndElem.second.getKnownMinValue()) &&
+      //        "Expected End to be a power of 2");
+    }
+  }
+
+  /// Iterator to iterate over vectorization factors in a VFRange.
+  class iterator
+      : public iterator_facade_base<iterator, std::forward_iterator_tag, TFTy> {
+    TFTy TF;
+
+  public:
+    iterator(TFTy TF) : TF(TF) {}
+
+    bool operator==(const iterator &Other) const {
+      for (auto [TFElem, OtherTFElem] : zip(TF, *Other)) {
+        if (TFElem.first != OtherTFElem.first ||
+            TFElem.second != OtherTFElem.second)
+          return false;
+      }
+      return true;
+    }
+
+    TFTy operator*() const { return TF; }
+
+    iterator &operator++() {
+      // TODO(yuxin.an): Need to check.
+      for (auto &Elem : TF)
+        Elem.second *= 2;
+      return *this;
+    }
+  };
+
+  iterator begin() { return iterator(Start); }
+  iterator end() {
+    for (auto Elem : End)
+      assert(isPowerOf2_32(Elem.second.getKnownMinValue()));
+
+    return iterator(End);
+  }
+};
+
+using TPlanPtr = std::unique_ptr<TPlan>;
+
+class TPLane { // yuxin.an: L156
+public:
+  /// Kind describes how to interpret Lane.
+  enum class Kind : uint8_t {
+    /// For First, Lane is the index into the first N elements of a
+    /// fixed-vector <N x <ElTy>> or a scalable vector <vscale x N x <ElTy>>.
+    First,
+    /// For ScalableLast, Lane is the offset from the start of the last
+    /// N-element subvector in a scalable vector <vscale x N x <ElTy>>. For
+    /// example, a Lane of 0 corresponds to lane `(vscale - 1) * N`, a Lane of
+    /// 1 corresponds to `((vscale - 1) * N) + 1`, etc.
+    ScalableLast
+  };
+
+private:
+  /// in [0..VF)
+  unsigned Lane;
+
+  /// Indicates how the Lane should be interpreted, as described above.
+  Kind LaneKind;
+
+public:
+  TPLane(unsigned Lane, Kind LaneKind) : Lane(Lane), LaneKind(LaneKind) {}
+
+  static TPLane getFirstLane() { return TPLane(0, TPLane::Kind::First); }
+
+  static TPLane getLaneFromEnd(const ElementCount &VF, unsigned Offset) {
+    assert(Offset > 0 && Offset <= VF.getKnownMinValue() &&
+           "trying to extract with invalid offset");
+    unsigned LaneOffset = VF.getKnownMinValue() - Offset;
+    Kind LaneKind;
+    if (VF.isScalable())
+      // In this case 'LaneOffset' refers to the offset from the start of the
+      // last subvector with VF.getKnownMinValue() elements.
+      LaneKind = TPLane::Kind::ScalableLast;
+    else
+      LaneKind = TPLane::Kind::First;
+    return TPLane(LaneOffset, LaneKind);
+  }
+
+  static TPLane getLastLaneForTF(const ElementCount &VF) {
+    return getLaneFromEnd(VF, 1);
+  }
+
+  /// Returns a compile-time known value for the lane index and asserts if the
+  /// lane can only be calculated at runtime.
+  unsigned getKnownLane() const {
+    assert(LaneKind == Kind::First);
+    return Lane;
+  }
+
+  /// Returns an expression describing the lane index that can be used at
+  /// runtime.
+  Value *getAsRuntimeExpr(IRBuilderBase &Builder, const ElementCount &VF) const;
+
+  /// Returns the Kind of lane offset.
+  Kind getKind() const { return LaneKind; }
+
+  /// Returns true if this is the first lane of the whole vector.
+  bool isFirstLane() const { return Lane == 0 && LaneKind == Kind::First; }
+
+  /// Maps the lane to a cache index based on \p VF.
+  unsigned mapToCacheIndex(const ElementCount &VF) const {
+    switch (LaneKind) {
+    case TPLane::Kind::ScalableLast:
+      assert(VF.isScalable() && Lane < VF.getKnownMinValue());
+      return VF.getKnownMinValue() + Lane;
+    default:
+      assert(Lane < VF.getKnownMinValue());
+      return Lane;
+    }
+  }
+
+  /// Returns the maxmimum number of lanes that we are able to consider
+  /// caching for \p VF.
+  static unsigned getNumCachedLanes(const ElementCount &VF) {
+    return VF.getKnownMinValue() * (VF.isScalable() ? 2 : 1);
+  }
+};
+
+struct TPIteration { // yuxin.an: L238
+  unsigned Part;
+
+  TPLane Lane;
+
+  TPIteration(unsigned Part, unsigned Lane,
+              TPLane::Kind Kind = TPLane::Kind::First)
+      : Part(Part), Lane(Lane, Kind) {}
+
+  TPIteration(unsigned Part, const TPLane &Lane) : Part(Part), Lane(Lane) {}
+
+  bool isFirstIteration() const { return Part == 0 && Lane.isFirstLane(); }
+};
+
+struct TensorBlocks {
+  BasicBlock *EntryB = nullptr;  // Entry Block
+  BasicBlock *MiddleB = nullptr; // Middle Block
+  BasicBlock *SPH = nullptr;     // Scalar PreHeader
+  BasicBlock *TPH = nullptr;     // Tensor PreHeader
+  BasicBlock *TEntry = nullptr;
+  BasicBlock *TExiting = nullptr;
+  DenseMap<Loop *, BasicBlock *> Loop2HeadBB;
+  DenseMap<Loop *, BasicBlock *> Loop2LatchBB;
+};
+
+//===----------------------------------------------------------------------===//
+// EmissionPolicy — per-dim lowering intent built from TPlan before execute()
+//===----------------------------------------------------------------------===//
+
+/// How a tensor dimension should be emitted during lowering.
+enum class DimEmitMode {
+  Inline,       ///< TC <= PF for this dim: no tiling loop needed.
+  StaticTiled,  ///< TC > PF (known at compile time) or dynamic output dim:
+                ///< emit umin-bounded tiling loop via emitTilingLoop().
+  DynamicTiled, ///< Reduction dim with runtime TC: emit fixed-tile loop
+                ///< (tensor.body) + epilogue tiers + scalar remainder.
+};
+
+/// Per-dimension emission specification built by buildEmissionPolicy().
+/// Dim indices use the DimIdx convention (innermost=0, outermost=Depth-1).
+struct DimEmissionSpec {
+  unsigned    Dim;                     ///< Dimension index.
+  unsigned    PF;                      ///< Tile size from Plan.getPFForDim(Dim).
+  DimEmitMode Mode = DimEmitMode::Inline;
+};
+
+/// Upfront per-lowering emission plan: classifies every tensor dim before
+/// execute() runs. Built by buildEmissionPolicy() in LoopTensorizePlanner::executePlan().
+///
+/// Seperates the "what to emit" decision (here, driven by TPlan's PF/TC data)
+/// from the "how to emit" mechanics (inside emitContraction()).
+struct EmissionPolicy {
+  SmallVector<DimEmissionSpec, 4> Specs;
+
+  /// True iff any dim uses DynamicTiled mode.
+  /// When true, LoopTensorizePlanner::executePlan() must call createTensorizedLoopSkeleton()
+  /// before exeucte() to insert a runtime profitability guard.
+  bool needsGuard() const {
+    return llvm::any_of(Specs, [](const DimEmissionSpec &S) {
+      return S.Mode == DimEmitMode::DynamicTiled;
+    });
+  }
+
+  /// Returns the spec for dim \p Dim, or nullptr if not present.
+  const DimEmissionSpec *getSpec(unsigned Dim) const {
+    for (const auto &S : Specs)
+      if (S.Dim == Dim)
+        return &S;
+    return nullptr;
+  }
+
+  /// True if any dim requires a tiling loop (Static or Dynamic).
+  bool needsTiling() const {
+    return llvm::any_of(Specs, [](const DimEmissionSpec &S) {
+      return S.Mode != DimEmitMode::Inline;
+    });
+  }
+};
+
+// yuxin.an: L255
+struct TPTransformState {
+  // TODO(yuxin.an)
+  TPTransformState(TFTy VF, TUFTy UF, LoopInfo *LI, DominatorTree *DT,
+                   IRBuilderBase &Builder, LoopTensorizer *LT, TPlan *Plan,
+                   LLVMContext &Ctx);
+
+  /// The chosen Vectorization and Unroll Factors of the loop being vectorized.
+  TFTy TF;
+  TUFTy UF;
+
+  const TargetTransformInfo *TTI;
+  /// TPlan dim index -> Loop*.
+  /// Used by decomposePtrForDims() in emitContraction().
+  MapVector<unsigned, Loop *> DimToLoop;
+
+  DenseMap<const TPDef *, Value *> ValueMap;
+
+  /// Upfront emission policy built by buildEmissionPolicy() before execute().
+  /// Consumed by emitContraction() to classify dims without re-running checkDim().
+  EmissionPolicy Policy;
+
+  /// Hold the indices to generate specific scalar instructions. Null indicates
+  /// that all instances are to be generated, using either scalar or vector
+  /// instructions.
+  std::optional<TPIteration> Instance;
+
+  struct DataState {
+    /// A type for vectorized values in the new loop. Each value from the
+    /// original loop, when vectorized, is represented by UF vector values in
+    /// the new unrolled loop, where UF is the unroll factor.
+    typedef SmallVector<Value *, 2> PerPartValuesTy;
+
+    DenseMap<TPValue *, PerPartValuesTy> PerPartOutput;
+
+    using ScalarsPerPartValuesTy = SmallVector<SmallVector<Value *, 4>, 2>;
+    DenseMap<TPValue *, ScalarsPerPartValuesTy> PerPartScalars;
+  } Data;
+
+  /// Get the generated vector Value for a given VPValue \p Def and a given \p
+  /// Part if \p IsScalar is false, otherwise return the generated scalar
+  /// for \p Part. \See set.
+  Value *get(TPValue *Def, unsigned Part, bool IsScalar = false);
+
+  /// Get the generated Value for a given VPValue and given Part and Lane.
+  Value *get(TPValue *Def, const TPIteration &Instance, Loop *L);
+
+  /// Get the generated Value for a given VPValue and given Part and Lane.
+  DenseMap<Loop *, Value *> get(DenseMap<Loop *, TPValue *> Def,
+                                const TPIteration &Instance);
+
+  Value *getValue(const TPDef *V) const { return ValueMap.lookup(V); }
+  void setValue(const TPDef *V, Value *IRV) { ValueMap[V] = IRV; }
+
+  bool hasTensorValue(TPValue *Def, unsigned Part) {
+    auto I = Data.PerPartOutput.find(Def);
+    return I != Data.PerPartOutput.end() && Part < I->second.size() &&
+           I->second[Part];
+  }
+
+  bool hasScalarValue(TPValue *Def, TPIteration Instance, Loop *L) {
+    auto I = Data.PerPartScalars.find(Def);
+    if (I == Data.PerPartScalars.end())
+      return false;
+    unsigned CacheIdx = Instance.Lane.mapToCacheIndex(TF[L]);
+    return Instance.Part < I->second.size() &&
+           CacheIdx < I->second[Instance.Part].size() &&
+           I->second[Instance.Part][CacheIdx];
+  }
+
+  /// Set by TPlanTransformer before execute() for the tiling dim's trip-count.
+  /// TPTilingRegion::execute() reads this to compute tile loop bounds.
+  Value *TilingTCVal = nullptr;
+
+  /// Set the generated vector Value for a given VPValue and a given Part, if \p
+  /// IsScalar is false. If \p IsScalar is true, set the scalar in (Part, 0).
+  void set(TPValue *Def, Value *V, unsigned Part, bool IsScalar = false) {
+    // TODO(yuxin.an)
+    llvm_unreachable("");
+  }
+
+  /// Reset an existing vector value for \p Def and a given \p Part.
+  void reset(TPValue *Def, Value *V, unsigned Part) {
+    // TODO(yuxin.an):
+    llvm_unreachable("");
+  }
+
+  /// Set the generated scalar \p V for \p Def and the given \p Instance.
+  void set(TPValue *Def, Value *V, const TPIteration &Instance) {
+    // TODO(yuxin.an):
+    llvm_unreachable("");
+  }
+
+  /// Reset an existing scalar value for \p Def and a given \p Instance.
+  void reset(TPValue *Def, Value *V, const TPIteration &Instance) {
+    // TODO(yuxin.an):
+    llvm_unreachable("");
+  }
+
+  /// Add additional metadata to \p To that was not present on \p Orig.
+  ///
+  /// Currently this is used to add the noalias annotations based on the
+  /// inserted memchecks.  Use this for instructions that are *cloned* into the
+  /// vector loop.
+  void addNewMetadata(Instruction *To, const Instruction *Orig);
+
+  /// Add metadata from one instruction to another.
+  ///
+  /// This includes both the original MDs from \p From and additional ones (\see
+  /// addNewMetadata).  Use this for *newly created* instructions in the vector
+  /// loop.
+  void addMetadata(Value *To, Instruction *From);
+
+  /// Set the debug location in the builder using the debug location \p DL.
+  void setDebugLocFrom(DebugLoc DL);
+
+  /// Construct the vector value of a scalarized value \p V one lane at a time.
+  void packScalarIntoTensorValue(TPValue *Def, const TPIteration &Instance);
+
+  struct CFGState {
+    /// The previous VPBasicBlock visited. Initially set to null.
+    TPBasicBlock *PrevTPBB = nullptr;
+
+    /// The previous IR BasicBlock created or used. Initially set to the new
+    /// header BasicBlock.
+    BasicBlock *PrevBB = nullptr;
+
+    /// The last IR BasicBlock in the output IR. Set to the exit block of the
+    /// vector loop.
+    BasicBlock *ExitBB = nullptr;
+
+    /// A mapping of each VPBasicBlock to the corresponding BasicBlock. In case
+    /// of replication, maps the BasicBlock of the last replica created.
+    SmallDenseMap<TPBasicBlock *, BasicBlock *> TPBB2IRBB;
+
+    /// Updater for the DominatorTree.
+    DomTreeUpdater DTU;
+
+    CFGState(DominatorTree *DT)
+        : DTU(DT, DomTreeUpdater::UpdateStrategy::Lazy) {}
+
+    /// Returns the BasicBlock* mapped to the pre-header of the loop region
+    /// containing \p R.
+    BasicBlock *getPreheaderBBFor(TPRecipeBase *R);
+  } CFG;
+
+  /// Hold a pointer to LoopInfo to register new basic blocks in the loop.
