@@ -1001,3 +1001,82 @@ bool ConvolutionTensorizePattern::isSemanticMatch() {
   }
   return Res;
 }
+
+
+bool ConvolutionTensorizePattern::tryToBuildTPlanWithTPRecipes(TPlanPtr &tplan,
+                                               TPRecipeBuilder *RecipeBuilder,
+                                               TPBasicBlock *TPBB,
+                                               bool UseTensorType) {
+  
+  
+  // Current TPlan is not general at all.
+  // Below implementation will create new TPlan with calling llvm.tensor.conv2d intrinsic.
+  // This is temporal solution for testing end-to-end building of GGML for NPU backend.
+
+  // step 1. create new TPlan rather than remove tplan's TPBBs.
+  TPlanPtr        Plan = nullptr;
+  TPIRBasicBlock *Entry = new TPIRBasicBlock(Loops[0]->getLoopPreheader());
+  TPBasicBlock *TensorPreheader = new TPBasicBlock("tensor.ph6");
+  Plan = std::make_unique<TPlan>(Entry, TensorPreheader, tplan->getPattern());
+  // Plan->TripCount[Loops[0]] =
+  //     tputils::getOrCreateTPValueForSCEVExpr(*Plan, /* TripCount[Loops[0]]=*/16, SE);
+
+  // Header / Latch
+  // Header와 BODY를 분리해서 따로 만들어야 됨!
+  BasicBlock *IRHeaderBlock = Loops[0]->getHeader();
+  auto *HeaderTPBB = new TPIRBasicBlock(IRHeaderBlock, "tensor.header6");
+  TPBasicBlock *LatchTPBB  = new TPBasicBlock("tensor.latch6");
+  TPRegionBlock *CurRegion = new TPRegionBlock(HeaderTPBB, LatchTPBB,
+                              "tensor loop6", false);
+  // Middle / ScalarPH
+  TPBasicBlock *MiddleTPBB = new TPBasicBlock("middle.block6");
+  TPBasicBlock *ScalarPH   = new TPBasicBlock("scalar.ph6");
+  TPBlockUtils::connectBlocks(MiddleTPBB, ScalarPH);
+  // HeaderTPBB -> LatchTPBB 
+  TPBlockUtils::connectBlocks(HeaderTPBB, LatchTPBB);
+  // CurRegion -> MiddleTPBB
+  TPBlockUtils::insertBlockAfter(MiddleTPBB, CurRegion);
+  // TensorPreheader -> Header (of CurRegion)
+  TPBlockUtils::insertBlockAfter(CurRegion, TensorPreheader);
+
+  // YYG::REMOVE
+  errs() << "TPlan: \n";
+  Plan->dump();
+
+  // step 2. calling llvm.tensor.load intrinsic for input tensor (A_instr), weight tensor (B_instr)
+  bool success;
+  // auto TFxUF = tplan->getTFxUF();
+  auto TFxUF = Plan->getTFxUF();
+  Loop *OutermostL = Info.Loops[2];
+  Loop *MiddleL = Info.Loops[1];
+  Loop *InnermostL = Info.Loops[0];
+
+  SmallVector<TPValue *> MatrixLoads;
+  TPValue *Res, *CurGEP;
+  
+  auto *OutermostPhi = Info.Loop2PHI_tmp[OutermostL];
+  auto *MiddlePhi = Info.Loop2PHI_tmp[MiddleL];
+  
+  // ConstantInt *ConstInt = ConstantInt::get(Type::getInt32Ty(Context), 42);
+  GetElementPtrInst *A_Instr = CI.GEPs[0];
+  ConstantInt *Input_N_IC = ConstantInt::get(Type::getInt32Ty(A_Instr->getContext()), 256);
+  ConstantInt *Input_IH_IW = ConstantInt::get(Type::getInt32Ty(A_Instr->getContext()), 128);
+  TPValue *Const_N_IC = new TPValue(Input_N_IC);
+  TPValue *Const_IH_IW = new TPValue(Input_IH_IW);
+  TPRecipeBase *AIdxRecipe = new TPNewInstrRecipe(
+      Instruction::Mul,
+      {Const_N_IC, Const_IH_IW});
+  LatchTPBB->appendRecipe(AIdxRecipe);
+
+  GetElementPtrInst *B_Instr = CI.GEPs[1];
+
+  int KH = 3;
+  int KW = 3;
+  ConstantInt *Input_OC_IC = ConstantInt::get(Type::getInt32Ty(B_Instr->getContext()), 512);
+  ConstantInt *Input_KH_KW = ConstantInt::get(Type::getInt32Ty(B_Instr->getContext()), KH * KW);
+  TPValue *Const_OC_IC = new TPValue(Input_OC_IC);
+  TPValue *Const_KH_KW = new TPValue(Input_KH_KW);
+  TPRecipeBase *BIdxRecipe =
+      new TPNewInstrRecipe(Instruction::Mul, {Const_OC_IC, Const_KH_KW});
+  LatchTPBB->appendRecipe(BIdxRecipe);
+
