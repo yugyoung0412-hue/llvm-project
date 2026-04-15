@@ -1204,3 +1204,505 @@ void LoopTensorizePlanner::executePlan(
       dbgs() << "  dim=" << S.Dim << " PF=" << S.PF << " mode=" << Mode << "\n";
     }
   });
+
+  // // If any dim needs a runtime profitability guard, insert the skeleton ONCE
+  // // before the outermost tensor loop — here, before execute(), not inside
+  // // emitContraction(). Mirrors VPlan's createVectorizedLoopSkeleton() call
+  // // site: the guard fires once, not once per M×N iteration.
+  // if (State.Policy.needsGuard()) {
+  //   // Find the outermost loop in the tensor nest (highest dim index in
+  //   // DimToLoop — outermost in DimIdx convention).
+  //   // TODO(yg0412.yun) Below finding mechanism can be replaced
+  //   // wihtout iterating for-loop.
+  //   Loop *OutermostLoop = nullptr;
+  //   unsigned MaxDim = 0;
+  //   for (const auto &[D, L] : State.DimToLoop) {
+  //     if (!OutermostLoop || D > MaxDim) {
+  //       MaxDim = D;
+  //       OutermostLoop = L;
+  //     }
+  //   }
+
+  //   // YYG::REMOVE
+  //   errs() << "OutermostLoop: \n";
+  //   OutermostLoop->dump();
+  //   // For each DynamicTiled dim, the PF in the Policy (from Plan.getPFForDim)
+  //   // serves as the guard threshold: TC >=u PF means at least one full tile
+  //   // can run on the tensor path.
+  //   for (const DimEmissionSpec &Spec : State.Policy.Specs) {
+  //     if (Spec.Mode != DimEmitMode::DynamicTiled)
+  //       continue;
+
+  //     if (!OutermostLoop)
+  //       break;
+      
+  //     BasicBlock *OuterPH   = OutermostLoop->getLoopPreheader();
+  //     BasicBlock *OuterPred = OuterPH ? OuterPH->getSinglePredecessor() : nullptr;
+  //     errs() << "OuterPH: " << *OuterPH << "\n";
+  //     errs() << "OuterPred: " << *OuterPred << "\n";
+  //     if (!OuterPred || !OutermostLoop->getExitBlock())
+  //       break;
+
+  //     const SCEV *BTCSCEV = BestTPlan.getTCForDim(Spec.Dim);
+  //     if (!BTCSCEV)
+  //       break;
+  //     // YYG::REMOVE
+  //     errs() << "Spec.Dim: " << Spec.Dim << ", BTCSCEV: " << *BTCSCEV << "\n";
+
+  //     // Expand the dim's backedge-taken count in OuterPred so it dominates
+  //     // the guard block that createTensorizedLoopSkeleton() will insert.
+  //     Instruction *ExpandAt = OuterPred->getTerminator();
+  //     Value *GuardBTC = Expander.expandCodeFor(
+  //         BTCSCEV, Type::getInt64Ty(BTCSCEV->getType()->getContext()), ExpandAt);
+  //     IRBuilder<> PredB(ExpandAt);
+  //     Value *GuardTC =
+  //         PredB.CreateAdd(GuardBTC, PredB.getInt64(1), "tc.guard");
+
+  //     ValueToValueMapTy SkelVMap;
+  //     TensorizedLoopSkeleton Skel = createTensorizedLoopSkeleton(
+  //         OutermostLoop, GuardTC, Spec.PF, *LI, *DT, SkelVMap);
+  //     LLVM_DEBUG({
+  //       if (Skel.Valid)
+  //         dbgs() << "LTP::executePlan: profitability guard inserted before "
+  //                << OutermostLoop->getName() << " (dim=" << Spec.Dim
+  //                << " PF=" << Spec.PF << ")\n";
+  //       else
+  //         dbgs() << "LTP::executePlan: skeleton creation failed for dim "
+  //                << Spec.Dim << "; proceeding without guard\n";
+  //     });
+  //     // Currently only one DynamicTiled dim is supported per lowering.
+  //     break;
+  //   }
+  // }
+
+  // Transform TPlan structure (no IR mutation here).
+  // TPlanTransforms inserts TPGuardBlock + TPTilingRegion nodes,
+  // sets State.TilingTCVal, and marks IsSubsumed on absorbed recipes.
+  TPlanTransforms Transforms(BestTPlan, State.Policy, Expander, Builder, State.DimToLoop);
+  Transforms.transform(State);
+
+  MapVector<Loop *, Value *> CanonicalIVStartValue;
+
+  // std::tie(State.CFG.PrevBB, CanonicalIVStartValue) =
+  //     LT.createTensorizedLoopSkeleton(ExpandedSCEVs ? *ExpandedSCEVs
+  //                                                   : State.ExpandedSCEVs);
+
+  State.TBS.EntryB = LT.EntryB;
+  State.TBS.TPH = LT.LoopTensorPreHeader;
+  State.TBS.MiddleB = LT.LoopMiddleBlock;
+  State.TBS.SPH = LT.LoopScalarPreHeader;
+
+#ifdef EXPENSIVE_CHECKS
+  assert(DT->verify(DominatorTree::VerificationLevel::Fast));
+#endif
+
+  // TODO(yuxin.an)
+
+  LT.printDebugTracesAtStart();
+
+  //===------------------------------------------------===//
+  //
+  // Notice: any optimization or new instruction that go
+  // into the code below should also be implemented in
+  // the cost-model.
+  //
+  //===------------------------------------------------===//
+
+  // 2. Copy and widen instructions from the old loop into the new loop.
+
+  dbgs() << "------------TPlan\n";
+  BestTPlan.dump();
+  dbgs() << "------------TPlan\n";
+
+  BestTPlan.prepareToExecute(CanonicalIVStartValue, State);
+
+  BestTPlan.execute(&State);
+  // YYG::REMOVE
+  errs() << "BestTPlan.execute: \n";
+  BestTPlan.dump();
+
+  // 3. Fix the vectorized code: take care of header phi's, live-outs,
+  //    predication, updating analyses.
+  // LT.fixTensorizedLoop(State, BestTPlan);
+
+  // LT.adaptForTarget(State, UseTensorType);
+}
+
+void LoopTensorizer::fixTensorizedLoop(TPTransformState &State, TPlan &Plan) {
+  auto GetPhi = [](BasicBlock *BB) { return cast<PHINode>(&BB->front()); };
+
+  for (auto [LIdx2HElem, LIdx2LElem] :
+       zip(Plan.LoopIdx2HeaderTPBB, Plan.LoopIdx2LatchTPBB)) {
+    auto *HeaderBB = State.TPBB2BB[LIdx2HElem.second];
+    auto *LatchBB = State.TPBB2BB[LIdx2LElem.second];
+    auto *PHI = GetPhi(HeaderBB);
+    auto *IdxAdd = State.IdxAddMap[LatchBB];
+    PHI->addIncoming(IdxAdd, LatchBB);
+  }
+}
+
+void LoopTensorizer::adaptForTarget(TPTransformState &State,
+                                    bool UseTensorType) {
+  auto *InnermostBB = State.TBS.Loop2HeadBB[Pattern->Loops[0]];
+  LLVMContext &Ctx = InnermostBB->getContext();
+
+  auto ConstInt = [&Ctx](unsigned N, int64_t Val) {
+    return ConstantInt::get(Type::getIntNTy(Ctx, N), Val);
+  };
+  auto CI8 = [ConstInt](int64_t Val) { return ConstInt(8, Val); };
+  auto CI16 = [ConstInt](int64_t Val) { return ConstInt(16, Val); };
+  auto CI32 = [ConstInt](int64_t Val) { return ConstInt(32, Val); };
+
+  auto GetSExtVal = [](Value *Val) {
+    return cast<ConstantInt>(Val)->getSExtValue();
+  };
+
+  auto GetAddrType = [](Value *Val) {
+    // memory space(mlir) / address space(llvm): (DRAM:0, SRAM:1)
+    // address type for GAIA: (NoOp:0, DRAM:1, SRAM:2, vFIFO:3)
+    const SmallDenseMap<unsigned, unsigned> AddrSpace2AddrType{
+        {0, 1}, // DRAM
+        {1, 2}, // SRAM
+    };
+
+    auto *PtrTy =
+        cast<PointerType>(cast<LoadInst>(Val)->getPointerOperandType());
+    unsigned AddrSpace = PtrTy->getAddressSpace();
+    return AddrSpace2AddrType.lookup(AddrSpace);
+  };
+
+  if (ArchType == Triple::ArchType::gaia) {
+    SmallVector<IntrinsicInst *> ToRemove;
+
+    for (Instruction &I : *InnermostBB) {
+      if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+        IRBuilder<> Builder(II);
+        switch (II->getIntrinsicID()) {
+        case Intrinsic::matrix_column_major_load_addr_space_ext: {
+          auto *NewLoad = Builder.CreateLoad(II->getType(), II->getOperand(0));
+          II->replaceAllUsesWith(NewLoad);
+          break;
+        }
+        case Intrinsic::matrix_column_major_store_addr_space_ext: {
+          Builder.CreateStore(II->getOperand(0), II->getOperand(1));
+          ToRemove.push_back(II);
+          break;
+        }
+        case Intrinsic::matrix_transpose: {
+          II->replaceAllUsesWith(II->getOperand(0));
+          ToRemove.push_back(II);
+          break;
+        }
+        case Intrinsic::matrix_multiply: {
+
+          auto *Input0 = II->getOperand(0);
+          auto *Input1_0 = II->getOperand(1);
+          auto *Input1_1 = II->getOperand(1);
+          auto *OuterRows = II->getOperand(2);
+          auto *Inner = II->getOperand(3);
+          auto *OuterColumns = II->getOperand(4);
+
+          Function *Func = Intrinsic::getOrInsertDeclaration(
+              /*Module=*/InnermostBB->getModule(), Intrinsic::gaia_mmatmul,
+              /*OverloadedTypes=*/
+              {II->getType(), II->getOperand(0)->getType(),
+               II->getOperand(1)->getType(), II->getOperand(1)->getType()});
+
+          SmallVector<Value *> Args{
+              /*input0*/ Input0,
+              /*input1_0*/ Input1_0,
+              /*input1_1*/ Input1_1,
+              /*row (num_of_vector)*/ CI16(GetSExtVal(OuterRows)),
+              /*input0's column*/ CI16(GetSExtVal(Inner)),
+              /*input1's column*/ CI16(GetSExtVal(OuterColumns)),
+              /*input0_addr_type(NoOp:0, DRAM:1, SRAM:2, vFIFO:3) */
+              CI16(GetAddrType(Input0)),
+              /*input1_addr0_type(NoOp:0, DRAM:1, SRAM:2, vFIFO:3) */
+              CI16(GetAddrType(Input1_0)),
+              /*input1_addr1_type(NoOp:0, DRAM:1, SRAM:2, vFIFO:3) */
+              CI16(GetAddrType(Input1_1)),
+              /*operation_type(Q_K:0, Probs_V:1)*/ CI16(0),
+              /*power_mode(invalid:0, valid:1)*/ CI16(0),
+              /*double_heads*/ CI16(0),
+              /*stride_input0*/ CI16(0),
+              /*stride_output*/ CI16(0),
+              /* mask_type*/ CI8(0),
+              /* mask_value*/ CI8(0),
+              /* mask_start_index*/ CI16(0),
+              /*input1_addr0_data_size*/ CI32(0),
+              /*input1_addr1_data_size*/ CI32(0),
+              /*input0_stride_size*/ CI32(0),
+              /*output_stride_size*/ CI32(0)};
+
+          Value *Res = Builder.CreateCall(Func->getFunctionType(), Func, Args);
+          II->replaceAllUsesWith(Res);
+          break;
+        }
+        }
+      }
+    }
+    for (auto *II : ToRemove)
+      II->eraseFromParent();
+  }
+}
+
+// std::pair<BasicBlock *, MapVector<Loop *, Value *>>
+// LoopTensorizer::createTensorizedLoopSkeleton(
+//     const SCEV2ValueTy &ExpandedSCEVs) {
+//   /*
+//    In this function we generate a new loop. The new loop will contain
+//    the vectorized instructions while the old loop will continue to run the
+//    scalar remainder.
+
+//        [ ] <-- old preheader - loop iteration number check and SCEVs in Plan's
+//      /  |      preheader are expanded here. Eventually all required SCEV
+//     /   |      expansion should happen here.
+//    /    v
+//   |    [ ] <-- vector loop bypass (may consist of multiple blocks).
+//   |  /  |
+//   | /   v
+//   ||   [ ]     <-- vector pre header.
+//   |/    |
+//   |     v
+//   |    [  ] \
+//   |    [  ]_|   <-- vector loop (created during VPlan execution).
+//   |     |
+//   |     v
+//   \   -[ ]   <--- middle-block (wrapped in VPIRBasicBlock with the branch to
+//    |    |                       successors created during VPlan execution)
+//    \/   |
+//    /\   v
+//    | ->[ ]     <--- new preheader (wrapped in VPIRBasicBlock).
+//    |    |
+//  (opt)  v      <-- edge from middle to exit iff epilogue is not required.
+//    |   [ ] \
+//    |   [ ]_|   <-- old scalar loop to handle remainder (scalar epilogue).
+//     \   |
+//      \  v
+//       >[ ]     <-- exit block(s). (wrapped in VPIRBasicBlock)
+//    ...
+//    */
+
+//   // Create an empty vector loop, and prepare basic blocks for the runtime
+//   // checks.
+//   // createTensorLoopSkeleton("");
+
+//   // // Now, compare the new count to zero. If it is zero skip the vector loop
+//   // // and jump to the scalar loop. This check also covers the case where the
+//   // // backedge-taken count is uint##_max: adding one to it will overflow
+//   // // leading to an incorrect trip count of zero. In this (rare) case we will
+//   // // also jump to the scalar loop.
+//   // emitIterationCountCheck(LoopScalarPreHeader);
+
+//   // // Generate the code to check any assumptions that we've made for SCEV
+//   // // expressions.
+//   // emitSCEVChecks(LoopScalarPreHeader);
+
+//   // // Generate the code that checks in runtime if arrays overlap. We put the
+//   // // checks into a separate block to make the more common case of few elements
+//   // // faster.
+//   // emitMemRuntimeChecks(LoopScalarPreHeader);
+
+//   // // Emit phis for the new starting index of the scalar loop.
+//   // createInductionResumeValues(ExpandedSCEVs);
+
+//   // // (maxim.o): Emit code to bypass scalar loops altogether.
+//   // emitScalarLoopBypassCode();
+
+//   // MapVector<Loop *, Value *> Res;
+
+//   // // LT has no more getTripCount()
+//   // // for (auto Elem : getTripCount())
+//   // //   Res.insert({Elem.first, nullptr});
+
+//   // return {LoopTensorPreHeader, Res};
+// }
+
+void LoopTensorizer::createTensorLoopSkeleton(StringRef Prefix) {
+  // YYG::REMOVE
+  errs() << "[createTensorLoopSkeleton]\n";
+
+  auto SplitBB = [&](BasicBlock *Old, Twine BBName) {
+    // From Old->getTerminator() instructions moves to a new block.
+    // The two blocks are joined by an unconditional branch.
+    return SplitBlock(Old, /* splitPt= */ Old->getTerminator(), DT, LI, /* MemorySSAUpdetaer= */ nullptr, BBName /* Before = false*/);
+  };
+
+  Loop *OutermostLoop = Pattern->Info.Loops.back();
+  // YYG::REMOVE
+  errs() << "OutermostLoop: \n";
+  OutermostLoop->dump();
+
+  LoopScalarBody = OutermostLoop->getHeader();
+  // YYG::REMOVE
+  errs() << "LoopScalarBody: " << *LoopScalarBody << "\n";
+
+  EntryB = OutermostLoop->getLoopPreheader();
+  // YYG::REMOVE
+  errs() << "EntryB: " << *EntryB << "\n";
+  assert(EntryB && "Invalid loop structure");
+
+  LoopExitBlock = OutermostLoop->getUniqueExitBlock(); // may be nullptr
+  // YYG::REMOVE
+  errs() << "LoopExitBlock: " << *LoopExitBlock << "\n";
+  // TODO(yuxin.an)
+  assert((LoopExitBlock) && "multiple exit loop without required epilogue?");
+
+  LoopTensorPreHeader = SplitBB(EntryB, "tensor.ph"); // 원래 preheader가 뭐지?
+  // YYG::REMOVE
+  errs() << "LoopTensorPreHeader: " << *LoopTensorPreHeader << "\n";
+
+  LoopMiddleBlock = SplitBB(LoopTensorPreHeader, "middle.block");
+  // YYG::REMOVE
+  errs() << "LoopMiddleBlock: " << *LoopMiddleBlock << "\n";
+
+  LoopScalarPreHeader = SplitBB(LoopMiddleBlock, "scalar.ph");
+  // YYG::REMOVE
+  errs() << "LoopScalarPreHeader: " << *LoopScalarPreHeader << "\n";
+}
+
+void LoopTensorizer::emitIterationCountCheck(BasicBlock *Bypass) {
+  assert(Bypass && "Expected valid bypass basic block.");
+  // Value *Count = getTripCount();
+  // // Reuse existing vector loop preheader for TC checks.
+  // // Note that new preheader block is generated for vector loop.
+  // BasicBlock *const TCCheckBlock = LoopVectorPreHeader;
+  // IRBuilder<> Builder(TCCheckBlock->getTerminator());
+
+  
+}
+
+void LoopTensorizer::emitScalarLoopBypassCode() {
+  Loop *OutermostLoop = Pattern->Info.Loops.back();
+  LoopExitBlock = OutermostLoop->getUniqueExitBlock(); // may be nullptr
+  assert((LoopExitBlock) && "multiple exit loop without required epilogue?");
+
+  BranchInst *Branch = cast<BranchInst>(LoopScalarPreHeader->getTerminator());
+  assert(Branch->isUnconditional() &&
+         "scalar preheader must have exactly one successor!");
+
+  llvm::Value *TrueCondition =
+      llvm::ConstantInt::get(llvm::Type::getInt1Ty(Branch->getContext()), 1);
+
+  IRBuilder<> Builder(Branch);
+  // Set branch condition to always True so we effectively skip the whole
+  // scalar loop.
+  BranchInst *NewBranch = Builder.CreateCondBr(TrueCondition, LoopExitBlock,
+                                               Branch->getSuccessor(0));
+  Branch->replaceAllUsesWith(NewBranch);
+  Branch->eraseFromParent();
+}
+
+BasicBlock *LoopTensorizer::emitSCEVChecks(BasicBlock *Bypass) {
+  LLVM_DEBUG(dbgs() << "[Warning] Please handle "
+                       "`LoopTensorizer::emitSCEVChecks` \n");
+  return nullptr;
+}
+
+BasicBlock *LoopTensorizer::emitMemRuntimeChecks(BasicBlock *Bypass) {
+  if (EnableTPlanNativePath)
+    return nullptr;
+  llvm_unreachable("");
+}
+
+/// Create a new ICmp VPInstruction with predicate \p Pred and operands \p A
+/// and \p B.
+/// TODO: add createFCmp when needed.
+TPValue *TPBuilder::createICmp(CmpInst::Predicate Pred, TPValue *A, TPValue *B,
+                    DebugLoc DL, const Twine &Name) {
+  // YYG:REMOVE
+  errs() << "[TPBuilder::createICmp]\n";
+  assert(Pred >= CmpInst::FIRST_ICMP_PREDICATE &&
+          Pred <= CmpInst::LAST_ICMP_PREDICATE && "invalid predicate");
+  // YYG:REMOVE
+  errs() << "[TPBuilder::createICmp]\n";
+  return tryInsertInstruction(
+      new TPInstruction(Instruction::ICmp, Pred, A, B, DL, Name));
+}
+
+/// Return a value for Step multiplied by VF.
+Value *createStepForTFElem(IRBuilderBase &B, Type *Ty, ElementCount TFElem,
+                           int64_t Step) {
+  assert(Ty->isIntegerTy() && "Expected an integer step");
+  return B.CreateElementCount(Ty, TFElem.multiplyCoefficientBy(Step));
+}
+
+MapVector<Loop *, Value *>
+LoopTensorizer::getOrCreateTensorTripCount(BasicBlock *InsertBlock) {
+  // YYG:REMOVE
+  // errs() << "getOrCreateTensorTripCount\n";
+
+  // if (!TensorTripCount.empty())
+  //   return TensorTripCount;
+
+  // MapVector<Loop *, Value *> TC = getTripCount();
+
+  // for (auto TCElem : TC) {
+  //   IRBuilder<> Builder(InsertBlock->getTerminator());
+  //   Type *Ty = TCElem.second->getType();
+  //   Value *Step =
+  //       createStepForTFElem(Builder, Ty, TF[TCElem.first], UF[TCElem.first]);
+
+  //   Value *R = Builder.CreateURem(TCElem.second, Step, "n.mod.vf");
+
+  //   // !FIXME(yuxin.an)
+  //   if (true) {
+  //     auto *IsZero = Builder.CreateICmpEQ(R, ConstantInt::get(R->getType(), 0));
+  //     R = Builder.CreateSelect(IsZero, Step, R);
+  //   }
+
+  //   auto *Temp = Builder.CreateSub(TCElem.second, R, "n.vec");
+  //   TensorTripCount.insert({TCElem.first, Temp});
+  // }
+
+  // return TensorTripCount;
+  llvm_unreachable("Need to Implement getOrCreateTensorTripCount.");
+}
+
+PHINode *LoopTensorizer::createInductionResumeValue(
+    PHINode *OrigPhi, const InductionDescriptor &II, Value *Step,
+    ArrayRef<BasicBlock *> BypassBlocks,
+    std::pair<BasicBlock *, Value *> AdditionalBypass) {
+  llvm_unreachable("");
+}
+
+void LoopTensorizer::createInductionResumeValues(
+    const SCEV2ValueTy &ExpandedSCEVs,
+    std::pair<BasicBlock *, Value *> AdditionalBypass) {
+  llvm_unreachable("Need to Implement createInductionResumeValues.");
+  // getOrCreateTensorTripCount(LoopTensorPreHeader);
+
+  // auto GetLoopIdxPHI = [](Loop *L) {
+  //   return cast<PHINode>(&L->getBlocks().front()->front());
+  // };
+
+  // if (ArchType == Triple::ArchType::gaia) {
+  //   BranchInst *BI = BranchInst::Create(LoopExitBlock);
+  //   ReplaceInstWithInst(LoopMiddleBlock->getTerminator(), BI);
+  // }
+
+  // int outIdx = Pattern->Info.Loops.size() - 1;
+  // int midIdx = Pattern->Info.Loops.size() - 2;
+  // Loop *MiddleL = Pattern->Info.Loops[midIdx];
+  // Loop *OutermostL = Pattern->Info.Loops[outIdx];
+
+  // PHINode *MiddleLPhi = GetLoopIdxPHI(MiddleL);
+  // PHINode *OutermostLPhi = GetLoopIdxPHI(OutermostL);
+
+  // auto *BrBlock = MiddleL->getLoopPreheader();
+  // auto *BrBlockFork =
+  //     SplitBlock(BrBlock, BrBlock->getTerminator(), DT, LI, nullptr, "br.fork");
+  // auto *BrBlockForkBRI = cast<BranchInst>(BrBlockFork->getTerminator());
+
+  // IRBuilder<> BuilderBrBlock(BrBlock->getTerminator());
+
+  // auto *OutermostLIdxICmp =
+  //     BuilderBrBlock.CreateICmpULT(OutermostLPhi, TensorTripCount[OutermostL]);
+
+  // BranchInst *BI = BranchInst::Create(BrBlockForkBRI->getSuccessor(0),
+  //                                     BrBlockFork, OutermostLIdxICmp);
+  // ReplaceInstWithInst(BrBlock->getTerminator(), BI);
+  // MiddleLPhi->addIncoming(TensorTripCount[MiddleL], BrBlock);
+}
+
+} // namespace llvm

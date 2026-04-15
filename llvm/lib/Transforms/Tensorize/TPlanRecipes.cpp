@@ -1356,3 +1356,200 @@ void TPScalarCastRecipe ::execute(TPTransformState &State) {
   // TODO(yuxin.an)
   llvm_unreachable("");
 }
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+void TPScalarCastRecipe ::print(raw_ostream &O, const Twine &Indent,
+                                TPSlotTracker &SlotTracker) const {
+  O << Indent << "SCALAR-CAST ";
+  printAsOperand(O, SlotTracker);
+  O << " = " << Instruction::getOpcodeName(Opcode) << " ";
+  printOperands(O, SlotTracker);
+  O << " to " << *ResultTy;
+}
+#endif
+
+void TPBranchOnMaskRecipe::execute(TPTransformState &State) {
+  llvm_unreachable("");
+}
+
+void TPPredInstPHIRecipe::execute(TPTransformState &State) {
+  llvm_unreachable("");
+}
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+void TPPredInstPHIRecipe::print(raw_ostream &O, const Twine &Indent,
+                                TPSlotTracker &SlotTracker) const {
+  O << Indent << "PHI-PREDICATED-INSTRUCTION ";
+  printAsOperand(O, SlotTracker);
+  O << " = ";
+  printOperands(O, SlotTracker);
+}
+#endif
+
+void TPWidenLoadRecipe::execute(TPTransformState &State) {
+  IRBuilder<> Builder(State.CurBB->getTerminator());
+  
+  LoadInst *Load = cast<LoadInst>(&getIngredient());
+  Type *ScalarTy = Load->getType();
+  
+  Value *Ptr = State.TPValue2Value.count(getAddr())
+                   ? State.TPValue2Value[getAddr()]
+                   : getAddr()->getLiveInIRValue();
+  
+  Type *LoadTy = ScalarTy;
+  unsigned TotalElements = 1;
+  
+  if (DimSet.any()) {
+    for (int D = DimSet.find_first(); D >= 0; D = DimSet.find_next(D)) {
+      TotalElements *= State.Plan->getPFForDim(static_cast<unsigned>(D));
+    }
+    if (TotalElements > 1) {
+      LoadTy = VectorType::get(ScalarTy, TotalElements, false);
+    }
+  }
+  
+  Value *LoadVal = Builder.CreateLoad(LoadTy, Ptr, "load.wide");
+  if (auto *NewLoad = dyn_cast<LoadInst>(LoadVal))
+    NewLoad->setAlignment(Load->getAlign());
+  
+  State.TPValue2Value[this] = LoadVal;
+}
+
+void TPWidenLoadRecipe::print(raw_ostream &O, const Twine &Indent,
+                              TPSlotTracker &SlotTracker) const {
+  O << Indent << "WIDEN ";
+  printAsOperand(O, SlotTracker);
+  O << " = load ";
+  printOperands(O, SlotTracker);
+}
+
+void TPWidenStoreRecipe::execute(TPTransformState &State) {
+  IRBuilder<> Builder(State.CurBB->getTerminator());
+  
+  StoreInst *Store = cast<StoreInst>(&getIngredient());
+  
+  Value *Ptr = State.TPValue2Value.count(getAddr())
+                   ? State.TPValue2Value[getAddr()]
+                   : getAddr()->getLiveInIRValue();
+  
+  Value *StoredVal = State.TPValue2Value.count(getStoredValue())
+                         ? State.TPValue2Value[getStoredValue()]
+                         : getStoredValue()->getLiveInIRValue();
+  
+  StoreInst *NewStore = Builder.CreateStore(StoredVal, Ptr);
+  NewStore->setAlignment(Store->getAlign());
+}
+
+void TPWidenStoreRecipe::print(raw_ostream &O, const Twine &Indent,
+                               TPSlotTracker &SlotTracker) const {
+  O << Indent << "WIDEN store ";
+  printOperands(O, SlotTracker);
+}
+
+void TPCanonicalIVPHIRecipe::execute(TPTransformState &State) {
+  Value *Start = getStartValue()->getLiveInIRValue();
+  PHINode *EntryPart = PHINode::Create(Start->getType(), 2, "index");
+
+  EntryPart->insertBefore(State.CurBB->getTerminator());
+  EntryPart->addIncoming(Start, State.CurBB->getPrevNode());
+
+  State.TPValue2Value[this] = EntryPart;
+}
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+void TPCanonicalIVPHIRecipe::print(raw_ostream &O, const Twine &Indent,
+                                   TPSlotTracker &SlotTracker) const {
+  O << Indent << "EMIT ";
+  printAsOperand(O, SlotTracker);
+  O << " = CANONICAL-INDUCTION ";
+  printOperands(O, SlotTracker);
+}
+#endif
+
+bool TPCanonicalIVPHIRecipe::isCanonical(
+    InductionDescriptor::InductionKind Kind, TPValue *Start,
+    TPValue *Step) const {
+  // Must be an integer induction.
+  if (Kind != InductionDescriptor::IK_IntInduction)
+    return false;
+  // Start must match the start value of this canonical induction.
+  if (Start != getStartValue())
+    return false;
+
+  // If the step is defined by a recipe, it is not a ConstantInt.
+  if (Step->getDefiningRecipe())
+    return false;
+
+  ConstantInt *StepC = dyn_cast<ConstantInt>(Step->getLiveInIRValue());
+  return StepC && StepC->isOne();
+}
+
+void TPExpandSCEVRecipe::execute(TPTransformState &State) {
+  llvm_unreachable("");
+}
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+void TPExpandSCEVRecipe::print(raw_ostream &O, const Twine &Indent,
+                               TPSlotTracker &SlotTracker) const {
+  O << Indent << "EMIT ";
+  getTPSingleValue()->printAsOperand(O, SlotTracker);
+  O << " = EXPAND SCEV " << *Expr;
+}
+#endif
+
+void TPWidenCanonicalIVRecipe::execute(TPTransformState &State) {
+  llvm_unreachable("");
+}
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+void TPWidenCanonicalIVRecipe::print(raw_ostream &O, const Twine &Indent,
+                                     TPSlotTracker &SlotTracker) const {
+  O << Indent << "EMIT ";
+  printAsOperand(O, SlotTracker);
+  O << " = WIDEN-CANONICAL-INDUCTION ";
+  printOperands(O, SlotTracker);
+}
+#endif
+
+void TPWidenPHIRecipe::execute(TPTransformState &State) {
+  llvm_unreachable("");
+}
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+void TPWidenPHIRecipe::print(raw_ostream &O, const Twine &Indent,
+                             TPSlotTracker &SlotTracker) const {
+  O << Indent << "WIDEN-PHI ";
+
+  auto *OriginalPhi = cast<PHINode>(getUnderlyingValue());
+  // Unless all incoming values are modeled in VPlan  print the original PHI
+  // directly.
+  // TODO: Remove once all VPWidenPHIRecipe instances keep all relevant incoming
+  // values as VPValues.
+  if (getNumOperands() != OriginalPhi->getNumOperands()) {
+    O << TPlanIngredient(OriginalPhi);
+    return;
+  }
+
+  printAsOperand(O, SlotTracker);
+  O << " = phi ";
+  printOperands(O, SlotTracker);
+}
+#endif
+
+// TODO: It would be good to use the existing VPWidenPHIRecipe instead and
+// remove VPActiveLaneMaskPHIRecipe.
+void TPActiveLaneMaskPHIRecipe::execute(TPTransformState &State) {
+  // TODO(yuxin.an)
+  llvm_unreachable("");
+}
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+void TPActiveLaneMaskPHIRecipe::print(raw_ostream &O, const Twine &Indent,
+                                      TPSlotTracker &SlotTracker) const {
+  O << Indent << "ACTIVE-LANE-MASK-PHI ";
+
+  printAsOperand(O, SlotTracker);
+  O << " = phi ";
+  printOperands(O, SlotTracker);
+}
+#endif
