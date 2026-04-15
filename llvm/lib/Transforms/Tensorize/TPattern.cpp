@@ -1079,18 +1079,68 @@ bool ConvolutionTensorizePattern::tryToBuildTPlanWithTPRecipes(TPlanPtr &tplan,
   TPRecipeBase *BIdxRecipe =
       new TPNewInstrRecipe(Instruction::Mul, {Const_OC_IC, Const_KH_KW});
   LatchTPBB->appendRecipe(BIdxRecipe);
-    // RecipeBuilder->setRecipe(Instr, StoreRecipe);
-    LatchTPBB->appendRecipe(StoreRecipe);
-    // YYG::REMOVE
-    errs() << "Calling intrinsic end!\n";
-    Plan->dump();
-    success = true;
-  }
-  // tensor intrinsic else
-  // ...
 
-  tplan = std::move(Plan);
-  return success;
-}
+  if (UseTensorType) {
+    auto *GEPRecipe = new TPNewInstrRecipe(
+            Instruction::GetElementPtr,
+            {Plan->getOrAddLiveIn( CI.GEPs[0]->getOperand(0)), AIdxRecipe->getTPSingleValue()});
+    // RecipeBuilder->setRecipe(A_Instr, GEPRecipe);
+    LatchTPBB->appendRecipe(GEPRecipe);
+    CurGEP = GEPRecipe->getTPSingleValue();
 
+    ConstantInt *Zero = ConstantInt::get(Type::getInt32Ty(CI.Accumulator->getContext()), 0);
+    ConstantInt *One =
+        ConstantInt::get(Type::getInt32Ty(CI.Accumulator->getContext()), 1);
+    TPValue *ConstOne = new TPValue(One);
 
+    // LoadInstr of Input Tensor
+    Intrinsic::ID ID = Intrinsic::tensor_new_load;
+    SmallVector<TPValue *> Operands;
+    Operands.append({CurGEP, ConstOne, Const_N_IC,
+                     // Plan->getOrCreateBackedgeTakenCount()[InnermostL],
+                     Const_IH_IW, Const_IH_IW});
+    // TFxUF[OutermostL], TFxUF[InnermostL]});
+    auto *MatrixLoadRecipe = new TPMatrixCallRecipe(
+        A_Instr, make_range(Operands.begin(), Operands.end()), ID,
+        A_Instr->getDebugLoc());
+    // RecipeBuilder->setRecipe(A_Instr, MatrixLoadRecipe);
+    LatchTPBB->appendRecipe(MatrixLoadRecipe);
+    MatrixLoads.push_back(MatrixLoadRecipe->getTPSingleValue());
+
+    auto *BGEPRecipe = new TPNewInstrRecipe(
+            Instruction::GetElementPtr,
+            {Plan->getOrAddLiveIn( CI.GEPs[1]->getOperand(0)), BIdxRecipe->getTPSingleValue()});
+    LatchTPBB->appendRecipe(BGEPRecipe);
+    CurGEP = BGEPRecipe->getTPSingleValue();
+
+    ConstantInt *Input_KH = ConstantInt::get(Type::getInt32Ty(B_Instr->getContext()), KH);
+    ConstantInt *Input_KW = ConstantInt::get(Type::getInt32Ty(B_Instr->getContext()), KW);
+    TPValue *KernelH= new TPValue(Input_KH);
+    TPValue *KernelW = new TPValue(Input_KW);
+
+    // LoadInstr of Weight Tensor
+    Intrinsic::ID BID = Intrinsic::tensor_new_load;
+    SmallVector<TPValue *> BOperands;
+    BOperands.append({CurGEP, Const_OC_IC, Const_N_IC,
+                      // Plan->getOrCreateBackedgeTakenCount()[InnermostL],
+                      KernelH, KernelW});
+    // TFxUF[OutermostL], TFxUF[InnermostL]});
+    auto *BMatrixLoadRecipe = new TPMatrixCallRecipe(
+        B_Instr, make_range(BOperands.begin(), BOperands.end()), BID,
+        B_Instr->getDebugLoc());
+    LatchTPBB->appendRecipe(BMatrixLoadRecipe);
+    MatrixLoads.push_back(BMatrixLoadRecipe->getTPSingleValue());
+
+    // 3. Call llvm.tensor.conv2d intrinsic
+    Intrinsic::ID ConvID = Intrinsic::tensor_convolution_2d;
+    SmallVector<TPValue *, 4> Op, Op2;
+
+    TPValue *PadOne = new TPValue(One);
+    TPValue *StrideOne = new TPValue(One);
+    TPValue *DilationZero = new TPValue(Zero);
+    TPValue *ConstPadTy = new TPValue(Zero);
+
+    // Here, stride means memory-layout related stride for NPU.Cov
+    Op.append({MatrixLoads[0], MatrixLoads[1], StrideOne, StrideOne, PadOne,
+               PadOne, PadOne, PadOne, DilationZero, DilationZero, ConstPadTy,
+               KernelH, KernelW});
