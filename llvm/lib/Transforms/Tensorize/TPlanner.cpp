@@ -23,7 +23,7 @@
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
-#include "llvm/IR/IntrinsicsGAIA.h"
+// #include "llvm/IR/IntrinsicsGAIA.h" // GAIA not available in this build
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Operator.h"
@@ -1184,7 +1184,7 @@ void LoopTensorizePlanner::executePlan(
   errs() << "After match() \n";
   BestTPlan.dump();
 
-  SCEVExpander Expander(*SE, "tplan.stride");
+  SCEVExpander Expander(*SE, Loops.front()->getHeader()->getModule()->getDataLayout(), "tplan.stride");
   State.SE = SE;
   State.Expander = &Expander;
   State.TTI = &TTI;
@@ -1371,79 +1371,8 @@ void LoopTensorizer::adaptForTarget(TPTransformState &State,
     return AddrSpace2AddrType.lookup(AddrSpace);
   };
 
-  if (ArchType == Triple::ArchType::gaia) {
-    SmallVector<IntrinsicInst *> ToRemove;
-
-    for (Instruction &I : *InnermostBB) {
-      if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
-        IRBuilder<> Builder(II);
-        switch (II->getIntrinsicID()) {
-        case Intrinsic::matrix_column_major_load_addr_space_ext: {
-          auto *NewLoad = Builder.CreateLoad(II->getType(), II->getOperand(0));
-          II->replaceAllUsesWith(NewLoad);
-          break;
-        }
-        case Intrinsic::matrix_column_major_store_addr_space_ext: {
-          Builder.CreateStore(II->getOperand(0), II->getOperand(1));
-          ToRemove.push_back(II);
-          break;
-        }
-        case Intrinsic::matrix_transpose: {
-          II->replaceAllUsesWith(II->getOperand(0));
-          ToRemove.push_back(II);
-          break;
-        }
-        case Intrinsic::matrix_multiply: {
-
-          auto *Input0 = II->getOperand(0);
-          auto *Input1_0 = II->getOperand(1);
-          auto *Input1_1 = II->getOperand(1);
-          auto *OuterRows = II->getOperand(2);
-          auto *Inner = II->getOperand(3);
-          auto *OuterColumns = II->getOperand(4);
-
-          Function *Func = Intrinsic::getOrInsertDeclaration(
-              /*Module=*/InnermostBB->getModule(), Intrinsic::gaia_mmatmul,
-              /*OverloadedTypes=*/
-              {II->getType(), II->getOperand(0)->getType(),
-               II->getOperand(1)->getType(), II->getOperand(1)->getType()});
-
-          SmallVector<Value *> Args{
-              /*input0*/ Input0,
-              /*input1_0*/ Input1_0,
-              /*input1_1*/ Input1_1,
-              /*row (num_of_vector)*/ CI16(GetSExtVal(OuterRows)),
-              /*input0's column*/ CI16(GetSExtVal(Inner)),
-              /*input1's column*/ CI16(GetSExtVal(OuterColumns)),
-              /*input0_addr_type(NoOp:0, DRAM:1, SRAM:2, vFIFO:3) */
-              CI16(GetAddrType(Input0)),
-              /*input1_addr0_type(NoOp:0, DRAM:1, SRAM:2, vFIFO:3) */
-              CI16(GetAddrType(Input1_0)),
-              /*input1_addr1_type(NoOp:0, DRAM:1, SRAM:2, vFIFO:3) */
-              CI16(GetAddrType(Input1_1)),
-              /*operation_type(Q_K:0, Probs_V:1)*/ CI16(0),
-              /*power_mode(invalid:0, valid:1)*/ CI16(0),
-              /*double_heads*/ CI16(0),
-              /*stride_input0*/ CI16(0),
-              /*stride_output*/ CI16(0),
-              /* mask_type*/ CI8(0),
-              /* mask_value*/ CI8(0),
-              /* mask_start_index*/ CI16(0),
-              /*input1_addr0_data_size*/ CI32(0),
-              /*input1_addr1_data_size*/ CI32(0),
-              /*input0_stride_size*/ CI32(0),
-              /*output_stride_size*/ CI32(0)};
-
-          Value *Res = Builder.CreateCall(Func->getFunctionType(), Func, Args);
-          II->replaceAllUsesWith(Res);
-          break;
-        }
-        }
-      }
-    }
-    for (auto *II : ToRemove)
-      II->eraseFromParent();
-  }
+  // GAIA-only block — commented out (IntrinsicsGAIA.h / Triple::gaia not available)
+  // if (ArchType == Triple::ArchType::gaia) { ... }
 }
 
 // std::pair<BasicBlock *, MapVector<Loop *, Value *>>

@@ -735,21 +735,21 @@ void TPMatrixCallRecipe::execute(TPTransformState &State) {
                                          GetSExtVal(Vals[3]));
     State.TPValue2Value[this] = Res;
     break;
-  case Intrinsic::matrix_column_major_load_addr_space_ext:
-    Res = MBuilder.CreateColumnMajorLoadAddrSpaceExt(
-        ElemTy, Vals[0], Align(), Vals[1], true, GetSExtVal(Vals[2]),
-        GetSExtVal(Vals[3]));
-    State.TPValue2Value[this] = Res;
-    break;
+  // case Intrinsic::matrix_column_major_load_addr_space_ext: // GAIA only
+  //   Res = MBuilder.CreateColumnMajorLoadAddrSpaceExt(
+  //       ElemTy, Vals[0], Align(), Vals[1], true, GetSExtVal(Vals[2]),
+  //       GetSExtVal(Vals[3]));
+  //   State.TPValue2Value[this] = Res;
+  //   break;
   case Intrinsic::matrix_column_major_store:
     MBuilder.CreateColumnMajorStore(Vals[0], Vals[1], Align(), Vals[2], true,
                                     GetSExtVal(Vals[3]), GetSExtVal(Vals[4]));
     break;
-  case Intrinsic::matrix_column_major_store_addr_space_ext:
-    MBuilder.CreateColumnMajorStoreAddrSpaceExt(
-        Vals[0], Vals[1], Align(), Vals[2], true, GetSExtVal(Vals[3]),
-        GetSExtVal(Vals[4]));
-    break;
+  // case Intrinsic::matrix_column_major_store_addr_space_ext: // GAIA only
+  //   MBuilder.CreateColumnMajorStoreAddrSpaceExt(
+  //       Vals[0], Vals[1], Align(), Vals[2], true, GetSExtVal(Vals[3]),
+  //       GetSExtVal(Vals[4]));
+  //   break;
   case Intrinsic::matrix_multiply:
     Res =
         MBuilder.CreateMatrixMultiply(Vals[0], Vals[1], GetSExtVal(Vals[2]),
@@ -761,68 +761,17 @@ void TPMatrixCallRecipe::execute(TPTransformState &State) {
                                          GetSExtVal(Vals[2]));
     State.TPValue2Value[this] = Res;
     break;
-  case Intrinsic::tensor_new_load:
-    Res = MBuilder.CreateTensorLoad(ElemTy, Vals[0], Align(), true,
-                                    GetSExtVal(Vals[1]), GetSExtVal(Vals[2]),
-                                    GetSExtVal(Vals[3]), GetSExtVal(Vals[4]));
-    State.TPValue2Value[this] = Res;
-    break;
-  case Intrinsic::tensor_new_store:
-    MBuilder.CreateTensorStore(ElemTy, Vals[0], Vals[1], Align(), Vals[2], true);
-    break;
-  case Intrinsic::tensor_convolution_2d:
-    Res = MBuilder.CreateTensorConvolution2D(
-        Vals[0], Vals[1], cast<ConstantInt>(Vals[2]),
-        cast<ConstantInt>(Vals[3]), cast<ConstantInt>(Vals[4]),
-        cast<ConstantInt>(Vals[5]), cast<ConstantInt>(Vals[6]),
-        cast<ConstantInt>(Vals[7]), cast<ConstantInt>(Vals[8]),
-        cast<ConstantInt>(Vals[9]), cast<ConstantInt>(Vals[10]),
-        cast<ConstantInt>(Vals[11]), cast<ConstantInt>(Vals[12]),
-        Intrinsic::tensor_convolution_2d);
-    State.TPValue2Value[this] = Res;
-    break;
-  case Intrinsic::tensor_multiply:
-    Res = MBuilder.CreateTensorMultiply(
-        ElemTy, Vals[0], Vals[1], GetSExtVal(Vals[2]), GetSExtVal(Vals[3]),
-        GetSExtVal(Vals[4]));
-    State.TPValue2Value[this] = Res;
-    break;
-  case Intrinsic::tensor_add:
-    Res = MBuilder.CreateTensorElementWise(
-        ElemTy, Vals[0], Vals[1], GetSExtVal(Vals[2]), GetSExtVal(Vals[3]),
-        Intrinsic::tensor_add);
-    State.TPValue2Value[this] = Res;
-    break;
-  case Intrinsic::tensor_sub:
-    Res = MBuilder.CreateTensorElementWise(
-        ElemTy, Vals[0], Vals[1], GetSExtVal(Vals[2]), GetSExtVal(Vals[3]),
-        Intrinsic::tensor_sub);
-    State.TPValue2Value[this] = Res;
-    break;
-  case Intrinsic::tensor_mul:
-    Res = MBuilder.CreateTensorElementWise(
-        ElemTy, Vals[0], Vals[1], GetSExtVal(Vals[2]), GetSExtVal(Vals[3]),
-        Intrinsic::tensor_mul);
-    State.TPValue2Value[this] = Res;
-    break;
-  case Intrinsic::tensor_maximum:
-    Res = MBuilder.CreateTensorElementWise(
-        ElemTy, Vals[0], Vals[1], GetSExtVal(Vals[2]), GetSExtVal(Vals[3]),
-        Intrinsic::tensor_maximum);
-    State.TPValue2Value[this] = Res;
-    break;
-  case Intrinsic::tensor_sqrt:
-    Res = MBuilder.CreateTensorUnaryOperation(
-        ElemTy, Vals[0], GetSExtVal(Vals[1]), GetSExtVal(Vals[2]),
-        Intrinsic::tensor_sqrt);
-    State.TPValue2Value[this] = Res;
-    break;
-  case Intrinsic::tensor_abs:
-    Res = MBuilder.CreateTensorUnaryOperation(
-        ElemTy, Vals[0], GetSExtVal(Vals[1]), GetSExtVal(Vals[2]),
-        Intrinsic::tensor_abs);
-    State.TPValue2Value[this] = Res;
-    break;
+  // GAIA-only intrinsics — commented out (IntrinsicsGAIA.h not available)
+  // case Intrinsic::tensor_new_load: ...
+  // case Intrinsic::tensor_new_store: ...
+  // case Intrinsic::tensor_convolution_2d: ...
+  // case Intrinsic::tensor_multiply: ...
+  // case Intrinsic::tensor_add: ...
+  // case Intrinsic::tensor_sub: ...
+  // case Intrinsic::tensor_mul: ...
+  // case Intrinsic::tensor_maximum: ...
+  // case Intrinsic::tensor_sqrt: ...
+  // case Intrinsic::tensor_abs: ...
   default:
     llvm_unreachable("");
   }
@@ -839,13 +788,10 @@ void TPMatrixCallRecipe::print(raw_ostream &O, const Twine &Indent,
       {Intrinsic::matrix_transpose, "llvm.matrix.transpose"},
       {Intrinsic::matrix_multiply, "llvm.matrix.multiply"},
       {Intrinsic::matrix_column_major_load, "llvm.matrix.column.major.load"},
-      {Intrinsic::matrix_column_major_load_addr_space_ext,
-       "llvm.matrix.column.major.load.addr.space.ext"},
+      // GAIA-only: {Intrinsic::matrix_column_major_load_addr_space_ext, ...}
       {Intrinsic::matrix_column_major_store, "llvm.matrix.column.major.store"},
-      {Intrinsic::tensor_new_load, "llvm.tensor.new.load"},
-      {Intrinsic::tensor_new_store, "llvm.tensor.new.store"},
-      {Intrinsic::tensor_convolution_2d, "llvm.tensor.convolution2D"},
-      {Intrinsic::tensor_multiply, "llvm.tensor.multiply"},
+      // GAIA-only: tensor_new_load, tensor_new_store, tensor_convolution_2d,
+      // tensor_multiply — commented out (IntrinsicsGAIA.h not available)
   };
 
   if (MatrixIntrinsicID != Intrinsic::matrix_column_major_store) {

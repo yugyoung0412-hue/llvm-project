@@ -689,8 +689,8 @@ public:
   GeneratedRTChecks(ScalarEvolution &SE, DominatorTree *DT, LoopInfo *LI,
                     TargetTransformInfo *TTI, const DataLayout &DL,
                     bool AddBranchWeights)
-      : DT(DT), LI(LI), TTI(TTI), SCEVExp(SE, "scev.check"),
-        MemCheckExp(SE, "scev.check"), AddBranchWeights(AddBranchWeights) {}
+      : DT(DT), LI(LI), TTI(TTI), SCEVExp(SE, DL, "scev.check"),
+        MemCheckExp(SE, DL, "scev.check"), AddBranchWeights(AddBranchWeights) {}
 };
 
 using SCEV2ValueTy = DenseMap<const SCEV *, Value *>;

@@ -1303,7 +1303,6 @@ public:
   /// Set the IR flags for \p I.
   void setFlags(Instruction *I) const {
     switch (OpType) {
-    switch (OpType) {
     case OperationType::OverflowingBinOp:
       I->setHasNoUnsignedWrap(WrapFlags.HasNUW);
       I->setHasNoSignedWrap(WrapFlags.HasNSW);

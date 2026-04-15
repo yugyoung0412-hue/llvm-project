@@ -248,31 +248,6 @@ void adaptForTargetPre(Function &F, bool UseTensorType) {
   auto CI64 = [ConstInt](int64_t Val) { return ConstInt(64, Val); };
   const int64_t SRAMGranularity = 128;
 
-  if (ArchType == Triple::ArchType::gaia) {
-    for (BasicBlock &BB : F) {
-      for (Instruction &I : BB) {
-        if (auto *GEP = dyn_cast<GEPOperator>(&I)) {
-          if (MDNode *MD = I.getMetadata("addr")) {
-            auto &Operand = MD->getOperand(0);
-            if (auto *ConstMeta = dyn_cast<ConstantAsMetadata>(Operand)) {
-              auto *GEPPtr = GEP->getPointerOperand();
-              auto *PtrTy = cast<PointerType>(GEPPtr->getType());
-              unsigned AddrSpace = PtrTy->getAddressSpace();
-              auto *ConstMetaVal = ConstMeta->getValue();
-              auto PtrAddr = ConstMetaVal->getUniqueInteger().getSExtValue();
-
-              auto *ConstI =
-                  CI64(/*IsSRAM*/ AddrSpace == 1 ? PtrAddr * SRAMGranularity
-                                                 : PtrAddr);
-              auto *Addr = Builder.CreateIntToPtr(ConstI, GEPPtr->getType());
-              if (GEPPtr != Addr)
-                GEPPtr->replaceAllUsesWith(Addr);
-            }
-          }
-        }
-      }
-    }
-  }
 }
 
 } // namespace
@@ -673,12 +648,7 @@ bool LoopTensorizePass::processLoop(SmallVector<Loop *> NestedLoops) {
   std::vector<unsigned> TensorizationFactors = TensorizationFactorList;
 
   // FIXME(yg0412.yun) need to remove target-specific below code
-  if (ArchType == Triple::ArchType::gaia) {
-    for (Loop *L : Pattern->Info.Loops) {
-      UserTFMap.insert({L, ElementCount::getFixed(getLoopTripCount(SE, L))});
-    }
-  } else {
-    if (TensorizationFactors.size()) {
+  if (TensorizationFactors.size()) {
       if (TensorizationFactors.size() != NestedLoops.size()) {
         llvm::errs() << "ERROR: Number of tensor factors ("
                      << TensorizationFactors.size()
@@ -730,7 +700,6 @@ bool LoopTensorizePass::processLoop(SmallVector<Loop *> NestedLoops) {
         UserTICMap[L] = 2;
       }
     }
-  }
   LTP.setMaxTF(Pattern.get(), &UserTFMap);
   // Get user vectorization factor. This is only working for inner-most loop
   // vectorization.
