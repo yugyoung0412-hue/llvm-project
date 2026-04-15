@@ -850,3 +850,377 @@ class TPRecipeBase : public ilist_node_with_parent<TPRecipeBase, TPBasicBlock>,
 
   /// Parallel Factor (PF)
   ElementCount PF = ElementCount::getFixed(1);
+
+  /// Represent index of loop-induction variable (0 = inner-most)
+  int DimIndex = -1;
+  
+  RecipeClassification Out = { TensorOpKind::Scalar, -1, nullptr };
+
+  /// When true, execute() is a no-op. Set by TPlanTransformer on recipes
+  /// that are absorbed into a tensor op (e.g. loads/fmul/fadd subsumed by
+  /// tensor.contract). ScalarEpilogue copies always have IsSubsumed=false.
+  bool IsSubsumed = false;
+
+public:
+  TPRecipeBase(const unsigned char SC, ArrayRef<TPValue *> Operands,
+               DebugLoc DL = {})
+      : TPDef(SC), TPUser(Operands, TPUser::TPUserID::Recipe), DL(DL) {}
+
+  template <typename IterT>
+  TPRecipeBase(const unsigned char SC, iterator_range<IterT> Operands,
+               DebugLoc DL = {})
+      : TPDef(SC), TPUser(Operands, TPUser::TPUserID::Recipe), DL(DL) {}
+  virtual ~TPRecipeBase() = default;
+
+  bool isSubsumed() const { return IsSubsumed; }
+  void setSubsumed(bool V = true) { IsSubsumed = V; }
+
+  /// Clone the current recipe.
+  virtual TPRecipeBase *clone() = 0;
+
+  void setTensorOpKind(RecipeClassification New) { Out = New; }
+
+  TensorOpKind getTensorOpKind() const { return Out.Kind; }
+
+  int getContractDim() const { return Out.ContractDim; }
+
+  TPRecipeBase* getFusedMulRecipe() const { return Out.FusedMulRecipe; }
+
+  void setDimIndex(int dimIdx) { DimIndex = dimIdx; }
+
+  int getDimIndex() { return DimIndex; }
+  
+  SmallBitVector DimSet;
+  
+  /// Loop dim indices this value spans;
+  DimPF *dimPF;
+
+  ElementCount getPF() const { return PF; }
+
+  /// Apply PF
+  void applyPF(ElementCount newPF) { this->PF = newPF; }
+  
+  void setPF(ElementCount NewPF) { PF = NewPF; }
+
+  /// \return the VPBasicBlock which this VPRecipe belongs to.
+  TPBasicBlock *getParent() { return Parent; }
+  const TPBasicBlock *getParent() const { return Parent; }
+
+  /// The method which generates the output IR instructions that correspond to
+  /// this VPRecipe, thereby "executing" the VPlan.
+  virtual void execute(TPTransformState &State) = 0;
+
+  /// Return the cost of this recipe, taking into account if the cost
+  /// computation should be skipped and the ForceTargetInstructionCost flag.
+  /// Also takes care of printing the cost for debugging.
+  virtual InstructionCost cost(ElementCount VF, TPCostContext &Ctx);
+
+  /// Insert an unlinked recipe into a basic block immediately before
+  /// the specified recipe.
+  void insertBefore(TPRecipeBase *InsertPos);
+
+  /// Returns the single-def value, or nullptr for stores.
+  TPSingleDefRecipe *getDefinedValue();
+  const TPSingleDefRecipe *getDefinedValue() const;
+
+  /// Insert an unlinked recipe into \p BB immediately before the insertion
+  /// point \p IP;
+  void insertBefore(TPBasicBlock &BB, iplist<TPRecipeBase>::iterator IP);
+
+  /// Insert an unlinked Recipe into a basic block immediately after
+  /// the specified Recipe.
+  void insertAfter(TPRecipeBase *InsertPos);
+
+  /// Unlink this recipe from its current VPBasicBlock and insert it into
+  /// the VPBasicBlock that MovePos lives in, right after MovePos.
+  void moveAfter(TPRecipeBase *MovePos);
+
+  /// Unlink this recipe and insert into BB before I.
+  ///
+  /// \pre I is a valid iterator into BB.
+  void moveBefore(TPBasicBlock &BB, iplist<TPRecipeBase>::iterator I);
+
+  /// This method unlinks 'this' from the containing basic block, but does not
+  /// delete it.
+  void removeFromParent();
+
+  /// This method unlinks 'this' from the containing basic block and deletes it.
+  ///
+  /// \returns an iterator pointing to the element after the erased one
+  iplist<TPRecipeBase>::iterator eraseFromParent();
+
+  /// Method to support type inquiry through isa, cast, and dyn_cast.
+  static inline bool classof(const TPDef *D) {
+    // All VPDefs are also VPRecipeBases.
+    return true;
+  }
+
+  static inline bool classof(const TPUser *U) {
+    return U->getTPUserID() == TPUser::TPUserID::Recipe;
+  }
+
+  /// Returns true if the recipe may have side-effects.
+  bool mayHaveSideEffects() const;
+
+  /// Returns true for PHI-like recipes.
+  bool isPhi() const {
+    return getTPDefID() >= TPFirstPHISC && getTPDefID() <= TPLastPHISC;
+  }
+
+  /// Returns true if the recipe may read from memory.
+  bool mayReadFromMemory() const;
+
+  /// Returns true if the recipe may write to memory.
+  bool mayWriteToMemory() const;
+
+  /// Returns true if the recipe may read from or write to memory.
+  bool mayReadOrWriteMemory() const {
+    return mayReadFromMemory() || mayWriteToMemory();
+  }
+
+  /// Returns the debug location of the recipe.
+  DebugLoc getDebugLoc() const { return DL; }
+
+protected:
+  /// Compute the cost of this recipe using the legacy cost model and the
+  /// underlying instructions.
+  InstructionCost computeCost(ElementCount VF, TPCostContext &Ctx) const;
+};
+
+// Helper macro to define common classof implementations for recipes.
+// Inline definitions for TPRecipeBase member functions.
+inline TPSingleDefRecipe *TPRecipeBase::getDefinedValue() {
+  return dyn_cast<TPSingleDefRecipe>(this);
+}
+inline const TPSingleDefRecipe *TPRecipeBase::getDefinedValue() const {
+  return dyn_cast<TPSingleDefRecipe>(this);
+}
+
+#define TP_CLASSOF_IMPL(TPDefID)                                               \
+  static inline bool classof(const TPDef *D) {                                 \
+    return D->getTPDefID() == TPDefID;                                         \
+  }                                                                            \
+  static inline bool classof(const TPValue *V) {                               \
+    auto *R = V->getDefiningRecipe();                                          \
+    return R && R->getTPDefID() == TPDefID;                                    \
+  }                                                                            \
+  static inline bool classof(const TPUser *U) {                                \
+    auto *R = dyn_cast<TPRecipeBase>(U);                                       \
+    return R && R->getTPDefID() == TPDefID;                                    \
+  }                                                                            \
+  static inline bool classof(const TPRecipeBase *R) {                          \
+    return R->getTPDefID() == TPDefID;                                         \
+  }                                                                            \
+  static inline bool classof(const TPSingleDefRecipe *R) {                     \
+    return R->getTPDefID() == TPDefID;                                         \
+  }
+
+/// VPSingleDef is a base class for recipes for modeling a sequence of one or
+/// more output IR that define a single result VPValue.
+/// Note that VPRecipeBase must be inherited from before VPValue.
+class TPSingleDefRecipe : public TPRecipeBase, public TPValue {
+public:
+  template <typename IterT>
+  TPSingleDefRecipe(const unsigned char SC, IterT Operands, DebugLoc DL = {})
+      : TPRecipeBase(SC, Operands, DL), TPValue(this) {}
+
+  TPSingleDefRecipe(const unsigned char SC, ArrayRef<TPValue *> Operands,
+                    DebugLoc DL = {})
+      : TPRecipeBase(SC, Operands, DL), TPValue(this) {}
+
+  template <typename IterT>
+  TPSingleDefRecipe(const unsigned char SC, IterT Operands, Value *UV,
+                    DebugLoc DL = {})
+      : TPRecipeBase(SC, Operands, DL), TPValue(this, UV) {}
+
+  TPSingleDefRecipe(const unsigned char SC, ArrayRef<TPValue *> Operands,
+                    Value *UV, DebugLoc DL = {})
+      : TPRecipeBase(SC, Operands, DL), TPValue(this, UV) {}
+
+  static inline bool classof(const TPRecipeBase *R) {
+    switch (R->getTPDefID()) {
+    case TPRecipeBase::TPDerivedIVSC:
+    case TPRecipeBase::TPEVLBasedIVPHISC:
+    case TPRecipeBase::TPExpandSCEVSC:
+    case TPRecipeBase::TPInstructionSC:
+    case TPRecipeBase::TPReductionEVLSC:
+    case TPRecipeBase::TPReductionSC:
+    case TPRecipeBase::TPNewInstrSC:
+    case TPRecipeBase::TPReplicateSC:
+    case TPRecipeBase::TPScalarIVStepsSC:
+    case TPRecipeBase::TPVectorPointerSC:
+    case TPRecipeBase::TPWidenCallSC:
+    case TPRecipeBase::TPMatrixCallSC:
+    case TPRecipeBase::TPWidenCanonicalIVSC:
+    case TPRecipeBase::TPWidenCastSC:
+    case TPRecipeBase::TPWidenGEPSC:
+    case TPRecipeBase::TPWidenSC:
+    case TPRecipeBase::TPWidenSelectSC:
+    case TPRecipeBase::TPBlendSC:
+    case TPRecipeBase::TPPredInstPHISC:
+    case TPRecipeBase::TPCanonicalIVPHISC:
+    case TPRecipeBase::TPActiveLaneMaskPHISC:
+    case TPRecipeBase::TPFirstOrderRecurrencePHISC:
+    case TPRecipeBase::TPWidenPHISC:
+    case TPRecipeBase::TPWidenIntOrFpInductionSC:
+    case TPRecipeBase::TPWidenPointerInductionSC:
+    case TPRecipeBase::TPReductionPHISC:
+    case TPRecipeBase::TPScalarCastSC:
+      return true;
+    case TPRecipeBase::TPInterleaveSC:
+    case TPRecipeBase::TPBranchOnMaskSC:
+    case TPRecipeBase::TPWidenLoadEVLSC:
+    case TPRecipeBase::TPWidenLoadSC:
+    case TPRecipeBase::TPWidenStoreEVLSC:
+    case TPRecipeBase::TPWidenStoreSC:
+      // TODO: Widened stores don't define a value, but widened loads do. Split
+      // the recipes to be able to make widened loads VPSingleDefRecipes.
+      return false;
+    }
+    llvm_unreachable("Unhandled VPDefID");
+  }
+
+  /// DimSet is a bitset of loop indices that this recipe's defined value "spans"
+  /// - i.e., which loop induction dimensions contributed to computing. It drives tensor semantics:
+  /// - Empty ({}) -> scalar: no loop dimension, no tensor parallelism (TensorOpKind::Scalar)
+  /// - Non-empty -> the value is a tensor over those dims; the pattern matcher (by TPRecipeMatcher)
+  /// uses DimSet comparisons between operands to classify 
+  /// the op (ElementWise, BroadcastBinary, OuterProduct, Contraction, etc.).
+  /// getTPValueShape() (TPRecipeMatcher.h:21) maps it to actual sizes: { Plan.getPFForDim(d) for d in DimSet }.
+  SmallBitVector DimSet;
+
+  /// Per-dim memory stride overrides (load/store recipes only).
+  /// Key: dim index (innermost=0). Value: SCEV stride expression in elements.
+  /// Absent entry → dense default expressed as a SCEV constant.
+  /// Populated by TPRecipePatternMatcher_match() via SCEV GEP-index analysis.
+  DenseMap<unsigned, const SCEV *> MemStrides;
+
+  static inline bool classof(const TPUser *U) {
+    auto *R = dyn_cast<TPRecipeBase>(U);
+    return R && classof(R);
+  }
+
+  virtual TPSingleDefRecipe *clone() override = 0;
+
+  /// Returns the underlying instruction.
+  Instruction *getUnderlyingInstr() {
+    return cast<Instruction>(getUnderlyingValue());
+  }
+  const Instruction *getUnderlyingInstr() const {
+    return cast<Instruction>(getUnderlyingValue());
+  }
+
+  /// Returns the effective memory stride for \p Dim as a SCEV expression.
+  /// Returns MemStrides[Dim] if set, else SE.getConstant(getDenseStrideForDim(Dim)).
+  const SCEV *getMemStride(unsigned Dim, const TPlan &Plan,
+                            ScalarEvolution &SE) const;
+};
+
+/// Class to record LLVM IR flag for a recipe along with it.
+class TPRecipeWithIRFlags : public TPSingleDefRecipe { // yuxin.an: L964
+  enum class OperationType : unsigned char {
+    Cmp,
+    OverflowingBinOp,
+    DisjointOp,
+    PossiblyExactOp,
+    GEPOp,
+    FPMathOp,
+    NonNegOp,
+    Other
+  };
+
+public:
+  struct WrapFlagsTy {
+    char HasNUW : 1;
+    char HasNSW : 1;
+
+    WrapFlagsTy(bool HasNUW, bool HasNSW) : HasNUW(HasNUW), HasNSW(HasNSW) {}
+  };
+
+  struct DisjointFlagsTy {
+    char IsDisjoint : 1;
+    DisjointFlagsTy(bool IsDisjoint) : IsDisjoint(IsDisjoint) {}
+  };
+
+protected:
+  struct GEPFlagsTy {
+    char IsInBounds : 1;
+    GEPFlagsTy(bool IsInBounds) : IsInBounds(IsInBounds) {}
+  };
+
+private:
+  struct ExactFlagsTy {
+    char IsExact : 1;
+  };
+  struct NonNegFlagsTy {
+    char NonNeg : 1;
+  };
+  struct FastMathFlagsTy {
+    char AllowReassoc : 1;
+    char NoNaNs : 1;
+    char NoInfs : 1;
+    char NoSignedZeros : 1;
+    char AllowReciprocal : 1;
+    char AllowContract : 1;
+    char ApproxFunc : 1;
+
+    FastMathFlagsTy(const FastMathFlags &FMF);
+  };
+
+  OperationType OpType;
+
+  union {
+    CmpInst::Predicate CmpPredicate;
+    WrapFlagsTy WrapFlags;
+    DisjointFlagsTy DisjointFlags;
+    ExactFlagsTy ExactFlags;
+    GEPFlagsTy GEPFlags;
+    NonNegFlagsTy NonNegFlags;
+    FastMathFlagsTy FMFs;
+    unsigned AllFlags;
+  };
+
+protected:
+  void transferFlags(TPRecipeWithIRFlags &Other) {
+    OpType = Other.OpType;
+    AllFlags = Other.AllFlags;
+  }
+
+public:
+  template <typename IterT>
+  TPRecipeWithIRFlags(const unsigned char SC, IterT Operands, DebugLoc DL = {})
+      : TPSingleDefRecipe(SC, Operands, DL) {
+    OpType = OperationType::Other;
+    AllFlags = 0;
+  }
+
+  template <typename IterT>
+  TPRecipeWithIRFlags(const unsigned char SC, IterT Operands, Instruction &I)
+      : TPSingleDefRecipe(SC, Operands, &I, I.getDebugLoc()) {
+    if (auto *Op = dyn_cast<CmpInst>(&I)) {
+      OpType = OperationType::Cmp;
+      CmpPredicate = Op->getPredicate();
+    } else if (auto *Op = dyn_cast<PossiblyDisjointInst>(&I)) {
+      OpType = OperationType::DisjointOp;
+      DisjointFlags.IsDisjoint = Op->isDisjoint();
+    } else if (auto *Op = dyn_cast<OverflowingBinaryOperator>(&I)) {
+      OpType = OperationType::OverflowingBinOp;
+      WrapFlags = {Op->hasNoUnsignedWrap(), Op->hasNoSignedWrap()};
+    } else if (auto *Op = dyn_cast<PossiblyExactOperator>(&I)) {
+      OpType = OperationType::PossiblyExactOp;
+      ExactFlags.IsExact = Op->isExact();
+    } else if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+      OpType = OperationType::GEPOp;
+      GEPFlags.IsInBounds = GEP->isInBounds();
+    } else if (auto *PNNI = dyn_cast<PossiblyNonNegInst>(&I)) {
+      OpType = OperationType::NonNegOp;
+      NonNegFlags.NonNeg = PNNI->hasNonNeg();
+    } else if (auto *Op = dyn_cast<FPMathOperator>(&I)) {
+      OpType = OperationType::FPMathOp;
+      FMFs = Op->getFastMathFlags();
+    } else {
+      OpType = OperationType::Other;
+      AllFlags = 0;
+    }
+  }
+
