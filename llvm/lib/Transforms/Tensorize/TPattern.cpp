@@ -1079,3 +1079,18 @@ bool ConvolutionTensorizePattern::tryToBuildTPlanWithTPRecipes(TPlanPtr &tplan,
   TPRecipeBase *BIdxRecipe =
       new TPNewInstrRecipe(Instruction::Mul, {Const_OC_IC, Const_KH_KW});
   LatchTPBB->appendRecipe(BIdxRecipe);
+    // RecipeBuilder->setRecipe(Instr, StoreRecipe);
+    LatchTPBB->appendRecipe(StoreRecipe);
+    // YYG::REMOVE
+    errs() << "Calling intrinsic end!\n";
+    Plan->dump();
+    success = true;
+  }
+  // tensor intrinsic else
+  // ...
+
+  tplan = std::move(Plan);
+  return success;
+}
+
+
