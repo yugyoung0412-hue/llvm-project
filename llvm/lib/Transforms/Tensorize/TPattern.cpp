@@ -1079,4 +1079,3 @@ bool ConvolutionTensorizePattern::tryToBuildTPlanWithTPRecipes(TPlanPtr &tplan,
   TPRecipeBase *BIdxRecipe =
       new TPNewInstrRecipe(Instruction::Mul, {Const_OC_IC, Const_KH_KW});
   LatchTPBB->appendRecipe(BIdxRecipe);
-
