@@ -1,0 +1,484 @@
+  TPValue *getAddr() const { return getOperand(0); }
+
+  /// Returns true if the recipe is masked.
+  bool isMasked() const { return IsMasked; }
+
+  /// Return the mask used by this recipe. Note that a full mask is represented
+  /// by a nullptr.
+  TPValue *getMask() const {
+    // Mask is optional and therefore the last operand.
+    return isMasked() ? getOperand(getNumOperands() - 1) : nullptr;
+  }
+
+  /// Generate the wide load/store.
+  void execute(TPTransformState &State) override {
+    llvm_unreachable("VPWidenMemoryRecipe should not be instantiated.");
+  }
+
+  Instruction &getIngredient() const { return Ingredient; }
+};
+
+/// A recipe for widening load operations, using the address to load from and an
+/// optional mask.
+struct TPWidenLoadRecipe final : public TPWidenMemoryRecipe,
+                                 public TPValue { // yuxin.an: L2521
+  TPWidenLoadRecipe(LoadInst &Load, TPValue *Addr, TPValue *Mask,
+                    bool Consecutive, bool Reverse, DebugLoc DL)
+      : TPWidenMemoryRecipe(TPDef::TPWidenLoadSC, Load, {Addr}, Consecutive,
+                            Reverse, DL),
+        TPValue(this, &Load) {
+    setMask(Mask);
+  }
+
+  TPWidenLoadRecipe *clone() override {
+    return new TPWidenLoadRecipe(cast<LoadInst>(Ingredient), getAddr(),
+                                 getMask(), Consecutive, Reverse,
+                                 getDebugLoc());
+  }
+
+  TP_CLASSOF_IMPL(TPDef::TPWidenLoadSC);
+
+  /// Generate a wide load or gather.
+  void execute(TPTransformState &State) override;
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+  /// Print the recipe.
+  void print(raw_ostream &O, const Twine &Indent,
+             TPSlotTracker &SlotTracker) const override;
+#endif
+
+  /// Returns true if the recipe only uses the first lane of operand \p Op.
+  bool onlyFirstLaneUsed(const TPValue *Op) const override {
+    assert(is_contained(operands(), Op) &&
+           "Op must be an operand of the recipe");
+    // Widened, consecutive loads operations only demand the first lane of
+    // their address.
+    return Op == getAddr() && isConsecutive();
+  }
+};
+
+/// A recipe for widening store operations, using the stored value, the address
+/// to store to and an optional mask.
+struct TPWidenStoreRecipe final : public TPWidenMemoryRecipe {
+  TPWidenStoreRecipe(StoreInst &Store, TPValue *Addr, TPValue *StoredVal,
+                     TPValue *Mask, bool Consecutive, bool Reverse, DebugLoc DL)
+      : TPWidenMemoryRecipe(TPDef::TPWidenStoreSC, Store, {Addr, StoredVal},
+                            Consecutive, Reverse, DL) {
+    setMask(Mask);
+  }
+
+  TPWidenStoreRecipe *clone() override {
+    return new TPWidenStoreRecipe(cast<StoreInst>(Ingredient), getAddr(),
+                                  getStoredValue(), getMask(), Consecutive,
+                                  Reverse, getDebugLoc());
+  }
+
+  TP_CLASSOF_IMPL(TPDef::TPWidenStoreSC);
+
+  /// Return the value stored by this recipe.
+  TPValue *getStoredValue() const { return getOperand(1); }
+
+  /// Generate a wide store or scatter.
+  void execute(TPTransformState &State) override;
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+  /// Print the recipe.
+  void print(raw_ostream &O, const Twine &Indent,
+             TPSlotTracker &SlotTracker) const override;
+#endif
+
+  /// Returns true if the recipe only uses the first lane of operand \p Op.
+  bool onlyFirstLaneUsed(const TPValue *Op) const override {
+    assert(is_contained(operands(), Op) &&
+           "Op must be an operand of the recipe");
+    // Widened, consecutive stores only demand the first lane of their address,
+    // unless the same operand is also stored.
+    return Op == getAddr() && isConsecutive() && Op != getStoredValue();
+  }
+};
+
+/// Recipe to expand a SCEV expression.
+class TPExpandSCEVRecipe : public TPSingleDefRecipe { // yuxin.an: L2678
+  const SCEV *Expr;
+  ScalarEvolution &SE;
+
+public:
+  TPExpandSCEVRecipe(const SCEV *Expr, ScalarEvolution &SE)
+      : TPSingleDefRecipe(TPDef::TPExpandSCEVSC, {}), Expr(Expr), SE(SE) {}
+
+  ~TPExpandSCEVRecipe() override = default;
+
+  TPExpandSCEVRecipe *clone() override {
+    return new TPExpandSCEVRecipe(Expr, SE);
+  }
+
+  TP_CLASSOF_IMPL(TPDef::TPExpandSCEVSC)
+
+  /// Generate a canonical vector induction variable of the vector loop, with
+  void execute(TPTransformState &State) override;
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+  /// Print the recipe.
+  void print(raw_ostream &O, const Twine &Indent,
+             TPSlotTracker &SlotTracker) const override;
+#endif
+
+  const SCEV *getSCEV() const { return Expr; }
+};
+
+/// Canonical scalar induction phi of the vector loop. Starting at the specified
+/// start value (either 0 or the resume value when vectorizing the epilogue
+/// loop). VPWidenCanonicalIVRecipe represents the vector version of the
+/// canonical induction variable.
+class TPCanonicalIVPHIRecipe : public TPHeaderPHIRecipe { // yuxin.an: L2710
+public:
+  TPCanonicalIVPHIRecipe(TPValue *StartV, DebugLoc DL)
+      : TPHeaderPHIRecipe(TPDef::TPCanonicalIVPHISC, nullptr, StartV, DL) {}
+
+  ~TPCanonicalIVPHIRecipe() override = default;
+
+  TPCanonicalIVPHIRecipe *clone() override {
+    auto *R = new TPCanonicalIVPHIRecipe(getOperand(0), getDebugLoc());
+    R->addOperand(getBackedgeValue());
+    return R;
+  }
+
+  TP_CLASSOF_IMPL(TPDef::TPCanonicalIVPHISC)
+
+  static inline bool classof(const TPHeaderPHIRecipe *D) {
+    return D->getTPDefID() == TPDef::TPCanonicalIVPHISC;
+  }
+
+  /// Generate the canonical scalar induction phi of the vector loop.
+  void execute(TPTransformState &State) override;
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+  /// Print the recipe.
+  void print(raw_ostream &O, const Twine &Indent,
+             TPSlotTracker &SlotTracker) const override;
+#endif
+
+  /// Returns the scalar type of the induction.
+  Type *getScalarType() const {
+    return getStartValue()->getLiveInIRValue()->getType();
+  }
+
+  /// Returns true if the recipe only uses the first lane of operand \p Op.
+  bool onlyFirstLaneUsed(const TPValue *Op) const override {
+    assert(is_contained(operands(), Op) &&
+           "Op must be an operand of the recipe");
+    return true;
+  }
+
+  /// Returns true if the recipe only uses the first part of operand \p Op.
+  bool onlyFirstPartUsed(const TPValue *Op) const override {
+    assert(is_contained(operands(), Op) &&
+           "Op must be an operand of the recipe");
+    return true;
+  }
+
+  /// Check if the induction described by \p Kind, /p Start and \p Step is
+  /// canonical, i.e.  has the same start and step (of 1) as the canonical IV.
+  bool isCanonical(InductionDescriptor::InductionKind Kind, TPValue *Start,
+                   TPValue *Step) const;
+};
+
+/// A recipe for generating the active lane mask for the vector loop that is
+/// used to predicate the vector operations.
+/// TODO: It would be good to use the existing VPWidenPHIRecipe instead and
+/// remove VPActiveLaneMaskPHIRecipe.
+class TPActiveLaneMaskPHIRecipe : public TPHeaderPHIRecipe { // yuxin.an: L2767
+public:
+  TPActiveLaneMaskPHIRecipe(TPValue *StartMask, DebugLoc DL)
+      : TPHeaderPHIRecipe(TPDef::TPActiveLaneMaskPHISC, nullptr, StartMask,
+                          DL) {}
+
+  ~TPActiveLaneMaskPHIRecipe() override = default;
+
+  TPActiveLaneMaskPHIRecipe *clone() override {
+    return new TPActiveLaneMaskPHIRecipe(getOperand(0), getDebugLoc());
+  }
+
+  TP_CLASSOF_IMPL(TPDef::TPActiveLaneMaskPHISC)
+
+  static inline bool classof(const TPHeaderPHIRecipe *D) {
+    return D->getTPDefID() == TPDef::TPActiveLaneMaskPHISC;
+  }
+
+  /// Generate the active lane mask phi of the vector loop.
+  void execute(TPTransformState &State) override;
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+  /// Print the recipe.
+  void print(raw_ostream &O, const Twine &Indent,
+             TPSlotTracker &SlotTracker) const override;
+#endif
+};
+
+/// A Recipe for widening the canonical induction variable of the vector loop.
+class TPWidenCanonicalIVRecipe : public TPSingleDefRecipe {
+public:
+  TPWidenCanonicalIVRecipe(TPCanonicalIVPHIRecipe *CanonicalIV)
+      : TPSingleDefRecipe(TPDef::TPWidenCanonicalIVSC, {CanonicalIV}) {}
+
+  ~TPWidenCanonicalIVRecipe() override = default;
+
+  TPWidenCanonicalIVRecipe *clone() override {
+    return new TPWidenCanonicalIVRecipe(
+        cast<TPCanonicalIVPHIRecipe>(getOperand(0)));
+  }
+
+  TP_CLASSOF_IMPL(TPDef::TPWidenCanonicalIVSC)
+
+  /// Generate a canonical vector induction variable of the vector loop, with
+  /// start = {<Part*VF, Part*VF+1, ..., Part*VF+VF-1> for 0 <= Part < UF}, and
+  /// step = <VF*UF, VF*UF, ..., VF*UF>.
+  void execute(TPTransformState &State) override;
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+  /// Print the recipe.
+  void print(raw_ostream &O, const Twine &Indent,
+             TPSlotTracker &SlotTracker) const override;
+#endif
+};
+
+/// A recipe for converting the input value \p IV value to the corresponding
+/// value of an IV with different start and step values, using Start + IV *
+/// Step.
+class TPDerivedIVRecipe : public TPSingleDefRecipe {
+  /// Kind of the induction.
+  const InductionDescriptor::InductionKind Kind;
+  /// If not nullptr, the floating point induction binary operator. Must be set
+  /// for floating point inductions.
+  const FPMathOperator *FPBinOp;
+
+public:
+  TPDerivedIVRecipe(const InductionDescriptor &IndDesc, TPValue *Start,
+                    TPCanonicalIVPHIRecipe *CanonicalIV, TPValue *Step)
+      : TPDerivedIVRecipe(
+            IndDesc.getKind(),
+            dyn_cast_or_null<FPMathOperator>(IndDesc.getInductionBinOp()),
+            Start, CanonicalIV, Step) {}
+
+  TPDerivedIVRecipe(InductionDescriptor::InductionKind Kind,
+                    const FPMathOperator *FPBinOp, TPValue *Start, TPValue *IV,
+                    TPValue *Step)
+      : TPSingleDefRecipe(TPDef::TPDerivedIVSC, {Start, IV, Step}), Kind(Kind),
+        FPBinOp(FPBinOp) {}
+
+  ~TPDerivedIVRecipe() override = default;
+
+  TPDerivedIVRecipe *clone() override {
+    return new TPDerivedIVRecipe(Kind, FPBinOp, getStartValue(), getOperand(1),
+                                 getStepValue());
+  }
+
+  TP_CLASSOF_IMPL(TPDef::TPDerivedIVSC)
+
+  /// Generate the transformed value of the induction at offset StartValue (1.
+  /// operand) + IV (2. operand) * StepValue (3, operand).
+  void execute(TPTransformState &State) override;
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+  /// Print the recipe.
+  void print(raw_ostream &O, const Twine &Indent,
+             TPSlotTracker &SlotTracker) const override;
+#endif
+
+  Type *getScalarType() const {
+    return getStartValue()->getLiveInIRValue()->getType();
+  }
+
+  TPValue *getStartValue() const { return getOperand(0); }
+  TPValue *getStepValue() const { return getOperand(2); }
+
+  /// Returns true if the recipe only uses the first lane of operand \p Op.
+  bool onlyFirstLaneUsed(const TPValue *Op) const override {
+    assert(is_contained(operands(), Op) &&
+           "Op must be an operand of the recipe");
+    return true;
+  }
+};
+
+/// A recipe for handling phi nodes of integer and floating-point inductions,
+/// producing their scalar values.
+class TPScalarIVStepsRecipe : public TPRecipeWithIRFlags { // yuxin.an: L2921
+  Instruction::BinaryOps InductionOpcode;
+  Loop *L;
+  TPValue *IV;
+
+public:
+  TPScalarIVStepsRecipe(TPValue *IV, TPValue *Step,
+                        Instruction::BinaryOps Opcode, FastMathFlags FMFs,
+                        Loop *L)
+      : TPRecipeWithIRFlags(TPDef::TPScalarIVStepsSC,
+                            ArrayRef<TPValue *>({IV, Step}), FMFs),
+        InductionOpcode(Opcode), L(L), IV(IV) {}
+
+  TPScalarIVStepsRecipe(const InductionDescriptor &IndDesc, TPValue *IV,
+                        TPValue *Step, Loop *L)
+      : TPScalarIVStepsRecipe(
+            IV, Step, IndDesc.getInductionOpcode(),
+            dyn_cast_or_null<FPMathOperator>(IndDesc.getInductionBinOp())
+                ? IndDesc.getInductionBinOp()->getFastMathFlags()
+                : FastMathFlags(),
+            L) {}
+
+  ~TPScalarIVStepsRecipe() override = default;
+
+  TPScalarIVStepsRecipe *clone() override {
+    return new TPScalarIVStepsRecipe(
+        getOperand(0), getOperand(1), InductionOpcode,
+        hasFastMathFlags() ? getFastMathFlags() : FastMathFlags(), L);
+  }
+
+  TP_CLASSOF_IMPL(TPDef::TPScalarIVStepsSC)
+
+  /// Generate the scalarized versions of the phi node as needed by their users.
+  void execute(TPTransformState &State) override;
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+  /// Print the recipe.
+  void print(raw_ostream &O, const Twine &Indent,
+             TPSlotTracker &SlotTracker) const override;
+#endif
+
+  TPValue *getStepValue() const { return getOperand(1); }
+
+  /// Returns true if the recipe only uses the first lane of operand \p Op.
+  bool onlyFirstLaneUsed(const TPValue *Op) const override {
+    assert(is_contained(operands(), Op) &&
+           "Op must be an operand of the recipe");
+    return true;
+  }
+};
+
+/// VPBasicBlock serves as the leaf of the Hierarchical Control-Flow Graph. It
+/// holds a sequence of zero or more VPRecipe's each representing a sequence of
+/// output IR instructions. All PHI-like recipes must come before any non-PHI
+/// recipes.
+class TPBasicBlock : public TPBlockBase { // L2971
+public:
+  using RecipeListTy = iplist<TPRecipeBase>;
+
+protected:
+  /// The VPRecipes held in the order of output instructions to generate.
+  RecipeListTy Recipes;
+
+  TPBasicBlock(const unsigned char BlockSC, const Twine &Name = "")
+      : TPBlockBase(BlockSC, Name.str()) {}
+
+public:
+  TPBasicBlock(const Twine &Name = "", TPRecipeBase *Recipe = nullptr)
+      : TPBlockBase(TPBasicBlockSC, Name.str()) {
+    if (Recipe)
+      appendRecipe(Recipe);
+  }
+
+  ~TPBasicBlock() override {
+    while (!Recipes.empty())
+      Recipes.pop_back();
+  }
+
+  /// Instruction iterators...
+  using iterator = RecipeListTy::iterator;
+  using const_iterator = RecipeListTy::const_iterator;
+  using reverse_iterator = RecipeListTy::reverse_iterator;
+  using const_reverse_iterator = RecipeListTy::const_reverse_iterator;
+
+  //===--------------------------------------------------------------------===//
+  /// Recipe iterator methods
+  ///
+  inline iterator begin() { return Recipes.begin(); }
+  inline const_iterator begin() const { return Recipes.begin(); }
+  inline iterator end() { return Recipes.end(); }
+  inline const_iterator end() const { return Recipes.end(); }
+
+  inline reverse_iterator rbegin() { return Recipes.rbegin(); }
+  inline const_reverse_iterator rbegin() const { return Recipes.rbegin(); }
+  inline reverse_iterator rend() { return Recipes.rend(); }
+  inline const_reverse_iterator rend() const { return Recipes.rend(); }
+
+  inline size_t size() const { return Recipes.size(); }
+  inline bool empty() const { return Recipes.empty(); }
+  inline const TPRecipeBase &front() const { return Recipes.front(); }
+  inline TPRecipeBase &front() { return Recipes.front(); }
+  inline const TPRecipeBase &back() const { return Recipes.back(); }
+  inline TPRecipeBase &back() { return Recipes.back(); }
+
+  /// Returns a reference to the list of recipes.
+  RecipeListTy &getRecipeList() { return Recipes; }
+
+  /// Returns a pointer to a member of the recipe list.
+  static RecipeListTy TPBasicBlock::*getSublistAccess(TPRecipeBase *) {
+    return &TPBasicBlock::Recipes;
+  }
+
+  /// Method to support type inquiry through isa, cast, and dyn_cast.
+  static inline bool classof(const TPBlockBase *V) {
+    return V->getTPBlockID() == TPBlockBase::TPBasicBlockSC ||
+           V->getTPBlockID() == TPBlockBase::TPIRBasicBlockSC;
+  }
+
+  void insert(TPRecipeBase *Recipe, iterator InsertPt) {
+    assert(Recipe && "No recipe to append.");
+    assert(!Recipe->Parent && "Recipe already in VPlan");
+    Recipe->Parent = this;
+    Recipes.insert(InsertPt, Recipe);
+  }
+
+  /// Augment the existing recipes of a VPBasicBlock with an additional
+  /// \p Recipe as the last recipe.
+  void appendRecipe(TPRecipeBase *Recipe) { insert(Recipe, end()); }
+
+  /// The method which generates the output IR instructions that correspond to
+  /// this VPBasicBlock, thereby "executing" the VPlan.
+  void execute(TPTransformState *State) override;
+
+  /// Return the cost of this VPBasicBlock.
+  InstructionCost cost(ElementCount VF, TPCostContext &Ctx) override;
+
+  /// Return the position of the first non-phi node recipe in the block.
+  iterator getFirstNonPhi();
+
+  /// Returns an iterator range over the PHI-like recipes in the block.
+  iterator_range<iterator> phis() {
+    return make_range(begin(), getFirstNonPhi());
+  }
+
+  void dropAllReferences(TPValue *NewValue) override;
+
+  /// Split current block at \p SplitAt by inserting a new block between the
+  /// current block and its successors and moving all recipes starting at
+  /// SplitAt to the new block. Returns the new block.
+  TPBasicBlock *splitAt(iterator SplitAt);
+
+  TPRegionBlock *getEnclosingLoopRegion();
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+  /// Print this VPBsicBlock to \p O, prefixing all lines with \p Indent. \p
+  /// SlotTracker is used to print unnamed VPValue's using consequtive numbers.
+  ///
+  /// Note that the numbering is applied to the whole VPlan, so printing
+  /// individual blocks is consistent with the whole VPlan printing.
+  void print(raw_ostream &O, const Twine &Indent,
+             TPSlotTracker &SlotTracker) const override;
+  using TPBlockBase::print; // Get the print(raw_stream &O) version.
+#endif
+
+  /// If the block has multiple successors, return the branch recipe terminating
+  /// the block. If there are no or only a single successor, return nullptr;
+  TPRecipeBase *getTerminator();
+  const TPRecipeBase *getTerminator() const;
+
+  /// Returns true if the block is exiting it's parent region.
+  bool isExiting() const;
+
+  /// Clone the current block and it's recipes, without updating the operands of
+  /// the cloned recipes.
+  TPBasicBlock *clone() override {
+    auto *NewBlock = new TPBasicBlock(getName());
+    for (TPRecipeBase &R : *this)
+      NewBlock->appendRecipe(R.clone());
+    return NewBlock;
+  }
