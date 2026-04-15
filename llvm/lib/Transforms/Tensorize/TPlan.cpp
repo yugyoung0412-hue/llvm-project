@@ -571,3 +571,256 @@ TPRegionBlock::TPRegionBlock(TPBlockBase *Entry, TPBlockBase *Exiting,
   for (TPBlockBase *Block : tp_depth_first_shallow(Entry))
     Block->setParent(this);
 }
+
+TPRegionBlock *TPRegionBlock::clone() {
+  DenseMap<TPBlockBase *, TPBlockBase *> Old2NewTPBlocks;
+  const auto &[NewEntry, NewExiting] = cloneFrom(getEntry(), Old2NewTPBlocks);
+
+  DenseMap<Loop *, TPBlockBase *> NewLoop2HeaderTPB, NewLoop2LatchTPB;
+
+  for (auto Elem : Loop2HeaderTPB)
+    NewLoop2HeaderTPB.insert({Elem.first, Old2NewTPBlocks[Elem.second]});
+  for (auto Elem : Loop2LatchTPB)
+    NewLoop2LatchTPB.insert({Elem.first, Old2NewTPBlocks[Elem.second]});
+
+  auto *NewRegion =
+      new TPRegionBlock(NewEntry, NewExiting, NewLoop2HeaderTPB,
+                        NewLoop2LatchTPB, getName(), isReplicator());
+  for (TPBlockBase *Block : tp_depth_first_shallow(NewEntry))
+    Block->setParent(NewRegion);
+  return NewRegion;
+}
+
+void TPRegionBlock::dropAllReferences(TPValue *NewValue) {
+  for (TPBlockBase *Block : tp_depth_first_shallow(Entry))
+    // Drop all references in VPBasicBlocks and replace all uses with
+    // DummyValue.
+    Block->dropAllReferences(NewValue);
+}
+
+void TPRegionBlock::execute(TPTransformState *State) {
+  State->TPBB2BB.insert({cast<TPBasicBlock>(Entry), State->TBS.TEntry});
+  State->BB2TPBB.insert({State->TBS.TEntry, cast<TPBasicBlock>(Entry)});
+
+  State->TPBB2BB.insert({cast<TPBasicBlock>(Exiting), State->TBS.TExiting});
+  State->BB2TPBB.insert({State->TBS.TExiting, cast<TPBasicBlock>(Exiting)});
+
+  ReversePostOrderTraversal<TPBlockShallowTraversalWrapper<TPBlockBase *>> RPOT(
+      Entry);
+
+  // TODO(yuxin.an)
+  for (TPBlockBase *Block : RPOT) {
+    LLVM_DEBUG(dbgs() << "LT: TPBlock in RPO " << Block->getName() << '\n');
+    Block->execute(State);
+  }
+}
+
+InstructionCost TPBasicBlock::cost(ElementCount VF, TPCostContext &Ctx) {
+  InstructionCost Cost = 0;
+  for (TPRecipeBase &R : Recipes)
+    Cost += R.cost(VF, Ctx);
+  return Cost;
+}
+
+InstructionCost TPRegionBlock::cost(ElementCount VF, TPCostContext &Ctx) {
+  // TODO(yuxin.an)
+  llvm_unreachable("");
+}
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+void TPRegionBlock::print(raw_ostream &O, const Twine &Indent,
+                          TPSlotTracker &SlotTracker) const {
+  O << Indent << (isReplicator() ? "<xVFxUF> " : "<x1> ") << getName() << ": {";
+  auto NewIndent = Indent + "  ";
+  for (auto *BlockBase : tp_depth_first_shallow(Entry)) {
+    O << '\n';
+    BlockBase->print(O, NewIndent, SlotTracker);
+  }
+  O << Indent << "}\n";
+
+  printSuccessors(O, Indent);
+}
+#endif
+
+TPlan::~TPlan() {
+  for (auto &KV : LiveOuts)
+    delete KV.second;
+  LiveOuts.clear();
+
+  if (Entry) {
+    TPValue DummyValue;
+    for (TPBlockBase *Block : tp_depth_first_shallow(Entry))
+      Block->dropAllReferences(&DummyValue);
+
+    TPBlockBase::deleteCFG(Entry);
+
+    Preheader->dropAllReferences(&DummyValue);
+    delete Preheader;
+  }
+  for (TPValue *TPV : TPLiveInsToFree)
+    delete TPV;
+  for (auto &Elem : BackedgeTakenCount)
+    delete Elem.second;
+  BackedgeTakenCount.clear();
+}
+
+/// Create nested-loop TPlan
+TPlanPtr TPlan::createInitialTPlan(MapVector<Loop *, SCEV *> TripCount,
+                                   ScalarEvolution &SE,
+                                   bool RequiresScalarEpilogueCheck,
+                                   bool TailFolded,
+                                   std::shared_ptr<TensorizePattern> Pattern) {
+  
+  // From Inner-most loop, arrange the preheader and its' control-flow-based TPBB  
+  TPIRBasicBlock *Entry = nullptr;
+  TPBasicBlock   *TensorPreheader = nullptr;
+  TPlanPtr        Plan = nullptr;
+  TPRegionBlock  *PrevRegion = nullptr;   // 가장 안쪽(innermost) region
+  TPBasicBlock   *PrevHeader = nullptr;
+  BasicBlock   *PrevExit = nullptr;
+  TPRegionBlock *CurRegion = nullptr;
+
+  // ----- Loop list : outer(R) → inner 순서라 가정 --------------------
+  for (auto [Idx, CurL] : enumerate(Pattern->Info.LoopsR)) {
+    // Although we visit outer-most loop first but its Idx starts from 0.
+    // We want Idx=0 for inner-most loop. Thus, use IdxR.
+    auto IdxR = Pattern->Info.LoopsR.size() - Idx - 1;
+    // YYG::REMOVE
+    errs() << "{Idx, IdxR} " << Idx << "IdxR: " << IdxR << "\n";
+    CurL->dump();
+
+    Entry = new TPIRBasicBlock(CurL->getLoopPreheader());
+    TensorPreheader = new TPBasicBlock("tensor.ph" + Twine(IdxR));
+
+    if (!Plan) {
+      Plan = std::make_unique<TPlan>(Entry, TensorPreheader, Pattern);
+    }
+
+    // Header / Latch
+    BasicBlock *IRHeaderBlock = CurL->getHeader();
+    auto *HeaderTPBB = new TPIRBasicBlock(IRHeaderBlock, "tensor.header" + Twine(IdxR));
+    // TPBasicBlock *HeaderTPBB = new TPBasicBlock("tensor.header" + Twine(IdxR));
+    TPBasicBlock *LatchTPBB  = new TPBasicBlock("tensor.latch" + Twine(IdxR));
+
+    // Middle / ScalarPH
+    TPBasicBlock *MiddleTPBB = new TPBasicBlock("middle.block" + Twine(IdxR));
+    TPBasicBlock *ScalarPH   = new TPBasicBlock("scalar.ph" + Twine(IdxR));
+    if (!RequiresScalarEpilogueCheck)
+      TPBlockUtils::connectBlocks(MiddleTPBB, ScalarPH);
+
+    BasicBlock *IRExitBlock = CurL->getUniqueExitBlock();
+    auto *TPExitBlock = new TPIRBasicBlock(IRExitBlock);
+    // The connection order corresponds to the operands of the conditional branch.
+    TPBlockUtils::insertBlockAfter(TPExitBlock, MiddleTPBB);
+    TPBlockUtils::connectBlocks(MiddleTPBB, ScalarPH);
+
+    // TODO(yg0412.yun) : (ScalarPH 와 연결은 나중에 InnerRegion.Exit 와 연결한다)
+    // → 여기서는 아직 연결 안 함
+    // middle → scalar (scalar‑epilogue가 필요하면)
+    if (!PrevRegion) {
+      // ---------- innermost (no inner region) ----------
+      CurRegion = new TPRegionBlock(HeaderTPBB, LatchTPBB,
+                                   "tensor loop" + Twine(IdxR), false);
+      // YYG:REMOVE
+      errs() << "---------- create PrevRegion1 \n";
+    } else {
+      // Prev.header (N+1) -> Cur.Prev-header(N)
+      TPBlockUtils::connectBlocks(PrevRegion->getEntry(), TensorPreheader);
+
+      // ---------- outer region that *contains* PrevRegion ----------
+      CurRegion = new TPRegionBlock(HeaderTPBB, LatchTPBB,
+                                    PrevRegion,               // ← inner region
+                                    "tensor loop" + Twine(IdxR), false);
+      // ScalarPH (N) -> Latch (N+1)
+      TPBlockUtils::connectBlocks(ScalarPH, PrevRegion->getExiting());
+      // // CurHeader (N) -> CurLatch (N)
+      // TPBlockUtils::connectBlocks(LatchTPBB, HeaderTPBB);
+    }
+    // HeaderTPBB -> LatchTPBB 
+    TPBlockUtils::connectBlocks(HeaderTPBB, LatchTPBB);
+    // CurRegion -> MiddleTPBB
+    TPBlockUtils::insertBlockAfter(MiddleTPBB, CurRegion);
+    // TensorPreheader -> Header (of CurRegion)
+    TPBlockUtils::insertBlockAfter(CurRegion, TensorPreheader);
+
+    // Loop ↔ Region 매핑
+    Plan->LoopIdx2Loop.insert({IdxR, CurL});
+    Plan->Loop2LoopIdx.insert({CurL, IdxR});
+    Plan->LoopIdx2TPRB.insert({IdxR, CurRegion});
+    Plan->LoopIdx2PreHeaderTPBB.insert({IdxR, TensorPreheader});
+    Plan->PreHeaderTPBB2LoopIdx.insert({TensorPreheader, IdxR});
+    Plan->LoopIdx2HeaderTPBB.insert({IdxR, HeaderTPBB});
+    Plan->HeaderTPBB2LoopIdx.insert({HeaderTPBB, IdxR});
+    Plan->LoopIdx2LatchTPBB.insert({IdxR, LatchTPBB});
+    Plan->LatchTPBB2LoopIdx.insert({LatchTPBB, IdxR});
+    Plan->LoopIdx2ExitingTPBB.insert({IdxR, TPExitBlock});
+    Plan->ExitingTPBB2LoopIdx.insert({TPExitBlock, IdxR});
+    
+    if (PrevRegion)
+      PrevRegion->setInner(CurRegion);
+    
+    PrevRegion = CurRegion;
+    PrevHeader = HeaderTPBB;
+    PrevExit = IRExitBlock;
+    Plan->dump();
+  }
+  // ----- Loop list : inner → outer --------------------
+  for (auto [Idx, CurL] : enumerate(Pattern->Info.Loops)) {
+    // Set the original trip-count
+    Plan->TensorTripCount[CurL] =
+        tputils::getOrCreateTPValueForSCEVExpr(*Plan, TripCount[CurL], SE);
+    
+    // Create initial TFxUF values as default 1.
+    LLVMContext &Ctx = CurL->getHeader()->getContext();
+    Value *initialTFUF = ConstantInt::get(Ctx, APInt(32, 1));
+    auto *tfuf = new TPValue(initialTFUF);
+    Plan->TFxUF.insert({CurL, tfuf});
+
+    // Set the tensor-trip-count.
+    // Initially, we just set tensor-trip-count to be same with scalar trip-count.
+    // TODO(yg0412.yun) need to fix.
+    // Plan->TensorTripCount[CurL] = new TPValue(Plan->TripCount[CurL]->getLiveInIRValue());
+  }
+
+  // Create one synthetic PF value per loop dimension.
+  // TODO(yg.yun) Future, it PF value should be set by TTI.
+  for (unsigned D = 0; D < Pattern->getDepth(); ++D)
+    Plan->DimPFs.push_back(
+                 std::make_unique<TPSymbolicValue>("PF[" + std::to_string(D) + "]"));
+
+  // Set the total loop-depth on TPlan.
+  Plan->setDepth(Pattern->getDepth());
+  // SEt the TripCouunt
+  Plan->resetTripCount(TripCount);
+  return Plan;
+}
+
+void TPlan::prepareToExecute(MapVector<Loop *, Value *> CanonicalIVStartValue,
+                             TPTransformState &State) {
+
+  // for (auto &BTCElem : BackedgeTakenCount) {
+  //   if (State.CFG.PrevBB && TripCountT.count(BTCElem.first)) {
+  //     IRBuilder<> Builder(State.CFG.PrevBB->getTerminator());
+  //     auto *TCMO = Builder.CreateSub(
+  //         TripCountT[BTCElem.first],
+  //         ConstantInt::get(TripCountT[BTCElem.first]->getType(), 1),
+  //         "trip.count.minus");
+  //     BackedgeTakenCount[BTCElem.first]->setUnderlyingValue(TCMO);
+  //   }
+  // }
+
+  // for (auto Elem : TensorTripCountT)
+  //   if (Elem.second)
+  //     TensorTripCount[Elem.first]->setUnderlyingValue(Elem.second);
+
+  // if (State.CFG.PrevBB) {
+  //   IRBuilder<> Builder(State.CFG.PrevBB->getTerminator());
+
+  //   for (auto [TCVElem, TFElem, UFElem] : zip(TripCountT, State.TF, State.UF)) {
+  //     if (TCVElem.second && TFElem.second && UFElem.second) {
+  //       TFxUF[TCVElem.first]->setUnderlyingValue(createStepForTFElem(
+  //           Builder, TCVElem.second->getType(), TFElem.second, UFElem.second));
+  //     }
+  //   }
+  // }
+}
