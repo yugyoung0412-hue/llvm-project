@@ -529,6 +529,15 @@ FUNCTION_PASS_WITH_PARAMS(
     "no-profile-peeling;profile-peeling;no-runtime;runtime;no-upperbound;"
     "upperbound")
 FUNCTION_PASS_WITH_PARAMS(
+    "loop-tensorize", "LoopTensorizePass",
+    [](LoopTensorizeOptions Opts) { return LoopTensorizePass(Opts); },
+    parseLoopTensorizeOptions,
+    "no-interleave-forced-only;interleave-forced-only;"
+    "no-tensorize-forced-only;tensorize-forced-only;"
+    "no-auto-tensorize-forced-only;auto-tensorize-forced-only;"
+    "no-use-instr-semantic-info-forced-only;use-instr-semantic-info-forced-only;"
+    "no-support-divergent-br-forced-only;support-divergent-br-forced-only")
+FUNCTION_PASS_WITH_PARAMS(
     "loop-vectorize", "LoopVectorizePass",
     [](LoopVectorizeOptions Opts) { return LoopVectorizePass(Opts); },
     parseLoopVectorizeOptions,

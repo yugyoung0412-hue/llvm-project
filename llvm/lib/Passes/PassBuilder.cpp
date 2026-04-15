@@ -311,6 +311,7 @@
 #include "llvm/Transforms/Utils/SymbolRewriter.h"
 #include "llvm/Transforms/Utils/UnifyFunctionExitNodes.h"
 #include "llvm/Transforms/Utils/UnifyLoopExits.h"
+#include "llvm/Transforms/Tensorize/LoopTensorize.h"
 #include "llvm/Transforms/Vectorize/LoadStoreVectorizer.h"
 #include "llvm/Transforms/Vectorize/LoopIdiomVectorize.h"
 #include "llvm/Transforms/Vectorize/LoopVectorize.h"
@@ -912,6 +913,32 @@ Expected<LoopVectorizeOptions> parseLoopVectorizeOptions(StringRef Params) {
     } else {
       return make_error<StringError>(
           formatv("invalid LoopVectorize parameter '{0}' ", ParamName).str(),
+          inconvertibleErrorCode());
+    }
+  }
+  return Opts;
+}
+
+Expected<LoopTensorizeOptions> parseLoopTensorizeOptions(StringRef Params) {
+  LoopTensorizeOptions Opts;
+  while (!Params.empty()) {
+    StringRef ParamName;
+    std::tie(ParamName, Params) = Params.split(';');
+
+    bool Enable = !ParamName.consume_front("no-");
+    if (ParamName == "interleave-forced-only") {
+      Opts.setInterleaveOnlyWhenForced(Enable);
+    } else if (ParamName == "tensorize-forced-only") {
+      Opts.setTensorizeOnlyWhenForced(Enable);
+    } else if (ParamName == "auto-tensorize-forced-only") {
+      Opts.setAutoTensorizeOnlyWhenForced(Enable);
+    } else if (ParamName == "use-instr-semantic-info-forced-only") {
+      Opts.setUseInstrSemanticInfoOnlyWhenForced(Enable);
+    } else if (ParamName == "support-divergent-br-forced-only") {
+      Opts.setSupportDivergentBrOnlyWhenForced(Enable);
+    } else {
+      return make_error<StringError>(
+          formatv("invalid LoopTensorize parameter '{0}' ", ParamName).str(),
           inconvertibleErrorCode());
     }
   }

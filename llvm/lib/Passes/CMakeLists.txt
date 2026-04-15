@@ -18,6 +18,7 @@ add_llvm_component_library(LLVMPasses
   AggressiveInstCombine
   Analysis
   CFGuard
+  Tensorize
   CodeGen
   Core
   Coroutines
