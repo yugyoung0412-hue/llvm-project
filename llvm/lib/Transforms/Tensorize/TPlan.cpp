@@ -824,3 +824,168 @@ void TPlan::prepareToExecute(MapVector<Loop *, Value *> CanonicalIVStartValue,
   //   }
   // }
 }
+
+/// Replace \p VPBB with a VPIRBasicBlock wrapping \p IRBB. All recipes from \p
+/// VPBB are moved to the newly created VPIRBasicBlock.  VPBB must have a single
+/// predecessor, which is rewired to the new VPIRBasicBlock. All successors of
+/// VPBB, if any, are rewired to the new VPIRBasicBlock.
+static void replaceTPBBWithIRTPBB(TPBasicBlock *TPBB, BasicBlock *IRBB) {
+  TPIRBasicBlock *IRMiddleVPBB = new TPIRBasicBlock(IRBB);
+  for (auto &R : make_early_inc_range(*TPBB))
+    R.moveBefore(*IRMiddleVPBB, IRMiddleVPBB->end());
+  TPBlockBase *PredTPBB = TPBB->getSinglePredecessor();
+  TPBlockUtils::disconnectBlocks(PredTPBB, TPBB);
+  TPBlockUtils::connectBlocks(PredTPBB, IRMiddleVPBB);
+  for (auto *Succ : to_vector(TPBB->getSuccessors())) {
+    TPBlockUtils::connectBlocks(IRMiddleVPBB, Succ);
+    TPBlockUtils::disconnectBlocks(TPBB, Succ);
+  }
+  delete TPBB;
+}
+
+/// Generate the code inside the preheader and body of the vectorized loop.
+/// Assumes a single pre-header basic-block was created for this. Introduce
+/// additional basic-blocks as needed, and fill them all.
+void TPlan::execute(TPTransformState *State) {
+  // TODO(yuxin.an)
+  TPBasicBlock *MiddleTPBB =
+      cast<TPBasicBlock>(getTensorLoopRegion()->getSingleSuccessor());
+
+  // BasicBlock *ScalarPh = MiddleBB->getSingleSuccessor();
+  auto &MiddleSuccs = MiddleTPBB->getSuccessors();
+  // assert((MiddleSuccs.size() == 1 || MiddleSuccs.size() == 2) &&
+  //        "middle block has unexpected successors");
+  TPBasicBlock *ScalarPhTPBB = cast<TPBasicBlock>(
+      MiddleSuccs.size() == 1 ? MiddleSuccs[0] : MiddleSuccs[1]);
+  // assert(!isa<TPIRBasicBlock>(ScalarPhTPBB) &&
+  //        "scalar preheader cannot be wrapped already");
+
+  replaceTPBBWithIRTPBB(ScalarPhTPBB, State->TBS.SPH);
+  replaceTPBBWithIRTPBB(MiddleTPBB, State->TBS.MiddleB);
+
+  if (Preheader) {
+    State->TPBB2BB.insert({Preheader, State->TBS.TPH});
+    State->BB2TPBB.insert({State->TBS.TPH, Preheader});
+  }
+
+  State->TPBB2BB.insert({Entry, State->TBS.TPH});
+  State->BB2TPBB.insert({State->TBS.TPH, Entry});
+
+  // Disconnect the middle block from its single successor (the scalar loop
+  // header) in both the CFG and DT. The branch will be recreated during VPlan
+  // execution.
+  // auto *BrInst = new UnreachableInst(MiddleBB->getContext());
+  // BrInst->insertBefore(MiddleBB->getTerminator());
+  // MiddleBB->getTerminator()->eraseFromParent();
+  // State->CFG.DTU.applyUpdates({{DominatorTree::Delete, MiddleBB, ScalarPh}});
+
+  // replaceTPBBWithIRTPBB(Entry, TensorPreHeader);
+
+  auto SplitBB = [&](BasicBlock *Old, Twine BBName) {
+    return SplitBlock(Old, Old->getTerminator(), State->DT, State->LI, nullptr,
+                      BBName);
+  };
+
+  State->TBS.TEntry = SplitBB(State->TBS.TPH, "tensor.entry");
+
+  // State->TPBB2BB.insert({Loop2HeaderTPBB[LoopI.L], Body});
+  // State->BB2TPBB.insert({Body, Loop2HeaderTPBB[LoopI.L]});
+
+  BasicBlock *InsertPtFront = State->TBS.TEntry; // Front insert point
+  BasicBlock *InsertPtBack = State->TBS.TEntry;  // Back insert point
+
+  for (auto [Idx, L] : enumerate(getPattern()->Info.Loops)) {
+    auto IdxR = Pattern->Info.LoopsR.size() - Idx - 1;
+
+    if (!Idx) {
+      auto *Body = SplitBB(InsertPtFront, "tensor.body" + Twine(Idx));
+      State->TBS.Loop2HeadBB.insert({L, Body});
+      State->TBS.Loop2LatchBB.insert({L, Body});
+      InsertPtBack = Body;
+
+      auto *CurTPBB = LoopIdx2HeaderTPBB[IdxR];
+      State->TPBB2BB.insert({CurTPBB, Body});
+      State->BB2TPBB.insert({Body, CurTPBB});
+      State->BackedgeTPBB.insert({CurTPBB, CurTPBB});
+      State->BackedgeBB.insert({Body, Body});
+
+      LoopIdx2LatchTPBB[IdxR] = LoopIdx2HeaderTPBB[IdxR];
+
+      if (LoopIdx2PreHeaderTPBB.count(IdxR)) {
+        State->TPBB2BB.insert({LoopIdx2PreHeaderTPBB[IdxR], State->TBS.TEntry});
+        State->BB2TPBB.insert({State->TBS.TEntry, LoopIdx2PreHeaderTPBB[IdxR]});
+      }
+    } else {
+      auto *PreBlock = SplitBB(InsertPtFront, "tensor.body" + Twine(Idx));
+      auto *PostBlock = SplitBB(InsertPtBack, "tensor.latch" + Twine(Idx));
+
+      State->TBS.Loop2HeadBB.insert({L, PreBlock});
+      State->TBS.Loop2LatchBB.insert({L, PostBlock});
+
+      State->TPBB2BB.insert({LoopIdx2HeaderTPBB[IdxR], PreBlock});
+      State->BB2TPBB.insert({PreBlock, LoopIdx2HeaderTPBB[IdxR]});
+
+      State->TPBB2BB.insert({LoopIdx2LatchTPBB[IdxR], PostBlock});
+      State->BB2TPBB.insert({PostBlock, LoopIdx2LatchTPBB[IdxR]});
+
+      State->BackedgeTPBB.insert({LoopIdx2LatchTPBB[IdxR], LoopIdx2HeaderTPBB[IdxR]});
+      State->BackedgeBB.insert({PostBlock, PreBlock});
+      InsertPtBack = PostBlock;
+
+      if (LoopIdx2PreHeaderTPBB.count(IdxR)) {
+        State->TPBB2BB.insert({LoopIdx2PreHeaderTPBB[IdxR], PreBlock});
+        State->BB2TPBB.insert({PreBlock, LoopIdx2PreHeaderTPBB[IdxR]});
+      }
+    }
+  }
+
+  State->TBS.TExiting = SplitBB(InsertPtBack, "tensor.exiting");
+
+  // Generate code in the loop pre-header and body.
+  for (TPBlockBase *Block : tp_depth_first_shallow(Entry)) {
+    Block->execute(State);
+  }
+}
+
+InstructionCost TPlan::cost(ElementCount VF, TPCostContext &Ctx) {
+  // TODO(yuxin.an)
+  llvm_unreachable("");
+}
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+void TPlan::printLiveIns(raw_ostream &O) const {
+  TPSlotTracker SlotTracker(this);
+
+  for (auto [idx, TFxUFElem] : enumerate(TFxUF)) {
+    if (TFxUFElem.second->getNumUsers() > 0) {
+      O << "\nLive-in ";
+      TFxUFElem.second->printAsOperand(O, SlotTracker);
+      O << " = TF." << idx << " * UF." << idx;
+    }
+  }
+
+  for (auto [idx, TTCElem] : enumerate(TensorTripCount)) {
+    if (TTCElem.second->getNumUsers() > 0) {
+      O << "\nLive-in ";
+      TTCElem.second->printAsOperand(O, SlotTracker);
+      O << " = tensor-trip-count." << idx;
+    }
+  }
+
+  for (auto [idx, BTCElem] : enumerate(BackedgeTakenCount)) {
+    if (BTCElem.second && BTCElem.second->getNumUsers()) {
+      O << "\nLive-in ";
+      BTCElem.second->printAsOperand(O, SlotTracker);
+      O << " = backedge-taken count." << idx;
+    }
+  }
+
+  for (auto [idx, TCElem] : enumerate(TensorTripCount)) {
+    O << "\n";
+    if (TCElem.second->isLiveIn())
+      O << "Live-in ";
+    TCElem.second->printAsOperand(O, SlotTracker);
+    O << " = original trip-count." << idx;
+  }
+  O << "\n";
+}
