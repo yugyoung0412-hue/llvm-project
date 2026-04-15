@@ -1308,3 +1308,15 @@ public:
       I->setHasNoSignedWrap(WrapFlags.HasNSW);
       break;
     case OperationType::DisjointOp:
+      cast<PossiblyDisjointInst>(I)->setIsDisjoint(DisjointFlags.IsDisjoint);
+      break;
+    case OperationType::PossiblyExactOp:
+      I->setIsExact(ExactFlags.IsExact);
+      break;
+    case OperationType::GEPOp:
+      // TODO(gep_nowrap): Track the full GEPNoWrapFlags in VPlan.
+      cast<GetElementPtrInst>(I)->setNoWrapFlags(
+          GEPFlags.IsInBounds ? GEPNoWrapFlags::inBounds()
+                              : GEPNoWrapFlags::none());
+      break;
+    case OperationType::FPMathOp:
