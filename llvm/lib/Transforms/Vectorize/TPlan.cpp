@@ -1282,12 +1282,14 @@ void TPTilingRegion::execute(TPTransformState &State) {
     State.EmittedMap[OrigKIVPhi] = TileIV;
 
     // TileBody: run all body recipes.
+    // Iterate recipes directly instead of calling Body->execute(State):
+    // Body is a TPIRBasicBlock whose execute() would reposition the builder
+    // back to IRBB->getFirstNonPHIIt() (k.loop), undoing our SetInsertPoint.
     B.SetInsertPoint(TileBody);
-    Body->execute(State);
-    // Body->execute() must leave the builder inside TileBody (K-body is flat —
-    // no nested control flow). A nested block would make the branch below wrong.
+    for (TPRecipeBase &R : *Body)
+      R.execute(State);
     assert(B.GetInsertBlock() == TileBody &&
-           "TPTilingRegion: Body::execute() left builder in unexpected block");
+           "TPTilingRegion: body recipes left builder in unexpected block");
     B.CreateBr(TileLatch);
 
     // TileLatch: increment IV and loop back.

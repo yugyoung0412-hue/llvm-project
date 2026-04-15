@@ -1,6 +1,5 @@
 ; llvm/test/Transforms/LoopTensorize/basic/outer-dim-preheader-gep.ll
-; RUN: opt -passes=loop-tensorize --disable-verify -S < %s | FileCheck %s
-; FIXME: --disable-verify needed due to known dominance violations in lowered IR.
+; RUN: opt -passes=loop-tensorize -S < %s | FileCheck %s
 ;
 ; 3-loop GEMM (M=N=K=16) where A's row pointer is computed in a separate
 ; i.body block between the M-loop header and the N-loop. This triggers the
