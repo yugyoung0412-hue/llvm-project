@@ -1224,3 +1224,59 @@ public:
     }
   }
 
+  template <typename IterT>
+  TPRecipeWithIRFlags(const unsigned char SC, IterT Operands,
+                      CmpInst::Predicate Pred, DebugLoc DL = {})
+      : TPSingleDefRecipe(SC, Operands, DL), OpType(OperationType::Cmp),
+        CmpPredicate(Pred) {}
+
+  template <typename IterT>
+  TPRecipeWithIRFlags(const unsigned char SC, IterT Operands,
+                      WrapFlagsTy WrapFlags, DebugLoc DL = {})
+      : TPSingleDefRecipe(SC, Operands, DL),
+        OpType(OperationType::OverflowingBinOp), WrapFlags(WrapFlags) {}
+
+  template <typename IterT>
+  TPRecipeWithIRFlags(const unsigned char SC, IterT Operands,
+                      FastMathFlags FMFs, DebugLoc DL = {})
+      : TPSingleDefRecipe(SC, Operands, DL), OpType(OperationType::FPMathOp),
+        FMFs(FMFs) {}
+
+  template <typename IterT>
+  TPRecipeWithIRFlags(const unsigned char SC, IterT Operands,
+                      DisjointFlagsTy DisjointFlags, DebugLoc DL = {})
+      : TPSingleDefRecipe(SC, Operands, DL), OpType(OperationType::DisjointOp),
+        DisjointFlags(DisjointFlags) {}
+
+protected:
+  template <typename IterT>
+  TPRecipeWithIRFlags(const unsigned char SC, IterT Operands,
+                      GEPFlagsTy GEPFlags, DebugLoc DL = {})
+      : TPSingleDefRecipe(SC, Operands, DL), OpType(OperationType::GEPOp),
+        GEPFlags(GEPFlags) {}
+
+public:
+  static inline bool classof(const TPRecipeBase *R) {
+    return R->getTPDefID() == TPRecipeBase::TPInstructionSC ||
+           R->getTPDefID() == TPRecipeBase::TPWidenSC ||
+           R->getTPDefID() == TPRecipeBase::TPWidenGEPSC ||
+           R->getTPDefID() == TPRecipeBase::TPWidenCastSC ||
+           R->getTPDefID() == TPRecipeBase::TPReplicateSC ||
+           R->getTPDefID() == TPRecipeBase::TPVectorPointerSC;
+  }
+
+  static inline bool classof(const TPUser *U) {
+    auto *R = dyn_cast<TPRecipeBase>(U);
+    return R && classof(R);
+  }
+
+  /// Drop all poison-generating flags.
+  void dropPoisonGeneratingFlags() {
+    // NOTE: This needs to be kept in-sync with
+    // Instruction::dropPoisonGeneratingFlags.
+    switch (OpType) {
+    case OperationType::OverflowingBinOp:
+      WrapFlags.HasNUW = false;
+      WrapFlags.HasNSW = false;
+      break;
+    case OperationType::DisjointOp:
