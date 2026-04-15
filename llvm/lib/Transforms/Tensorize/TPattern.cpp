@@ -1159,3 +1159,7 @@ bool ConvolutionTensorizePattern::tryToBuildTPlanWithTPRecipes(TPlanPtr &tplan,
         CI.FMulInst->getDebugLoc());
     LatchTPBB->appendRecipe(ConvRecipe);
         
+    // If we need transpose to store output matrix,
+    // auto *TransposeRecipe = new TPMatrixCallRecipe(
+    //     Instr, make_range(Operands2.begin(), Operands2.end()),
+    //     Intrinsic::matrix_transpose, Instr->getDebugLoc());
