@@ -470,3 +470,383 @@ struct TPTransformState {
   } CFG;
 
   /// Hold a pointer to LoopInfo to register new basic blocks in the loop.
+  LoopInfo *LI;
+
+  DominatorTree *DT;
+
+  /// Hold a reference to the IRBuilder used to generate output IR code.
+  IRBuilderBase &Builder;
+
+  /// Hold a pointer to InnerLoopVectorizer to reuse its IR generation methods.
+  LoopTensorizer *LT;
+
+  /// Pointer to the VPlan code is generated for.
+  TPlan *Plan;
+
+  DenseMap<Loop *, Loop *> Loop2TensorLoop;
+
+  Loop *CurLoop = nullptr;
+
+  /// The loop object for the current parent region, or nullptr.
+  Loop *CurrentTensorLoop = nullptr;
+
+  /// LoopVersioning.  It's only set up (non-null) if memchecks were
+  /// used.
+  ///
+  /// This is currently only used to add no-alias metadata based on the
+  /// memchecks.  The actually versioning is performed manually.
+  LoopVersioning *LVer = nullptr;
+
+  ScalarEvolution *SE;
+
+  SCEVExpander *Expander;
+
+  /// Map SCEVs to their expanded values. Populated when executing
+  /// VPExpandSCEVRecipes.
+  DenseMap<const SCEV *, Value *> ExpandedSCEVs;
+
+  /// VPlan-based type analysis.
+  TPTypeAnalysis TypeAnalysis;
+
+  TensorBlocks TBS;
+  DenseMap<TPBasicBlock *, BasicBlock *> TPBB2BB;
+  DenseMap<BasicBlock *, TPBasicBlock *> BB2TPBB;
+  DenseMap<TPValue *, Value *> TPValue2Value;
+  DenseMap<TPBasicBlock *, TPBasicBlock *> BackedgeTPBB;
+  DenseMap<BasicBlock *, BasicBlock *> BackedgeBB;
+  BasicBlock *CurBB;
+  DenseMap<BasicBlock *, Value *> IdxAddMap;
+  DenseMap<PHINode *, Value *> BackedgeValues;
+};
+
+class TPBlockBase { // yuxin.an: L437
+  // TODO(yuxin.an)
+  friend class TPBlockUtils;
+
+  const unsigned char SubclassID; ///< Subclass identifier (for isa/dyn_cast).
+
+  /// An optional name for the block.
+  std::string Name;
+
+  /// The immediate VPRegionBlock which this VPBlockBase belongs to, or null if
+  /// it is a topmost VPBlockBase.
+  TPRegionBlock *Parent = nullptr;
+
+  /// List of predecessor blocks.
+  SmallVector<TPBlockBase *, 1> Predecessors;
+
+  /// List of successor blocks.
+  SmallVector<TPBlockBase *, 1> Successors;
+
+  /// VPlan containing the block. Can only be set on the entry block of the
+  /// plan.
+  TPlan *Plan = nullptr;
+
+  /// Add \p Successor as the last successor to this block.
+  void appendSuccessor(TPBlockBase *Successor) {
+    assert(Successor && "Cannot add nullptr successor!");
+    Successors.push_back(Successor);
+  }
+
+  /// Add \p Predecessor as the last predecessor to this block.
+  void appendPredecessor(TPBlockBase *Predecessor) {
+    assert(Predecessor && "Cannot add nullptr predecessor!");
+    Predecessors.push_back(Predecessor);
+  }
+
+  /// Remove \p Predecessor from the predecessors of this block.
+  void removePredecessor(TPBlockBase *Predecessor) {
+    auto Pos = find(Predecessors, Predecessor);
+    assert(Pos && "Predecessor does not exist");
+    Predecessors.erase(Pos);
+  }
+
+  /// Remove \p Successor from the successors of this block.
+  void removeSuccessor(TPBlockBase *Successor) {
+    auto Pos = find(Successors, Successor);
+    assert(Pos && "Successor does not exist");
+    Successors.erase(Pos);
+  }
+
+protected:
+  TPBlockBase(const unsigned char SC, const std::string &N)
+      : SubclassID(SC), Name(N) {}
+
+public:
+  /// An enumeration for keeping track of the concrete subclass of VPBlockBase
+  /// that are actually instantiated. Values of this enumeration are kept in the
+  /// SubclassID field of the VPBlockBase objects. They are used for concrete
+  /// type identification.
+  using TPBlockTy = enum { TPRegionBlockSC, TPBasicBlockSC, TPIRBasicBlockSC, TPGuardBlockSC, TPTilingRegionSC };
+
+  using TPBlocksTy = SmallVectorImpl<TPBlockBase *>;
+
+  virtual ~TPBlockBase() = default;
+
+  const std::string &getName() const { return Name; }
+
+  void setName(const Twine &newName) { Name = newName.str(); }
+
+  /// \return an ID for the concrete type of this object.
+  /// This is used to implement the classof checks. This should not be used
+  /// for any other purpose, as the values may change as LLVM evolves.
+  unsigned getTPBlockID() const { return SubclassID; }
+
+  TPRegionBlock *getParent() { return Parent; }
+  const TPRegionBlock *getParent() const { return Parent; }
+
+  /// \return A pointer to the plan containing the current block.
+  TPlan *getPlan();
+  const TPlan *getPlan() const;
+
+  /// Sets the pointer of the plan containing the block. The block must be the
+  /// entry block into the VPlan.
+  void setPlan(TPlan *ParentPlan);
+
+  void setParent(TPRegionBlock *P) { Parent = P; }
+
+  /// \return the VPBasicBlock that is the entry of this VPBlockBase,
+  /// recursively, if the latter is a VPRegionBlock. Otherwise, if this
+  /// VPBlockBase is a VPBasicBlock, it is returned.
+  const TPBasicBlock *getEntryBasicBlock() const;
+  TPBasicBlock *getEntryBasicBlock();
+
+  /// \return the VPBasicBlock that is the exiting this VPBlockBase,
+  /// recursively, if the latter is a VPRegionBlock. Otherwise, if this
+  /// VPBlockBase is a VPBasicBlock, it is returned.
+  const TPBasicBlock *getExitingBasicBlock() const;
+  TPBasicBlock *getExitingBasicBlock();
+
+  const TPBlocksTy &getSuccessors() const { return Successors; }
+  TPBlocksTy &getSuccessors() { return Successors; }
+
+  iterator_range<TPBlockBase **> successors() { return Successors; }
+
+  const TPBlocksTy &getPredecessors() const { return Predecessors; }
+  TPBlocksTy &getPredecessors() { return Predecessors; }
+
+  /// \return the successor of this VPBlockBase if it has a single successor.
+  /// Otherwise return a null pointer.
+  TPBlockBase *getSingleSuccessor() const {
+    // YYG:REMOVE
+    errs() << "[getSingleSuccessor] Successors.size(): " << Successors.size() << "\n";
+    return (Successors.size() == 1 ? *Successors.begin() : nullptr);
+  }
+
+  /// \return the predecessor of this VPBlockBase if it has a single
+  /// predecessor. Otherwise return a null pointer.
+  TPBlockBase *getSinglePredecessor() const {
+    return (Predecessors.size() == 1 ? *Predecessors.begin() : nullptr);
+  }
+
+  size_t getNumSuccessors() const { return Successors.size(); }
+  size_t getNumPredecessors() const { return Predecessors.size(); }
+
+  /// An Enclosing Block of a block B is any block containing B, including B
+  /// itself. \return the closest enclosing block starting from "this", which
+  /// has successors. \return the root enclosing block if all enclosing blocks
+  /// have no successors.
+  TPBlockBase *getEnclosingBlockWithSuccessors();
+
+  /// \return the closest enclosing block starting from "this", which has
+  /// predecessors. \return the root enclosing block if all enclosing blocks
+  /// have no predecessors.
+  TPBlockBase *getEnclosingBlockWithPredecessors();
+
+  /// \return the successors either attached directly to this VPBlockBase or, if
+  /// this VPBlockBase is the exit block of a VPRegionBlock and has no
+  /// successors of its own, search recursively for the first enclosing
+  /// VPRegionBlock that has successors and return them. If no such
+  /// VPRegionBlock exists, return the (empty) successors of the topmost
+  /// VPBlockBase reached.
+  const TPBlocksTy &getHierarchicalSuccessors() {
+    return getEnclosingBlockWithSuccessors()->getSuccessors();
+  }
+
+  /// \return the hierarchical successor of this VPBlockBase if it has a single
+  /// hierarchical successor. Otherwise return a null pointer.
+  TPBlockBase *getSingleHierarchicalSuccessor() {
+    return getEnclosingBlockWithSuccessors()->getSingleSuccessor();
+  }
+
+  /// \return the predecessors either attached directly to this VPBlockBase or,
+  /// if this VPBlockBase is the entry block of a VPRegionBlock and has no
+  /// predecessors of its own, search recursively for the first enclosing
+  /// VPRegionBlock that has predecessors and return them. If no such
+  /// VPRegionBlock exists, return the (empty) predecessors of the topmost
+  /// VPBlockBase reached.
+  const TPBlocksTy &getHierarchicalPredecessors() {
+    return getEnclosingBlockWithPredecessors()->getPredecessors();
+  }
+
+  /// \return the hierarchical predecessor of this VPBlockBase if it has a
+  /// single hierarchical predecessor. Otherwise return a null pointer.
+  TPBlockBase *getSingleHierarchicalPredecessor() {
+    return getEnclosingBlockWithPredecessors()->getSinglePredecessor();
+  }
+
+  /// Set a given VPBlockBase \p Successor as the single successor of this
+  /// VPBlockBase. This VPBlockBase is not added as predecessor of \p Successor.
+  /// This VPBlockBase must have no successors.
+  void setOneSuccessor(TPBlockBase *Successor) {
+    assert(Successors.empty() && "Setting one successor when others exist.");
+    assert(Successor->getParent() == getParent() &&
+           "connected blocks must have the same parent");
+    appendSuccessor(Successor);
+  }
+
+  /// Set two given VPBlockBases \p IfTrue and \p IfFalse to be the two
+  /// successors of this VPBlockBase. This VPBlockBase is not added as
+  /// predecessor of \p IfTrue or \p IfFalse. This VPBlockBase must have no
+  /// successors.
+  void setTwoSuccessors(TPBlockBase *IfTrue, TPBlockBase *IfFalse) {
+    assert(Successors.empty() && "Setting two successors when others exist.");
+    appendSuccessor(IfTrue);
+    appendSuccessor(IfFalse);
+  }
+
+  /// Set each VPBasicBlock in \p NewPreds as predecessor of this VPBlockBase.
+  /// This VPBlockBase must have no predecessors. This VPBlockBase is not added
+  /// as successor of any VPBasicBlock in \p NewPreds.
+  void setPredecessors(ArrayRef<TPBlockBase *> NewPreds) {
+    assert(Predecessors.empty() && "Block predecessors already set.");
+    for (auto *Pred : NewPreds)
+      appendPredecessor(Pred);
+  }
+
+  /// Set each VPBasicBlock in \p NewSuccss as successor of this VPBlockBase.
+  /// This VPBlockBase must have no successors. This VPBlockBase is not added
+  /// as predecessor of any VPBasicBlock in \p NewSuccs.
+  void setSuccessors(ArrayRef<TPBlockBase *> NewSuccs) {
+    // assert(Successors.empty() && "Block successors already set.");
+    for (auto *Succ : NewSuccs)
+      appendSuccessor(Succ);
+  }
+
+  /// Remove all the predecessor of this block.
+  void clearPredecessors() { Predecessors.clear(); }
+
+  /// Remove all the successors of this block.
+  void clearSuccessors() { Successors.clear(); }
+
+  /// The method which generates the output IR that correspond to this
+  /// VPBlockBase, thereby "executing" the VPlan.
+  virtual void execute(TPTransformState *State) = 0;
+
+  /// Return the cost of the block.
+  // TODO(yuxin.an): Need to confirm VF -> TF.
+  virtual InstructionCost cost(ElementCount VF, TPCostContext &Ctx) = 0;
+
+  /// Delete all blocks reachable from a given VPBlockBase, inclusive.
+  static void deleteCFG(TPBlockBase *Entry);
+
+  /// Return true if it is legal to hoist instructions into this block.
+  bool isLegalToHoistInto() {
+    // There are currently no constraints that prevent an instruction to be
+    // hoisted into a VPBlockBase.
+    return true;
+  }
+
+  /// Replace all operands of VPUsers in the block with \p NewValue and also
+  /// replaces all uses of VPValues defined in the block with NewValue.
+  virtual void dropAllReferences(TPValue *NewValue) = 0;
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+  void printAsOperand(raw_ostream &OS, bool PrintType) const {
+    OS << getName();
+  }
+
+  /// Print plain-text dump of this VPBlockBase to \p O, prefixing all lines
+  /// with \p Indent. \p SlotTracker is used to print unnamed VPValue's using
+  /// consequtive numbers.
+  ///
+  /// Note that the numbering is applied to the whole VPlan, so printing
+  /// individual blocks is consistent with the whole VPlan printing.
+  virtual void print(raw_ostream &O, const Twine &Indent,
+                     TPSlotTracker &SlotTracker) const = 0;
+
+  /// Print plain-text dump of this VPlan to \p O.
+  void print(raw_ostream &O) const {
+    TPSlotTracker SlotTracker(getPlan());
+    print(O, "", SlotTracker);
+  }
+
+  /// Print the successors of this block to \p O, prefixing all lines with \p
+  /// Indent.
+  void printSuccessors(raw_ostream &O, const Twine &Indent) const;
+
+  /// Dump this VPBlockBase to dbgs().
+  LLVM_DUMP_METHOD void dump() const { print(dbgs()); }
+#endif
+
+  /// Clone the current block and it's recipes without updating the operands of
+  /// the cloned recipes, including all blocks in the single-entry single-exit
+  /// region for VPRegionBlocks.
+  virtual TPBlockBase *clone() = 0;
+};
+
+/// A value that is used outside the VPlan. The operand of the user needs to be
+/// added to the associated phi node. The incoming block from VPlan is
+/// determined by where the VPValue is defined: if it is defined by a recipe
+/// outside a region, its parent block is used, otherwise the middle block is
+/// used.
+class TPLiveOut : public TPUser { // yuxin.an: L704
+  PHINode *Phi;
+
+public:
+  TPLiveOut(PHINode *Phi, TPValue *Op)
+      : TPUser({Op}, TPUser::TPUserID::LiveOut), Phi(Phi) {}
+
+  static inline bool classof(const TPUser *U) {
+    return U->getTPUserID() == TPUser::TPUserID::LiveOut;
+  }
+
+  /// Fix the wrapped phi node. This means adding an incoming value to exit
+  /// block phi's from the vector loop via middle block (values from scalar loop
+  /// already reach these phi's), and updating the value to scalar header phi's
+  /// from the scalar preheader.
+  void fixPhi(TPlan &Plan, TPTransformState &State);
+
+  /// Returns true if the VPLiveOut uses scalars of operand \p Op.
+  bool usesScalars(const TPValue *Op) const override {
+    assert(is_contained(operands(), Op) &&
+           "Op must be an operand of the recipe");
+    return true;
+  }
+
+  PHINode *getPhi() const { return Phi; }
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+  /// Print the VPLiveOut to \p O.
+  void print(raw_ostream &O, TPSlotTracker &SlotTracker) const;
+#endif
+};
+
+/// Struct to hold various analysis needed for cost computations.
+struct TPCostContext { // yuxin.an: L737
+  // TODO(yuxin.an)
+};
+
+struct DimPF {
+  //SmallVector<ElementCount, 8> PFs = { ElementCount::getFixed(1) };
+  
+  /// Loop dim indices this value.
+  SmallBitVector DimSet;
+};
+
+// yuxin.an: L762
+class TPRecipeBase : public ilist_node_with_parent<TPRecipeBase, TPBasicBlock>,
+                     public TPDef,
+                     public TPUser {
+  // TODO(yuxin.an)
+  friend TPBasicBlock;
+  friend class TPBlockUtils;
+
+  /// Each VPRecipe belongs to a single VPBasicBlock.
+  TPBasicBlock *Parent = nullptr;
+
+  /// The debug location for the recipe.
+  DebugLoc DL;
+
+  /// Parallel Factor (PF)
+  ElementCount PF = ElementCount::getFixed(1);
