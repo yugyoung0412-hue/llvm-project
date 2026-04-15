@@ -1144,3 +1144,18 @@ bool ConvolutionTensorizePattern::tryToBuildTPlanWithTPRecipes(TPlanPtr &tplan,
     Op.append({MatrixLoads[0], MatrixLoads[1], StrideOne, StrideOne, PadOne,
                PadOne, PadOne, PadOne, DilationZero, DilationZero, ConstPadTy,
                KernelH, KernelW});
+    // %tensor_conv2d = call <4, <3 x 5 x 5 x 6 x half>,  [2, 3, 4, 5], NCHW,
+    // SRAM, 2222>
+    //                  @llvm.tensor.conv2d.t3x5x5x6xf16x2222.t3x5x5x6xf16x2222.t3x5x5x6xf16x2222.t1x4xi32x0.t1x4xi32x0.t1x4xi32x0
+    //                  (<4, <3 x 5 x 5 x 6 x half>,  [2, 3, 4, 5], NCHW, SRAM,
+    //                  2222> %Ifm,
+    //                    <4, <3 x 5 x 5 x 6 x half>,  [2, 3, 4, 5], NCHW, SRAM,
+    //                    2222> %Weight, <2, <1 x 4 x i32>> %Stride, <2, <1 x 4
+    //                    x i32>> %PadSize, <2, <1 x 4 x i32>> %DilationRate,
+    //                    i32 %PadTy)
+
+    auto *ConvRecipe = new TPMatrixCallRecipe(
+        CI.FMulInst, make_range(Op.begin(), Op.end()), ConvID,
+        CI.FMulInst->getDebugLoc());
+    LatchTPBB->appendRecipe(ConvRecipe);
+    
