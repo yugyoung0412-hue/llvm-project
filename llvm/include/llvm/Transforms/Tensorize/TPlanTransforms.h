@@ -65,17 +65,20 @@ public:
   /// not valid.
   static bool adjustFixedOrderRecurrences(TPlan &Plan, TPBuilder &Builder);
 
-  /// Mark body recipes absorbed by tensor.contract as IsSubsumed=true.
-  /// WIDEN-LOAD, WIDEN-STORE, fmul/fadd (non-Contraction), WIDEN-INDUCTION
-  /// are subsumed. WIDEN-GEP (tile-pointer computation) and Contraction are not.
-  void markSubsumedRecipes(TPBasicBlock *Body);
+  /// Mark body recipes absorbed by the tensor intrinsic as IsSubsumed=true.
+  /// \p TilingDim is the loop dimension index (DimIdx convention, 0=innermost)
+  /// being tiled.  Only load/store and IV recipes whose DimIndex matches
+  /// \p TilingDim are subsumed; arithmetic ops are subsumed unless they are
+  /// the Contraction or PlainReduction anchor.  GEP, ReductionPHI, and
+  /// PointerInduction recipes are never subsumed.
+  void markSubsumedRecipes(TPBasicBlock *Body, unsigned TilingDim);
 
   /// Build a scalar epilogue block (K%PF iteration). TODO(yg0412.yun) The scalar epilogue
   /// for DynamicTiled dims isn't implemented yet.
   TPBasicBlock *buildScalarEpilogue(TPBasicBlock *Body);
 
-  /// Replace the innermost K-loop with a TPTilingRegion by installing a
-  /// TilingOverride on the innermost TPRegionBlock.
+  /// Replace the tiling-dim loop region with a TPTilingRegion by installing a
+  /// TilingOverride on the corresponding TPRegionBlock.
   TPTilingRegion *replaceWithTilingRegion(TPRegionBlock *Innermost,
                                            const DimEmissionSpec &Spec);
 

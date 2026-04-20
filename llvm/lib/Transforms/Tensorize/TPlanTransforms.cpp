@@ -600,30 +600,48 @@ static void simplifyRecipes(TPlan &Plan, LLVMContext &Ctx) {
   }
 }
 
-void TPlanTransforms::markSubsumedRecipes(TPBasicBlock *Body) {
-  // Currently, @llvm.tensor.contract call replaces 5 separate scalar operations (load A, load B, multiply, add, store C).
-  // Those 5 recipes are subsumed because the intrinsic handles all of them internally.
-  // Only the GEPs (for tile-corner pointers), the accumulator PHI, and the contraction anchor recipe survive to emit IR.
+void TPlanTransforms::markSubsumedRecipes(TPBasicBlock *Body,
+                                          unsigned TilingDim) {
+  // A recipe is subsumed when the tensor intrinsic replaces it entirely.
+  // Rules are dim-aware so the function works for any tiling dimension, not
+  // just the GEMM K-loop (innermost, dim 0).
   for (TPRecipeBase &R : *Body) {
     TensorOpKind Kind = R.getTensorOpKind();
     switch (R.getTPDefID()) {
+
     case TPRecipeBase::TPWidenLoadSC:
     case TPRecipeBase::TPWidenStoreSC:
-      R.setSubsumed(true);
-      break;
-    case TPRecipeBase::TPWidenSC:
-      // Subsumed unless this IS the Contraction recipe (fadd reduction update).
-      if (Kind != TensorOpKind::Contraction)
+      // Subsume memory ops that belong to the loop being tiled.
+      // Loads/stores on other dimensions are not replaced by this intrinsic.
+      if (R.getDimIndex() == static_cast<int>(TilingDim))
         R.setSubsumed(true);
       break;
-    case TPRecipeBase::TPWidenIntOrFpInductionSC:
-      // K IV is subsumed — TileIV registered in EmittedMap replaces it.
-      // TPWidenPointerInductionSC is excluded: its execute() unconditionally
-      // registers the PHINode in ValueMap (ignoring IsSubsumed).
-      R.setSubsumed(true);
+
+    case TPRecipeBase::TPWidenSC:
+      // Subsume all arithmetic except the Contraction and PlainReduction
+      // anchors — those must survive so execute() can emit the intrinsic or
+      // the scalar reduction update respectively.
+      if (Kind != TensorOpKind::Contraction &&
+          Kind != TensorOpKind::PlainReduction) {
+        R.setSubsumed(true);
+      } else if (Kind == TensorOpKind::Contraction) {
+        assert(R.getContractDim() == static_cast<int>(TilingDim) &&
+               "Contraction recipe's reduction dim must match the tiling dim");
+      }
       break;
+
+    case TPRecipeBase::TPWidenIntOrFpInductionSC:
+      // Subsume only the IV for the loop being tiled; IVs of other loops
+      // must survive so their execute() registers the PHINode in ValueMap.
+      // TPWidenPointerInductionSC is intentionally excluded: its execute()
+      // unconditionally writes to ValueMap regardless of IsSubsumed.
+      if (R.getDimIndex() == static_cast<int>(TilingDim))
+        R.setSubsumed(true);
+      break;
+
     default:
-      // WIDEN-GEP (tile-corner pointer), Contraction, Reduction-PHI: keep.
+      // WIDEN-GEP (tile-corner pointer), ReductionPHI, and unknown recipes
+      // are kept — they must emit IR.
       break;
     }
   }
@@ -669,7 +687,7 @@ TPTilingRegion *TPlanTransforms::replaceWithTilingRegion(
       // YYG::REMOVE
       errs() << "[replaceWithTilingRegion] Innermost-TPBB:\n";
       TPBB->dump();
-      markSubsumedRecipes(TPBB);
+      markSubsumedRecipes(TPBB, Spec.Dim);
       
       TPBasicBlock *Epilogue =
           (Spec.Mode == DimEmitMode::DynamicTiled) ? buildScalarEpilogue(TPBB)
@@ -686,7 +704,7 @@ TPTilingRegion *TPlanTransforms::replaceWithTilingRegion(
   //   // YYG::REMOVE
   //   errs() << "[replaceWithTilingRegion] Innermost-TPBB:\n";
   //   TPBB->dump();
-  //   markSubsumedRecipes(TPBB);
+  //   markSubsumedRecipes(TPBB, Spec.Dim);
 
   //   // TPBB 순회
   //   // for (TPRecipeBase &R : *TPBB) {
@@ -756,11 +774,14 @@ void TPlanTransforms::transform(TPTransformState &State) {
   Value *TCVal = PredB.CreateAdd(BTC, PredB.getInt64(1), "tc.tiling");
   State.TilingTCVal = TCVal;
 
-  // Replace innermost region with a TPTilingRegion.
-  TPRegionBlock *Innermost = Plan.LoopIdx2TPRB[0];
-  if (!Innermost)
+  // Replace the region for the tiling dim with a TPTilingRegion.
+  // Use TilingSpec->Dim (not hardcoded 0) so this works for any loop depth,
+  // not just GEMM's innermost K-loop.
+  TPRegionBlock *TargetRegion = Plan.LoopIdx2TPRB[TilingSpec->Dim];
+  assert(TargetRegion && "LoopIdx2TPRB must contain an entry for every tiling dim");
+  if (!TargetRegion)
     return;
-  replaceWithTilingRegion(Innermost, *TilingSpec);
+  replaceWithTilingRegion(TargetRegion, *TilingSpec);
 
   // // For DynamicTiled dims, insert a runtime profitability guard.
   // if (TilingSpec->Mode == DimEmitMode::DynamicTiled)
