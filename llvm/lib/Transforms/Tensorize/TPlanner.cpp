@@ -255,10 +255,6 @@ void LoopTensorizePlanner::buildTPlansWithTPRecipes(TFTy MinTF, TFTy MaxTF,
       // FIxME(yg0412.yun) Below optimize function needs to be fix
       // TODO(yg0412.yun) Need to move optimize to before TPlanTransform::execute();
       // TPlanTransforms::optimize(*Plan, *Loop2PSE.begin()->second->getSE());
-      // YYG:REMOVE
-      errs() << "Final TPlan: \n";
-      Plan->dump();
-
       // LLVM_DEBUG(dbgs() << "[Info] `TPlanTransforms::optimize` end\n");
       // TODO(yg0412.yun)
       // turn on below code comments

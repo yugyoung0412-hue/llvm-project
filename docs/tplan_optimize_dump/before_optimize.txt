@@ -1,0 +1,204 @@
+========== TPlan BEFORE optimize() ==========
+TPlan ' for ' {
+Live-in ir<1> = TF.0 * UF.0
+Live-in ir<1> = TF.1 * UF.1
+Live-in ir<1> = TF.2 * UF.2
+Live-in ir<1> = TF.3 * UF.3
+Live-in ir<1> = TF.4 * UF.4
+Live-in ir<%9> = tensor-trip-count.0
+Live-in ir<%11> = tensor-trip-count.1
+Live-in ir<%13> = tensor-trip-count.2
+Live-in ir<%15> = tensor-trip-count.3
+Live-in ir<%17> = tensor-trip-count.4
+Live-in ir<%9> = original trip-count.0
+Live-in ir<%11> = original trip-count.1
+Live-in ir<%13> = original trip-count.2
+Live-in ir<%15> = original trip-count.3
+Live-in ir<%17> = original trip-count.4
+
+tensor.ph4:
+Successor(s): tensor loop4
+
+<x1> tensor loop4: {
+  ir-bb<tensor.header4>:
+    EMIT tp<%5> = CANONICAL-INDUCTION ir<0>, tp<%22> [PF= 1];
+    WIDEN-INDUCTION %55 = phi 0, %65, ir<1>; DimSet={4} [PF= 1];
+    CLONE br ir<%50>, ir<%64>, ir<%tensor.ph3>; DimSet={4} [PF= 1];
+  Successor(s): tensor.latch4, tensor.ph3
+
+  tensor.latch4:
+    EMIT tp<%22> = add nuw tp<%5>, ir<1> [PF= 1];
+    WIDEN ir<%65>.1 = add nuw nsw ir<%55>, ir<1>; DimSet={4} [PF= 1];
+    WIDEN ir<%66> = icmp eq ir<%65>.1, ir<%17>; DimSet={4} [PF= 1];
+    CLONE br ir<%66>, ir<%54>, ir<%.loopexit4>; DimSet={4} [PF= 1];
+    EMIT branch-on-count tp<%22>, ir<%17> [PF= 1];
+  No successors
+
+  tensor.ph3:
+    EMIT tp<%6> = select ir<%50>, ir<%7>, ir<1> [PF= 1];
+    WIDEN ir<%56> = srem ir<%55>, tp<%6>; DimSet={4} [PF= 1];
+    WIDEN ir<%57> = mul ir<%56>, ir<%25>; DimSet={4} [PF= 1];
+    WIDEN-GEP Inv[Var] ir<%58> = getelementptr inbounds ir<%43>, ir<%57>; DimSet={4} [PF= 1];
+    WIDEN ir<%59> = mul ir<%55>, ir<%33>; DimSet={4} [PF= 1];
+    WIDEN-GEP Inv[Var] ir<%60> = getelementptr inbounds ir<%45>, ir<%59>; DimSet={4} [PF= 1];
+    WIDEN ir<%61> = mul ir<%55>, ir<%41>; DimSet={4} [PF= 1];
+    WIDEN-GEP Inv[Var] ir<%62> = getelementptr inbounds ir<%47>, ir<%61>; DimSet={4} [PF= 1];
+  Successor(s): tensor loop3
+
+  <x1> tensor loop3: {
+    ir-bb<tensor.header3>:
+      EMIT tp<%7> = CANONICAL-INDUCTION ir<0>, tp<%20> [PF= 1];
+      WIDEN-INDUCTION %68 = phi 0, %83, ir<1>; DimSet={3} [PF= 1];
+      WIDEN ir<%69> = srem ir<%68>, ir<%5>; DimSet={3} [PF= 1];
+      WIDEN ir<%70> = mul ir<%69>, ir<%23>; DimSet={3} [PF= 1];
+      WIDEN-GEP Var[Var] ir<%71> = getelementptr inbounds ir<%58>, ir<%70>; DimSet={3,4} [PF= 1];
+      WIDEN ir<%72> = mul ir<%68>, ir<%31>; DimSet={3} [PF= 1];
+      WIDEN-GEP Var[Var] ir<%73> = getelementptr inbounds ir<%60>, ir<%72>; DimSet={3,4} [PF= 1];
+      WIDEN ir<%74> = mul ir<%68>, ir<%39>; DimSet={3} [PF= 1];
+      WIDEN-GEP Var[Var] ir<%75> = getelementptr inbounds ir<%62>, ir<%74>; DimSet={3,4} [PF= 1];
+      CLONE br ir<%51>, ir<%82>, ir<%tensor.ph2>; DimSet={3} [PF= 1];
+    Successor(s): tensor.latch3, tensor.ph2
+
+    tensor.latch3:
+      EMIT tp<%20> = add nuw tp<%7>, ir<1> [PF= 1];
+      WIDEN ir<%83>.1 = add nuw nsw ir<%68>, ir<1>; DimSet={3} [PF= 1];
+      WIDEN ir<%84> = icmp eq ir<%83>.1, ir<%15>; DimSet={3} [PF= 1];
+      CLONE br ir<%84>, ir<%67>, ir<%.loopexit3>; DimSet={3} [PF= 1];
+      EMIT branch-on-count tp<%20>, ir<%15> [PF= 1];
+    No successors
+
+    tensor.ph2:
+    Successor(s): tensor loop2
+
+    <x1> tensor loop2: {
+      ir-bb<tensor.header2>:
+        EMIT tp<%8> = CANONICAL-INDUCTION ir<0>, tp<%18> [PF= 1];
+        WIDEN-INDUCTION %77 = phi %90, 0, ir<1>; DimSet={2} [PF= 1];
+        CLONE br ir<%52>, ir<%89>, ir<%tensor.ph1>; DimSet={2} [PF= 1];
+      Successor(s): tensor.latch2, tensor.ph1
+
+      tensor.latch2:
+        EMIT tp<%18> = add nuw tp<%8>, ir<1> [PF= 1];
+        WIDEN ir<%90>.1 = add nuw nsw ir<%77>, ir<1>; DimSet={2} [PF= 1];
+        WIDEN ir<%91> = icmp eq ir<%90>.1, ir<%13>; DimSet={2} [PF= 1];
+        CLONE br ir<%91>, ir<%76>, ir<%.loopexit2>; DimSet={2} [PF= 1];
+        EMIT branch-on-count tp<%18>, ir<%13> [PF= 1];
+      No successors
+
+      tensor.ph1:
+        WIDEN ir<%78> = mul ir<%77>, ir<%29>; DimSet={2} [PF= 1];
+        WIDEN ir<%79> = mul ir<%77>, ir<%37>; DimSet={2} [PF= 1];
+        WIDEN-GEP Var[Var] ir<%80> = getelementptr inbounds ir<%73>, ir<%78>; DimSet={2,3,4} [PF= 1];
+        WIDEN-GEP Var[Var] ir<%81> = getelementptr inbounds ir<%75>, ir<%79>; DimSet={2,3,4} [PF= 1];
+      Successor(s): tensor loop1
+
+      <x1> tensor loop1: {
+        ir-bb<tensor.header1>:
+          EMIT tp<%9> = CANONICAL-INDUCTION ir<0>, tp<%13> [PF= 1];
+          WIDEN-INDUCTION %86 = phi 0, %97, ir<1>; DimSet={1} [PF= 1];
+          CLONE br ir<%53>, ir<%92>, ir<%tensor.ph0>; DimSet={1} [PF= 1];
+        Successor(s): tensor.latch1, tensor.ph0
+
+        tensor.latch1:
+          EMIT tp<%13> = add nuw tp<%9>, ir<1> [PF= 1];
+          EMIT tp<%14> = not ir<%53> [PF= 1];
+          EMIT tp<%15> = or ir<%113>, tp<%14>; DimSet={0} [PF= 1];
+          BLEND ir<%93> = ir<0.000000e+00> ir<%.lcssa>/ir<%113>; DimSet={0,1} [PF= 1];
+          WIDEN ir<%94> = mul ir<%86>, ir<%35>; DimSet={1} [PF= 1];
+          WIDEN-GEP Var[Var] ir<%95> = getelementptr inbounds ir<%81>, ir<%94>; DimSet={1,2,3,4} [PF= 1];
+          WIDEN-CAST ir<%96> = bitcast  ir<%95> to ptr; DimSet={1,2,3,4} [PF= 1];
+          WIDEN store ir<%96>, ir<%93>; DimSet={0,1,2,3,4} [PF= 1];
+          WIDEN ir<%97>.1 = add nuw nsw ir<%86>, ir<1>; DimSet={1} [PF= 1];
+          WIDEN ir<%98> = icmp eq ir<%97>.1, ir<%11>; DimSet={1} [PF= 1];
+          CLONE br ir<%98>, ir<%85>, ir<%.loopexit1>; DimSet={1} [PF= 1];
+          EMIT branch-on-count tp<%13>, ir<%11> [PF= 1];
+        No successors
+
+        tensor.ph0:
+          WIDEN ir<%87> = mul ir<%86>, ir<%21>; DimSet={1} [PF= 1];
+          WIDEN-GEP Var[Var] ir<%88> = getelementptr inbounds ir<%71>, ir<%87>; DimSet={1,3,4} [PF= 1];
+        Successor(s): tensor loop0
+
+        <x1> tensor loop0: {
+          ir-bb<tensor.header0>:
+            EMIT tp<%10> = CANONICAL-INDUCTION ir<0>, tp<%11> [PF= 1];
+            WIDEN-INDUCTION %100 = phi 0, %112, ir<1>; DimSet={0} [PF= 1];
+            WIDEN-REDUCTION-PHI ir<%101> = phi ir<0.000000e+00>, ir<%111>.1; DimSet={0,1,2,3,4} [PF= 1];
+          Successor(s): tensor.latch0
+
+          tensor.latch0:
+            EMIT tp<%11> = add nuw tp<%10>, ir<1> [PF= 1];
+            WIDEN ir<%102> = mul ir<%100>, ir<%19>; DimSet={0} [PF= 1];
+            WIDEN-GEP Var[Var] ir<%103> = getelementptr inbounds ir<%88>, ir<%102>; DimSet={0,1,3,4} [PF= 1];
+            WIDEN-CAST ir<%104> = bitcast  ir<%103> to ptr; DimSet={0,1,3,4} [PF= 1];
+            WIDEN ir<%105> = load ir<%104>; DimSet={0,1,3,4} [PF= 1];
+            WIDEN ir<%106> = mul ir<%100>, ir<%27>; DimSet={0} [PF= 1];
+            WIDEN-GEP Var[Var] ir<%107> = getelementptr inbounds ir<%80>, ir<%106>; DimSet={0,2,3,4} [PF= 1];
+            WIDEN-CAST ir<%108> = bitcast  ir<%107> to ptr; DimSet={0,2,3,4} [PF= 1];
+            WIDEN ir<%109> = load ir<%108>; DimSet={0,2,3,4} [PF= 1];
+            WIDEN ir<%110> = fmul ir<%105>, ir<%109>; DimSet={0,1,2,3,4} [PF= 1];
+            WIDEN ir<%111>.1 = fadd ir<%101>, ir<%110>; DimSet={0,1,2,3,4} [PF= 1];
+            WIDEN ir<%112>.1 = add nuw nsw ir<%100>, ir<1>; DimSet={0} [PF= 1];
+            WIDEN ir<%113> = icmp eq ir<%112>.1, ir<%9>; DimSet={0} [PF= 1];
+            CLONE br ir<%113>, ir<%99>, ir<%.loopexit>; DimSet={0} [PF= 1];
+            EMIT branch-on-count tp<%11>, ir<%9> [PF= 1];
+          No successors
+        }
+        Successor(s): middle.block0
+
+        middle.block0:
+        Successor(s): ir-bb<.loopexit>, scalar.ph0
+
+        ir-bb<.loopexit>:
+          BLEND ir<%.lcssa>.1 = ir<%111>; DimSet={1} [PF= 1];
+        Successor(s): scalar.ph0
+
+        scalar.ph0:
+        Successor(s): tensor.latch1
+      }
+      Successor(s): middle.block1
+
+      middle.block1:
+      Successor(s): ir-bb<.loopexit1>, scalar.ph1
+
+      ir-bb<.loopexit1>:
+        EMIT tp<%17> = logical-and tp<%15>, ir<%98>; DimSet={0,1} [PF= 1];
+      Successor(s): scalar.ph1
+
+      scalar.ph1:
+      Successor(s): tensor.latch2
+    }
+    Successor(s): middle.block2
+
+    middle.block2:
+    Successor(s): ir-bb<.loopexit2>, scalar.ph2
+
+    ir-bb<.loopexit2>:
+    Successor(s): scalar.ph2
+
+    scalar.ph2:
+    Successor(s): tensor.latch3
+  }
+  Successor(s): middle.block3
+
+  middle.block3:
+  Successor(s): ir-bb<.loopexit3>, scalar.ph3
+
+  ir-bb<.loopexit3>:
+  Successor(s): scalar.ph3
+
+  scalar.ph3:
+  Successor(s): tensor.latch4
+}
+Successor(s): middle.block4
+
+middle.block4:
+Successor(s): ir-bb<.loopexit4>, scalar.ph4
+
+ir-bb<.loopexit4>:
+Successor(s): scalar.ph4
+
+scalar.ph4:
+No successors
+}
+=============================================
