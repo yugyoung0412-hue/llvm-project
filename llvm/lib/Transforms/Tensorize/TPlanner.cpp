@@ -252,10 +252,9 @@ void LoopTensorizePlanner::buildTPlansWithTPRecipes(TFTy MinTF, TFTy MaxTF,
 
   if (auto Plan = tryToBuildTPlanWithTPRecipes(SubRange, UseTensorType)) {
     if (true) {
-      // FIxME(yg0412.yun) Below optimize function needs to be fix
       // TODO(yg0412.yun) Need to move optimize to before TPlanTransform::execute();
-      // TPlanTransforms::optimize(*Plan, *Loop2PSE.begin()->second->getSE());
-      // LLVM_DEBUG(dbgs() << "[Info] `TPlanTransforms::optimize` end\n");
+      TPlanTransforms::optimize(*Plan, *Loop2PSE.begin()->second->getSE());
+      LLVM_DEBUG(dbgs() << "[Info] `TPlanTransforms::optimize` end\n");
       // TODO(yg0412.yun)
       // turn on below code comments
       // assert(verifyTPlanIsValid(*Plan) && "TPlan is invalid");
