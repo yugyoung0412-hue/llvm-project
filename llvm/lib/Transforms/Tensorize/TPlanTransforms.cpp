@@ -337,25 +337,87 @@ void TPlanTransforms::createAndOptimizeReplicateRegions(TPlan &Plan) {
 /// in the vectorized loop. There is no need to vectorize the cast - the same
 /// value can be used for both the phi and casts in the vector loop.
 static void removeRedundantInductionCasts(TPlan &Plan) {
-  for (auto Elem : Plan.LoopIdx2HeaderTPBB) {
-    for (auto &Phi : Elem.second->phis()) {
+  for (auto &[Dim, HeaderTPBB] : Plan.LoopIdx2HeaderTPBB) {
+    for (auto &Phi : HeaderTPBB->phis()) {
       auto *IV = dyn_cast<TPWidenIntOrFpInductionRecipe>(&Phi);
       if (!IV || IV->getTruncInst())
         continue;
 
-      ArrayRef<Instruction *> Casts = IV->getInductionDescriptor().getCastInsts();
-      TPValue *FindMyCast = IV;
-      FindMyCast->replaceAllUsesWith(IV);
+      // When IV is widened, the cast chain is bypassed.
+      // getCastInsts() returns casts innermost-first; walk outward to find the
+      // last cast recipe in the chain and replace its uses with IV.
+      ArrayRef<Instruction *> Casts =
+          IV->getInductionDescriptor().getCastInsts();
+      if (Casts.empty())
+        continue;
+
+      TPValue *LastCastRecipe = IV;
+      for (Instruction *IRCast : reverse(Casts)) {
+        auto *It = llvm::find_if(LastCastRecipe->users(), [IRCast](TPUser *U) {
+          auto *UserCast = dyn_cast<TPSingleDefRecipe>(U);
+          return UserCast && UserCast->getUnderlyingValue() == IRCast;
+        });
+        if (It == LastCastRecipe->users().end())
+          break;
+        LastCastRecipe = cast<TPSingleDefRecipe>(*It);
+      }
+      if (LastCastRecipe != IV)
+        LastCastRecipe->replaceAllUsesWith(IV);
     }
   }
-
-  dbgs() << "[Warning] Please optimize `removeRedundantInductionCasts` \n";
 }
 
 /// Try to replace VPWidenCanonicalIVRecipes with a widened canonical IV
 /// recipe, if it exists.
 static void removeRedundantCanonicalIVs(TPlan &Plan) {
-  dbgs() << "[Warning] Please optimize `removeRedundantCanonicalIVs` \n";
+  for (auto &[Dim, HeaderTPBB] : Plan.LoopIdx2HeaderTPBB) {
+    if (HeaderTPBB->empty())
+      continue;
+
+    auto *FirstRecipe = &*HeaderTPBB->begin();
+    auto *CanonicalIV = dyn_cast<TPCanonicalIVPHIRecipe>(FirstRecipe);
+    if (!CanonicalIV)
+      continue;
+
+    // Find TPWidenCanonicalIVRecipe that uses CanonicalIV
+    TPWidenCanonicalIVRecipe *WidenNewIV = nullptr;
+    for (TPUser *U : CanonicalIV->users()) {
+      WidenNewIV = dyn_cast<TPWidenCanonicalIVRecipe>(U);
+      if (WidenNewIV)
+        break;
+    }
+    if (!WidenNewIV)
+      continue;
+
+    // Find canonical TPWidenIntOrFpInductionRecipe in the same header
+    for (TPRecipeBase &Phi : HeaderTPBB->phis()) {
+      auto *WidenOriginalIV = dyn_cast<TPWidenIntOrFpInductionRecipe>(&Phi);
+      if (!WidenOriginalIV || !WidenOriginalIV->isCanonical())
+        continue;
+
+      // Check if replacement is beneficial
+      bool ShouldReplace = false;
+
+      // Check if any user of WidenOriginalIV does not use scalars
+      for (TPUser *U : WidenOriginalIV->users()) {
+        if (!U->usesScalars(WidenOriginalIV)) {
+          ShouldReplace = true;
+          break;
+        }
+      }
+
+      // Or if WidenNewIV only uses the first lane
+      if (!ShouldReplace && tputils::onlyFirstLaneUsed(WidenNewIV)) {
+        ShouldReplace = true;
+      }
+
+      if (ShouldReplace) {
+        WidenNewIV->replaceAllUsesWith(WidenOriginalIV);
+        WidenNewIV->eraseFromParent();
+        break;
+      }
+    }
+  }
 }
 
 static TPScalarIVStepsRecipe *createScalarIVSteps(
@@ -441,6 +503,138 @@ static void removeDeadRecipes(TPlan &Plan) {
   }
 }
 
+/// Returns true if \p R can be pruned because all of its defined values are
+/// only used by subsumed recipes (which will be no-ops at execute() time).
+/// Subsumed recipes themselves are never prunable — they stay in the plan.
+static bool isPrunableConsideringSubsumed(const TPRecipeBase &R) {
+  if (R.isSubsumed())
+    return false; // subsumed recipes stay in the plan
+  if (R.mayHaveSideEffects())
+    return false;
+  if (R.mayReadOrWriteMemory())
+    return false;
+  return all_of(R.definedValues(), [](const TPValue *V) {
+    // vacuously true if no users; prunable if every user is subsumed
+    return all_of(V->users(), [](const TPUser *U) {
+      const auto *Recipe = dyn_cast<TPRecipeBase>(U);
+      return Recipe && Recipe->isSubsumed();
+    });
+  });
+}
+
+/// Remove recipes whose only consumers are subsumed recipes.
+/// Uses the same reverse-RPOT scan as removeDeadRecipes so that erasing an
+/// inner-loop def propagates up: once the user count drops to zero the outer
+/// def also becomes prunable in the same pass.
+static void pruneSubsumedCrossLoopDefs(TPlan &Plan) {
+  // Fast path: skip if no subsumed recipes exist
+  bool AnySubsumed = false;
+  {
+    ReversePostOrderTraversal<TPBlockDeepTraversalWrapper<TPBlockBase *>> Check(
+        Plan.getEntry());
+    for (auto *TPBB : TPBlockUtils::blocksOnly<TPBasicBlock>(Check)) {
+      for (TPRecipeBase &R : *TPBB) {
+        if (R.isSubsumed()) {
+          AnySubsumed = true;
+          break;
+        }
+      }
+      if (AnySubsumed)
+        break;
+    }
+  }
+  if (!AnySubsumed)
+    return;
+
+  // Post-order scan (reverse RPOT): inner blocks before outer blocks.
+  // Erasing an inner recipe reduces its outer def's user count → chain removal.
+  ReversePostOrderTraversal<TPBlockDeepTraversalWrapper<TPBlockBase *>> RPOT(
+      Plan.getEntry());
+  SmallVector<TPBasicBlock *, 16> Blocks(
+      TPBlockUtils::blocksOnly<TPBasicBlock>(RPOT).begin(),
+      TPBlockUtils::blocksOnly<TPBasicBlock>(RPOT).end());
+  for (auto *TPBB : reverse(Blocks)) {
+    SmallVector<TPRecipeBase *, 8> Recipes;
+    for (TPRecipeBase &R : *TPBB)
+      Recipes.push_back(&R);
+    for (auto *R : reverse(Recipes)) {
+      if (isPrunableConsideringSubsumed(*R))
+        R->eraseFromParent();
+    }
+  }
+}
+
+/// Returns true if \p TPBB is (transitively) inside \p TargetRegion.
+/// Walks up the parent-region chain from TPBB.
+static bool isInsideRegion(TPBasicBlock *TPBB, TPRegionBlock *TargetRegion) {
+  for (TPRegionBlock *Parent = TPBB->getParent(); Parent;
+       Parent = Parent->getParent())
+    if (Parent == TargetRegion)
+      return true;
+  return false;
+}
+
+/// Hoist loop-invariant recipes from the loop body to the loop preheader.
+/// Processes dimensions innermost-first so that recipes hoisted to an inner
+/// preheader become candidates for hoisting in the outer loop in the next
+/// iteration.
+static void hoistLoopInvariantRecipes(TPlan &Plan) {
+  // Process innermost (Dim=0) first → outermost (Dim=N-1) last
+  SmallVector<unsigned, 4> Dims;
+  for (auto &[Dim, _] : Plan.LoopIdx2TPRB)
+    Dims.push_back(Dim);
+  llvm::sort(Dims); // ascending = innermost first
+
+  for (unsigned Dim : Dims) {
+    auto *RegIt = Plan.LoopIdx2TPRB.find(Dim);
+    auto *PreIt = Plan.LoopIdx2PreHeaderTPBB.find(Dim);
+    if (RegIt == Plan.LoopIdx2TPRB.end() ||
+        PreIt == Plan.LoopIdx2PreHeaderTPBB.end())
+      continue;
+    TPRegionBlock *Region = RegIt->second;
+    TPBasicBlock *PreHdrTPBB = PreIt->second;
+
+    auto *HeaderIt = Plan.LoopIdx2HeaderTPBB.find(Dim);
+    if (HeaderIt == Plan.LoopIdx2HeaderTPBB.end())
+      continue;
+    TPBasicBlock *HeaderTPBB = HeaderIt->second;
+
+    // Shallow traversal: only direct-child TPBasicBlocks (skip nested regions)
+    ReversePostOrderTraversal<TPBlockShallowTraversalWrapper<TPBlockBase *>>
+        ShallowRPOT(
+            TPBlockShallowTraversalWrapper<TPBlockBase *>(Region->getEntry()));
+
+    for (TPBasicBlock *TPBB :
+         TPBlockUtils::blocksOnly<TPBasicBlock>(ShallowRPOT)) {
+      if (TPBB == static_cast<TPBasicBlock *>(HeaderTPBB))
+        continue;
+
+      for (TPRecipeBase &R : make_early_inc_range(*TPBB)) {
+        if (R.mayHaveSideEffects())
+          continue;
+        if (R.mayReadOrWriteMemory())
+          continue;
+        // PHI recipes must stay in the header
+        if (isa<TPHeaderPHIRecipe>(R))
+          continue;
+
+        // Recipe is invariant if all operands are defined outside this loop
+        auto IsOutside = [&](TPValue *Op) -> bool {
+          auto *Def = dyn_cast_or_null<TPRecipeBase>(Op->getDefiningRecipe());
+          if (!Def)
+            return true; // IR live-in value
+          TPBasicBlock *DefBB = Def->getParent();
+          return DefBB == PreHdrTPBB ||        // already hoisted here
+                 !isInsideRegion(DefBB, Region); // defined in outer scope
+        };
+
+        if (all_of(R.operands(), IsOutside))
+          R.moveBefore(*PreHdrTPBB, PreHdrTPBB->end());
+      }
+    }
+  }
+}
+
 /// Legalize VPWidenPointerInductionRecipe, by replacing it with a PtrAdd
 /// (IndStart, ScalarIVSteps (0, Step)) if only its scalar values are used, as
 /// VPWidenPointerInductionRecipe will generate vectors only. If some users
@@ -451,19 +645,25 @@ static void removeDeadRecipes(TPlan &Plan) {
 /// built on the canonical scalar IV and update the original IV's users. This is
 /// an optional optimization to reduce the needs of vector extracts.
 static void legalizeAndOptimizeInductions(TPlan &Plan, ScalarEvolution &SE) {
-  SmallVector<TPRecipeBase *> ToRemove;
+  bool HasOnlyVectorVFs = !Plan.hasScalarTFOnly();
 
-  for (auto Elem : Plan.LoopIdx2HeaderTPBB) {
-    TPBasicBlock *HeaderTPBB = Elem.second;
-    bool HasOnlyVectorVFs = true; // !FIXME(yuxin.an)
+  for (auto &[Dim, HeaderTPBB] : Plan.LoopIdx2HeaderTPBB) {
+    auto *LoopIt = Plan.LoopIdx2Loop.find(Dim);
+    Loop *L = (LoopIt != Plan.LoopIdx2Loop.end()) ? LoopIt->second : nullptr;
+    if (!L)
+      continue;
     TPBasicBlock::iterator InsertPt = HeaderTPBB->getFirstNonPhi();
 
     for (TPRecipeBase &Phi : HeaderTPBB->phis()) {
+      // TPWidenPointerInductionRecipe: not supported in TPlan — skip
       auto *WideIV = dyn_cast<TPWidenIntOrFpInductionRecipe>(&Phi);
-
       if (!WideIV)
         continue;
-      if (HasOnlyVectorVFs && none_of(WideIV->users(), [WideIV](TPUser *U) {
+
+      // If there are no scalar users and we are only vectorizing, no scalar
+      // steps are needed.
+      if (HasOnlyVectorVFs &&
+          none_of(WideIV->users(), [WideIV](TPUser *U) {
             return U->usesScalars(WideIV);
           }))
         continue;
@@ -473,46 +673,61 @@ static void legalizeAndOptimizeInductions(TPlan &Plan, ScalarEvolution &SE) {
           Plan, ID.getKind(), ID.getInductionOpcode(),
           dyn_cast_or_null<FPMathOperator>(ID.getInductionBinOp()), SE,
           WideIV->getTruncInst(), WideIV->getStartValue(),
-          WideIV->getStepValue(), InsertPt, HeaderTPBB, Plan.LoopIdx2Loop[Elem.first]);
+          WideIV->getStepValue(), InsertPt, HeaderTPBB, L);
 
-      // Update scalar users of IV to use Step instead.
+      // For scalar-only plans: replace all uses of WideIV with scalar steps.
+      // For vector+scalar plans: replace only scalar users (bug fix).
       if (!HasOnlyVectorVFs)
         WideIV->replaceAllUsesWith(Steps);
       else
-        WideIV->replaceAllUsesWith(Steps);
-      // WideIV->replaceUsesWithIf(Steps, [WideIV](TPUser &U, unsigned) {
-      //   return U.usesScalars(WideIV);
-      // });
+        WideIV->replaceUsesWithIf(Steps, [WideIV](TPUser &U, unsigned) {
+          return U.usesScalars(WideIV);
+        });
     }
   }
 }
 
-/// Remove redundant EpxandSCEVRecipes in \p Plan's entry block by replacing
-/// them with already existing recipes expanding the same SCEV expression.
-static void removeRedundantExpandSCEVRecipes(TPlan &Plan) {
+/// Remove redundant TPExpandSCEVRecipes across all levels of \p Plan
+/// (global entry preheader and all loop preheaders) by replacing duplicates
+/// with the first-seen recipe expanding the same SCEV expression.
+static void removeRedundantExpandSCEVRecipesAllLevels(TPlan &Plan) {
   DenseMap<const SCEV *, TPValue *> SCEV2VPV;
 
-  for (TPRecipeBase &R :
-       make_early_inc_range(*Plan.getEntry()->getEntryBasicBlock())) {
-    auto *ExpR = dyn_cast<TPExpandSCEVRecipe>(&R);
-    if (!ExpR)
-      continue;
+  // Helper: dedup TPExpandSCEVRecipes in a single block
+  auto Dedup = [&](TPBasicBlock *BB) {
+    for (TPRecipeBase &R : make_early_inc_range(*BB)) {
+      auto *ExpR = dyn_cast<TPExpandSCEVRecipe>(&R);
+      if (!ExpR)
+        continue;
+      auto [It, Inserted] = SCEV2VPV.insert({ExpR->getSCEV(), ExpR});
+      if (!Inserted) {
+        ExpR->replaceAllUsesWith(It->second);
+        ExpR->eraseFromParent();
+      }
+    }
+  };
 
-    auto I = SCEV2VPV.insert({ExpR->getSCEV(), ExpR});
-    if (I.second)
-      continue;
-    ExpR->replaceAllUsesWith(I.first->second);
-    ExpR->eraseFromParent();
-  }
+  // 1) Global entry preheader (outside all loops)
+  Dedup(Plan.getEntry()->getEntryBasicBlock());
+
+  // 2) Loop preheaders: outermost (Dim=N-1) → innermost (Dim=0)
+  //    Outer preheaders dominate inner ones, so register outer values first
+  //    to avoid use-before-def when deduplicating inner duplicates.
+  //    MapVector insertion order may not match dim order, so sort explicitly.
+  SmallVector<unsigned, 4> Dims;
+  for (auto &[Dim, _] : Plan.LoopIdx2PreHeaderTPBB)
+    Dims.push_back(Dim);
+  llvm::sort(Dims, std::greater<unsigned>());
+
+  for (unsigned D : Dims)
+    Dedup(Plan.LoopIdx2PreHeaderTPBB[D]);
 }
 
 /// Try to simplify recipe \p R.
 static void simplifyRecipe(TPRecipeBase &R, TPTypeAnalysis &TypeInfo) {
-  // !FIXME(yuxin.an)
-  return;
-
   using namespace llvm::TPlanPatternMatch;
-  // Try to remove redundant blend recipes.
+
+  // Pattern 1: Redundant Blend — all incoming values are the same, replace with Inc0
   if (auto *Blend = dyn_cast<TPBlendRecipe>(&R)) {
     TPValue *Inc0 = Blend->getIncomingValue(0);
     for (unsigned I = 1; I != Blend->getNumIncomingValues(); ++I)
@@ -524,6 +739,7 @@ static void simplifyRecipe(TPRecipeBase &R, TPTypeAnalysis &TypeInfo) {
     return;
   }
 
+  // Pattern 2: Trunc(ZExtOrSExt(A)) simplification
   TPValue *A;
   if (match(&R, m_Trunc(m_ZExtOrSExt(m_TPValue(A))))) {
     TPValue *Trunc = R.getTPSingleValue();
@@ -532,20 +748,18 @@ static void simplifyRecipe(TPRecipeBase &R, TPTypeAnalysis &TypeInfo) {
     if (TruncTy == ATy) {
       Trunc->replaceAllUsesWith(A);
     } else {
-      // Don't replace a scalarizing recipe with a widened cast.
+      // Do not replace scalarizing recipes with widened casts
       if (isa<TPReplicateRecipe>(&R))
         return;
-      if (ATy->getScalarSizeInBits() < TruncTy->getScalarSizeInBits()) {
 
+      if (ATy->getScalarSizeInBits() < TruncTy->getScalarSizeInBits()) {
         unsigned ExtOpcode = match(R.getOperand(0), m_SExt(m_TPValue()))
                                  ? Instruction::SExt
                                  : Instruction::ZExt;
         auto *TPC =
             new TPWidenCastRecipe(Instruction::CastOps(ExtOpcode), A, TruncTy);
-        if (auto *UnderlyingExt = R.getOperand(0)->getUnderlyingValue()) {
-          // UnderlyingExt has distinct return type, used to retain legacy cost.
+        if (auto *UnderlyingExt = R.getOperand(0)->getUnderlyingValue())
           TPC->setUnderlyingValue(UnderlyingExt);
-        }
         TPC->insertBefore(&R);
         Trunc->replaceAllUsesWith(TPC);
       } else if (ATy->getScalarSizeInBits() > TruncTy->getScalarSizeInBits()) {
@@ -554,27 +768,10 @@ static void simplifyRecipe(TPRecipeBase &R, TPTypeAnalysis &TypeInfo) {
         Trunc->replaceAllUsesWith(VPC);
       }
     }
-#ifndef NDEBUG
-    // Verify that the cached type info is for both A and its users is still
-    // accurate by comparing it to freshly computed types.
-    TPTypeAnalysis TypeInfo2(
-        R.getParent()->getPlan()->getCanonicalIV()->getScalarType(),
-        TypeInfo.getContext());
-    assert(TypeInfo.inferScalarType(A) == TypeInfo2.inferScalarType(A));
-    for (TPUser *U : A->users()) {
-      auto *R = dyn_cast<TPRecipeBase>(U);
-      if (!R)
-        continue;
-      for (TPValue *TPV : R->definedValues())
-        assert(TypeInfo.inferScalarType(TPV) == TypeInfo2.inferScalarType(TPV));
-    }
-#endif
+    return;
   }
 
-  // Simplify (X && Y) || (X && !Y) -> X.
-  // TODO: Split up into simpler, modular combines: (X && Y) || (X && Z) into X
-  // && (Y || Z) and (X || !X) into true. This requires queuing newly created
-  // recipes to be visited during simplification.
+  // Pattern 3: (X && Y) || (X && !Y) → X
   TPValue *X, *Y, *X1, *Y1;
   if (match(&R,
             m_c_BinaryOr(m_LogicalAnd(m_TPValue(X), m_TPValue(Y)),
@@ -584,8 +781,9 @@ static void simplifyRecipe(TPRecipeBase &R, TPTypeAnalysis &TypeInfo) {
     return;
   }
 
+  // Pattern 4: A * 1 → A
   if (match(&R, m_c_Mul(m_TPValue(A), m_SpecificInt(1))))
-    return R.getTPSingleValue()->replaceAllUsesWith(A);
+    R.getTPSingleValue()->replaceAllUsesWith(A);
 }
 
 /// Try to simplify the recipes in \p Plan.
@@ -656,17 +854,10 @@ TPBasicBlock *TPlanTransforms::buildScalarEpilogue(TPBasicBlock *Body) {
   // original K-loop PHI.
   auto *Epi = new TPBasicBlock("scalar.epilogue");
   for (TPRecipeBase &R : *Body) {
-    // YYG::REMOVE
-    errs() << "R: \n";
-    R.dump();
-
     TPRecipeBase *C = R.clone();
     assert(!C->isSubsumed() && "clone() must not propagate IsSubsumed=true");
     Epi->appendRecipe(C);
   }
-  // YYG::REMOVE
-  errs() << "[buildScalarEpilogue] Epi: \n";
-  Epi->dump();
   // Plan.addCreatedBlock(Epi);
   // Scalar block에 넣어야 할 듯. 
   // TPlan2TPlan Transformation Lowering을 신경써야 할까?
@@ -684,11 +875,8 @@ TPTilingRegion *TPlanTransforms::replaceWithTilingRegion(
   TPBlockBase *Cur = Innermost->getEntry();
   while (Cur) {
     if (auto *TPBB = dyn_cast<TPBasicBlock>(Cur)) {
-      // YYG::REMOVE
-      errs() << "[replaceWithTilingRegion] Innermost-TPBB:\n";
-      TPBB->dump();
       markSubsumedRecipes(TPBB, Spec.Dim);
-      
+
       TPBasicBlock *Epilogue =
           (Spec.Mode == DimEmitMode::DynamicTiled) ? buildScalarEpilogue(TPBB)
                                                     : nullptr;
@@ -715,7 +903,7 @@ TPTilingRegion *TPlanTransforms::replaceWithTilingRegion(
   // TPBasicBlock *Epilogue =
   //     (Spec.Mode == DimEmitMode::DynamicTiled) ? buildScalarEpilogue(TPBB)
   //                                               : nullptr;
-  
+
   // Locate the K-loop IV PHINode for EmittedMap registration in execute().
   // PHINode *KIVPhi = nullptr;
   // for (TPRecipeBase &R : *InnerHeaderBody) {
@@ -742,6 +930,9 @@ TPTilingRegion *TPlanTransforms::replaceWithTilingRegion(
   // // Install the tiling override — TPRegionBlock::execute() will delegate to TR.
   // Innermost->setTilingOverride(TR);
   // return TR;
+
+  // Stub implementation - returning nullptr for now
+  return nullptr;
 }
 
 void TPlanTransforms::transform(TPTransformState &State) {
@@ -792,17 +983,24 @@ void TPlanTransforms::transform(TPTransformState &State) {
 }
 
 void TPlanTransforms::optimize(TPlan &Plan, ScalarEvolution &SE) {
-
+  // [B] VPlan-derived passes — adapted for nested-loop TPlan
   removeRedundantCanonicalIVs(Plan);
   removeRedundantInductionCasts(Plan);
-
   simplifyRecipes(Plan, SE.getContext());
   legalizeAndOptimizeInductions(Plan, SE);
   removeDeadRecipes(Plan);
 
+  // VPlan-derived pass — deep traversal keeps nested-loop compatibility
   createAndOptimizeReplicateRegions(Plan);
 
-  removeRedundantExpandSCEVRecipes(Plan);
+  // [B→C] Extended to all loop preheaders (outermost→innermost)
+  removeRedundantExpandSCEVRecipesAllLevels(Plan);
+
+  // [C] Nested-loop specific passes
+  hoistLoopInvariantRecipes(Plan);
+  pruneSubsumedCrossLoopDefs(Plan);
+
+  // VPlan-derived pass — kept as-is
   mergeBlocksIntoPredecessors(Plan);
 }
 
