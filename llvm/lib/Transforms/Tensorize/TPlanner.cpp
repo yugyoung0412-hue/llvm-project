@@ -1282,6 +1282,7 @@ void LoopTensorizePlanner::executePlan(
   //     LT.createTensorizedLoopSkeleton(ExpandedSCEVs ? *ExpandedSCEVs
   //                                                   : State.ExpandedSCEVs);
 
+  LT.createTensorLoopSkeleton("");
   State.TBS.EntryB = LT.EntryB;
   State.TBS.TPH = LT.LoopTensorPreHeader;
   State.TBS.MiddleB = LT.LoopMiddleBlock;
