@@ -268,58 +268,44 @@ void TensorOpKindMatcher::populateSCEVStridesFromIndex(
     const SmallBitVector &DimSet,
     Value *GEPIdx,
     const MapVector<unsigned, Loop *> &DimToLoop) {
-  
-  // YY::REMOVE
-  errs() << "GEPIdx: " << *GEPIdx << "\n";
-  
+
   const SCEV *IdxSCEV = SE->getSCEV(GEPIdx);
-  // YYG::REMOVE
-  errs() << "IdxSCEV: " << *IdxSCEV << "\n";
 
   DenseMap<const Loop *, const SCEV *> LoopStep;
   const SCEV *S = IdxSCEV;
-  
+
   // If loop-induction variables are not canonicalized, whlie-loop for below logic can be work.
   // Right now, it is deprecated.
   // The while loop in populateSCEVStridesFromIndex unwraps this nesting layer by layer:
   // S = {0} <- AddRec? no -> stop
   // S ={0, + N}<Loop_i> <- AddRec? yes -> record Loop_i strides=N
   // S = { {0, +, N}, +, 1 }<Loop_k> <- AddRec? yes -> record Loop_k stride=1.
-  // Each layer gives one {Loop, stride} pair. 
+  // Each layer gives one {Loop, stride} pair.
   // That's why this pattern naturally handles any depth of loop nesting.
   if (const auto *AR = dyn_cast<SCEVAddRecExpr>(S)) {
-    // YYG::REMOVE
-    errs() << "AR->getStepRecurrence(SE): " << *(AR->getStepRecurrence(*SE)) << "\n";
-    errs() << "AR->getLoop(): " << "\n";
-    AR->getLoop()->dump();
     LoopStep[AR->getLoop()] = AR->getStepRecurrence(*SE);
     S = AR->getStart();
   }
   else return;
-  
+
   // Load instruction's DimSet
   for (int D = DimSet.find_first(); D >= 0; D = DimSet.find_next(D)) {
-    // YYG::REMOVE
-    errs() << "D: " << D << "\n";
     // Finding Loop for Dim d.
     auto DIt = DimToLoop.find(static_cast<unsigned>(D));
     if (DIt == DimToLoop.end())
       continue;
-    // YYG::REMOVE
-    errs() << "Loop: \n";
-    DIt->second->dump();
 
     auto SIt = LoopStep.find(DIt->second);
     if (SIt != LoopStep.end()) {
       // After this runs, each load/store recipe has its MemStrides map populated
       // - e.g., { dim0 -> 4, dim1 -> 1} mapping, "dim0 steps by 4 elements per iteration,
       // dim1 steps by 1.". This information is later used to determine leading
-      // dimensions (LDA/LDB) and contiguity for tensor operations like matrix multiply. 
+      // dimensions (LDA/LDB) and contiguity for tensor operations like matrix multiply.
       MemStrides[static_cast<unsigned>(D)] = SIt->second;
-      errs() << "SIt: " << *SIt->second << "\n";
     }
   }
 }
+
 
 void TensorOpKindMatcher::populateSCEVStrides(TPWidenLoadRecipe &LR,
                                  const MapVector<unsigned, Loop *> &DimToLoop) {
