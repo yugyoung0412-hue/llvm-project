@@ -850,37 +850,28 @@ void TPlan::prepareToExecute(MapVector<Loop *, Value *> TensorTripCountV,
   }
   LLVM_DEBUG(dbgs() << "TPlan::prepareToExecute sets up TFxUFTPV\n");
 
-  // Set up TensorTripCount values from canonical induction variable start values.
-  // The tensor trip count represents the number of tensor iterations for each loop.
+  // Set up TensorTripCount: directly assign pre-computed IR values.
+  // TensorTripCountV[L] = floor(TC[L] / TF[L]) * TF[L], computed in executePlan.
+  // Mirrors VPlan: VectorTripCount.setUnderlyingValue(VectorTripCountV).
   for (auto &[L, TTC_VPVal] : TensorTripCount) {
-    auto It = CanonicalIVStartValue.find(L);
-    if (It != CanonicalIVStartValue.end() && It->second) {
-      // The canonical IV start value is used as the tensor trip count.
-      // For nested loops, this represents the starting value for the outermost
-      // tensor iteration of this loop.
+    auto It = TensorTripCountV.find(L);
+    if (It != TensorTripCountV.end() && It->second)
       TTC_VPVal->setUnderlyingValue(It->second);
-    } else {
-      // Fallback: use original trip count if canonical IV start not available
-      auto TCIt = TripCount.find(L);
-      if (TCIt != TripCount.end() && TCIt->second) {
-        // Expand SCEV to get the trip count value
-        Value *TCVal = tputils::getOrCreateTPValueForSCEVExpr(
-            *this, TCIt->second, *State.SE)->getLiveInIRValue();
-        TTC_VPVal->setUnderlyingValue(TCVal);
-      }
-    }
   }
 
-  // Set up BackedgeTakenCount values: BackedgeTakenCount[L] = TensorTripCount[L] - 1
-  // This is used for tail folding optimization.
+  // Set up BackedgeTakenCount values: BTC[L] = TC[L] - 1.
+  // Mirrors VPlan: uses the original scalar trip count, not TensorTripCount.
+  // Only emits IR when BTC has actual users (matches VPlan's getNumUsers guard).
   for (auto &[L, BTCPV] : BackedgeTakenCount) {
-    auto TTCIt = TensorTripCount.find(L);
-    if (TTCIt != TensorTripCount.end() && TTCIt->second &&
-        TTCIt->second->getUnderlyingValue()) {
-      Value *TTCVal = TTCIt->second->getUnderlyingValue();
-      Value *One = ConstantInt::get(TTCVal->getType(), 1);
-      Value *BTCAbs = Builder.CreateSub(TTCVal, One, "backedge.taken.count");
-      BTCPV->setUnderlyingValue(BTCAbs);
+    if (!BTCPV->getNumUsers())
+      continue;
+    auto TCIt = TripCount.find(L);
+    if (TCIt != TripCount.end() && TCIt->second) {
+      Value *TCVal = tputils::getOrCreateTPValueForSCEVExpr(
+          *this, TCIt->second, *State.SE)->getLiveInIRValue();
+      Value *One = ConstantInt::get(TCVal->getType(), 1);
+      BTCPV->setUnderlyingValue(
+          Builder.CreateSub(TCVal, One, "trip.count.minus.1"));
     }
   }
 
