@@ -1296,6 +1296,22 @@ void LoopTensorizePlanner::executePlan(
 
   LT.printDebugTracesAtStart();
 
+  // Compute TensorTripCountV[L] = floor(TC[L] / TF[L]) * TF[L] = TC[L] - (TC[L] % TF[L]).
+  // Mirrors VPlan's VectorTripCountV: pre-computed outside prepareToExecute.
+  MapVector<Loop *, Value *> TensorTripCountV;
+  {
+    IRBuilder<> TTCBuilder(State.TBS.TPH->getTerminator());
+    for (auto &[L, TC_SCEV] : BestTPlan.getTripCount()) {
+      Value *TCVal = tputils::getOrCreateTPValueForSCEVExpr(
+          BestTPlan, TC_SCEV, *SE)->getLiveInIRValue();
+      unsigned TFVal = State.TF.count(L) ? State.TF[L].getKnownMinValue() : 1;
+      Value *TF_IR = ConstantInt::get(TCVal->getType(), TFVal);
+      Value *Rem = TTCBuilder.CreateURem(TCVal, TF_IR, "tc.rem");
+      Value *TTC = TTCBuilder.CreateSub(TCVal, Rem, "tensor.trip.count");
+      TensorTripCountV[L] = TTC;
+    }
+  }
+
   //===------------------------------------------------===//
   //
   // Notice: any optimization or new instruction that go
@@ -1310,7 +1326,6 @@ void LoopTensorizePlanner::executePlan(
   BestTPlan.dump();
   dbgs() << "------------TPlan\n";
 
-  MapVector<Loop *, Value *> TensorTripCountV;  // Task 3에서 채워진다
   BestTPlan.prepareToExecute(TensorTripCountV, CanonicalIVStartValue, State);
 
   BestTPlan.execute(&State);
