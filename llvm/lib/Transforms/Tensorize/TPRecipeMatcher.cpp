@@ -306,23 +306,14 @@ void TensorOpKindMatcher::populateSCEVStridesFromIndex(
   }
 }
 
-
 void TensorOpKindMatcher::populateSCEVStrides(TPWidenLoadRecipe &LR,
                                  const MapVector<unsigned, Loop *> &DimToLoop) {
-  // YYG::REMOVE
-  errs() << "populateSCEVStrides\n";
-
   auto *Load = cast<LoadInst>(LR.getUnderlyingValue());
   auto *GEP = dyn_cast<GetElementPtrInst>(Load->getPointerOperand()->stripPointerCasts());
-  // YYG::REMOVE
-  errs() << "Load: " << *Load << "\n";
-  errs() << "Load->getPointerOperand(): " << *(Load->getPointerOperand()) << "\n";
 
   // Only cares about Ptr[Idx] for flat GEP.
   if (!GEP || GEP->getNumIndices() != 1)
     return;
-  errs() << "GEP: " << *GEP << "\n";
-  errs() << "GEP->getOperand(1): " << *(GEP->getOperand(1)) << "\n";
 
   // nested-GEP
   auto *Ptr = Load->getPointerOperand()->stripPointerCasts();
@@ -332,8 +323,6 @@ void TensorOpKindMatcher::populateSCEVStrides(TPWidenLoadRecipe &LR,
     if (!GEP)
       break;
     if (GEP->getNumIndices() == 1) {
-      // YYG::REMOVE
-      errs() << "[Load] GEP: " << *GEP << "\n";
       populateSCEVStridesFromIndex(LR.MemStrides, LR.DimSet,
                                     GEP->getOperand(1), DimToLoop);
     }
@@ -343,26 +332,12 @@ void TensorOpKindMatcher::populateSCEVStrides(TPWidenLoadRecipe &LR,
 
 void TensorOpKindMatcher::populateSCEVStrides(TPWidenStoreRecipe &SR,
                                  const MapVector<unsigned, Loop *> &DimToLoop) {
-  // YYG::REMOVE
-  errs() << "SR: \n";
-  SR.dump();
-  errs() << "SR.getOperand(1): " << *(SR.getOperand(1)) << "\n"; // TPValue
   if (auto *ValDR = SR.getOperand(1)->getDefiningRecipe()) {
-    // YYG::REMOVE
-    errs() << "ValDR:\n";
-    ValDR->dump();
     SR.DimSet = ValDR->DimSet;
-
-    for (int D = ValDR->DimSet.find_first(); D >= 0; D = ValDR->DimSet.find_next(D)) {
-      // YYG::REMOVE
-      errs() << "D: " << D << "\n";
-    }
   }
   if (SR.DimSet.none())
     return;
   TPValue *Addr = SR.getAddr();
-  // YYG::REMOVE
-  Addr->dump();
 
   TPValue *Underlying = Addr;
   while (auto *Cast = dyn_cast<TPWidenCastRecipe>(Underlying)) {
