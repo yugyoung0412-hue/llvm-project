@@ -1310,7 +1310,8 @@ void LoopTensorizePlanner::executePlan(
   BestTPlan.dump();
   dbgs() << "------------TPlan\n";
 
-  BestTPlan.prepareToExecute(CanonicalIVStartValue, State);
+  MapVector<Loop *, Value *> TensorTripCountV;  // Task 3에서 채워진다
+  BestTPlan.prepareToExecute(TensorTripCountV, CanonicalIVStartValue, State);
 
   BestTPlan.execute(&State);
   // YYG::REMOVE

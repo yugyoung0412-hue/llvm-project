@@ -3439,7 +3439,8 @@ public:
                                      bool TailFolded, std::shared_ptr<TensorizePattern> Pattern);
 
   /// Prepare the plan for execution, setting up the required live-in values.
-  void prepareToExecute(MapVector<Loop *, Value *> CanonicalIVStartValue,
+  void prepareToExecute(MapVector<Loop *, Value *> TensorTripCountV,
+                        MapVector<Loop *, Value *> CanonicalIVStartValue,
                         TPTransformState &State);
 
   /// Generate the IR code for this VPlan.

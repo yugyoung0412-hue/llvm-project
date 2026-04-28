@@ -795,7 +795,8 @@ TPlanPtr TPlan::createInitialTPlan(MapVector<Loop *, SCEV *> TripCount,
   return Plan;
 }
 
-void TPlan::prepareToExecute(MapVector<Loop *, Value *> CanonicalIVStartValue,
+void TPlan::prepareToExecute(MapVector<Loop *, Value *> TensorTripCountV,
+                             MapVector<Loop *, Value *> CanonicalIVStartValue,
                              TPTransformState &State) {
   LLVM_DEBUG(dbgs() << "TPlan::prepareToExecute sets up TFxUFTPV\n");
   // Prepare TPlan for execution by setting up the required live-in values
